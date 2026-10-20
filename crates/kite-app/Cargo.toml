@@ -1,0 +1,23 @@
+[package]
+name = "kite-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kite"
+path = "src/main.rs"
+
+[dependencies]
+kite-core = { path = "../kite-core" }
+winit.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+cosmic-text.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+arboard.workspace = true
+trash.workspace = true
+unicode-segmentation.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

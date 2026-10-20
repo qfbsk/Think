@@ -1,0 +1,1517 @@
+use std::path::PathBuf;
+
+use glyphon::cosmic_text::{Attrs, Buffer, Color, Metrics, Shaping, Weight, Wrap};
+use glyphon::{FontSystem, TextArea, TextBounds};
+use kite_core::{Document, Position, Selection, file_key};
+use winit::dpi::PhysicalSize;
+
+use crate::editor::Editor;
+use crate::renderer::QuadVertex;
+use crate::shell::{Shell, ShellEffect};
+use crate::sidebar::{Sidebar, SidebarAction};
+use crate::text::attrs;
+use crate::theme;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Right,
+    Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn right(&self) -> f32 {
+        self.x + self.w
+    }
+
+    pub fn bottom(&self) -> f32 {
+        self.y + self.h
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+
+    pub fn inset(&self, amount: f32) -> Rect {
+        Rect {
+            x: self.x + amount,
+            y: self.y + amount,
+            w: (self.w - amount * 2.0).max(1.0),
+            h: (self.h - amount * 2.0).max(1.0),
+        }
+    }
+
+    pub fn clip_x(&self, left: f32, right: f32) -> Rect {
+        let clipped_left = self.x.max(left);
+        let clipped_right = self.right().min(right);
+        Rect {
+            x: clipped_left,
+            y: self.y,
+            w: (clipped_right - clipped_left).max(0.0),
+            h: self.h,
+        }
+    }
+}
+
+pub enum TabContent {
+    Shell(Shell),
+    Editor(Editor),
+}
+
+pub struct Tab {
+    pub content: TabContent,
+    pub title: String,
+    pub label: Buffer,
+    pub label_width: f32,
+    pub desired_width: f32,
+    pub rect: Rect,
+    pub close_rect: Option<Rect>,
+}
+
+impl Tab {
+    pub fn is_modified(&self) -> bool {
+        match &self.content {
+            TabContent::Editor(editor) => editor.is_modified(),
+            TabContent::Shell(_) => false,
+        }
+    }
+
+    pub fn is_shell(&self) -> bool {
+        matches!(self.content, TabContent::Shell(_))
+    }
+}
+
+pub struct Ui {
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+    pub mode: Mode,
+    pub focus: Focus,
+    pub sidebar: Sidebar,
+    pub size: PhysicalSize<u32>,
+    pub scale: f32,
+    pub body_font_size: f32,
+    pub cursor_blink: bool,
+    pub show_whitespace: bool,
+    pub topmost: bool,
+    pub message: Option<String>,
+    family: &'static str,
+
+    logo: Buffer,
+    logo_width: f32,
+    status: Buffer,
+    status_key: String,
+
+    titlebar_h: f32,
+    status_h: f32,
+    tab_pad: f32,
+    tab_gap: f32,
+    close_w: f32,
+    body_pad: f32,
+    sidebar_w: f32,
+    right: Rect,
+    sidebar_rect: Rect,
+    status_rect: Rect,
+    window_close: Rect,
+    tab_strip: Rect,
+    tab_scroll: f32,
+    tab_overflow: bool,
+    tab_font_size: f32,
+    tab_line_height: f32,
+    status_font_size: f32,
+    status_line_height: f32,
+
+    mouse_x: f32,
+    mouse_y: f32,
+}
+
+impl Ui {
+    pub fn new(
+        font_system: &mut FontSystem,
+        family: &'static str,
+        size: PhysicalSize<u32>,
+        scale: f32,
+    ) -> Self {
+        let scale = scale.max(0.5);
+        let titlebar_h = 40.0 * scale;
+        let status_h = 26.0 * scale;
+        let body_pad = 10.0 * scale;
+        let sidebar_w = 280.0 * scale;
+        let tab_font_size = 13.0 * scale;
+        let tab_line_height = (tab_font_size * 1.35).ceil();
+        let status_font_size = 12.0 * scale;
+        let status_line_height = (status_font_size * 1.3).ceil();
+        let body_font_size = theme::FONT_SIZE_BASE * scale;
+
+        let body_height = (size.height as f32 - titlebar_h - status_h).max(1.0);
+        let editor_width = (size.width as f32 - body_pad * 2.0).max(1.0);
+        let editor_height = (body_height - body_pad * 2.0).max(1.0);
+
+        let shell = Shell::new(
+            font_system,
+            family,
+            body_font_size,
+            editor_width,
+            editor_height,
+        );
+        let sidebar = Sidebar::new(
+            font_system,
+            family,
+            13.5 * scale,
+            sidebar_w - body_pad * 2.0,
+            body_height - body_pad * 2.0,
+        );
+
+        let logo_attrs = Attrs::new()
+            .family(glyphon::cosmic_text::Family::Name(family))
+            .color(theme::ACCENT)
+            .weight(Weight::BOLD);
+        let logo = make_label(font_system, &logo_attrs, 15.0 * scale, "kite");
+        let (logo_width, _) = measure(&logo);
+        let status_attrs = attrs(family, theme::TEXT_DIM);
+        let status = make_label(font_system, &status_attrs, status_font_size, "");
+
+        let shell_tab = make_tab(
+            font_system,
+            family,
+            tab_font_size,
+            11.0 * scale,
+            18.0 * scale,
+            4.0 * scale,
+            "shell",
+            TabContent::Shell(shell),
+        );
+        let mut ui = Self {
+            tabs: vec![shell_tab],
+            active: 0,
+            mode: Mode::Insert,
+            focus: Focus::Right,
+            sidebar,
+            size,
+            scale,
+            body_font_size,
+            cursor_blink: true,
+            show_whitespace: false,
+            topmost: false,
+            message: None,
+            family,
+            logo,
+            logo_width,
+            status,
+            status_key: String::new(),
+            titlebar_h,
+            status_h,
+            tab_pad: 11.0 * scale,
+            tab_gap: 4.0 * scale,
+            close_w: 18.0 * scale,
+            body_pad,
+            sidebar_w,
+            right: Rect::default(),
+            sidebar_rect: Rect::default(),
+            status_rect: Rect::default(),
+            window_close: Rect::default(),
+            tab_strip: Rect::default(),
+            tab_scroll: 0.0,
+            tab_overflow: false,
+            tab_font_size,
+            tab_line_height,
+            status_font_size,
+            status_line_height,
+            mouse_x: 0.0,
+            mouse_y: 0.0,
+        };
+        ui.recompute_layout(font_system);
+        for index in 0..ui.tabs.len() {
+            ui.refresh_label(font_system, index);
+        }
+        ui.recompute_layout(font_system);
+        ui.refresh_status(font_system);
+        ui
+    }
+
+    pub fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    pub fn active_editor(&self) -> Option<&Editor> {
+        match &self.tabs[self.active].content {
+            TabContent::Editor(editor) => Some(editor),
+            TabContent::Shell(_) => None,
+        }
+    }
+
+    pub fn active_editor_mut(&mut self) -> Option<&mut Editor> {
+        match &mut self.tabs[self.active].content {
+            TabContent::Editor(editor) => Some(editor),
+            TabContent::Shell(_) => None,
+        }
+    }
+
+    pub fn active_shell(&self) -> Option<&Shell> {
+        match &self.tabs[self.active].content {
+            TabContent::Shell(shell) => Some(shell),
+            TabContent::Editor(_) => None,
+        }
+    }
+
+    pub fn active_shell_mut(&mut self) -> Option<&mut Shell> {
+        match &mut self.tabs[self.active].content {
+            TabContent::Shell(shell) => Some(shell),
+            TabContent::Editor(_) => None,
+        }
+    }
+
+    pub fn shell_tab_mut(&mut self) -> Option<&mut Shell> {
+        self.tabs.iter_mut().find_map(|tab| match &mut tab.content {
+            TabContent::Shell(shell) => Some(shell),
+            TabContent::Editor(_) => None,
+        })
+    }
+
+    pub fn editor_content_rect(&self) -> Rect {
+        self.right.inset(self.body_pad)
+    }
+
+    pub fn sidebar_content_rect(&self) -> Rect {
+        Rect {
+            x: self.sidebar_rect.x + self.body_pad * 0.8,
+            y: self.sidebar_rect.y + self.body_pad * 0.4,
+            w: (self.sidebar_rect.w - self.body_pad * 1.6).max(1.0),
+            h: (self.sidebar_rect.h - self.body_pad * 0.8).max(1.0),
+        }
+    }
+
+    pub fn resize(&mut self, font_system: &mut FontSystem, size: PhysicalSize<u32>) {
+        if size.width == self.size.width && size.height == self.size.height {
+            return;
+        }
+        self.size = size;
+        self.recompute_layout(font_system);
+    }
+
+    pub fn set_scale(&mut self, font_system: &mut FontSystem, scale: f32, size: PhysicalSize<u32>) {
+        let scale = scale.max(0.5);
+        self.scale = scale;
+        self.size = size;
+        self.titlebar_h = 40.0 * scale;
+        self.status_h = 26.0 * scale;
+        self.body_pad = 10.0 * scale;
+        self.sidebar_w = 280.0 * scale;
+        self.tab_pad = 11.0 * scale;
+        self.tab_gap = 4.0 * scale;
+        self.close_w = 18.0 * scale;
+        self.tab_font_size = 13.0 * scale;
+        self.tab_line_height = (self.tab_font_size * 1.35).ceil();
+        self.status_font_size = 12.0 * scale;
+        self.status_line_height = (self.status_font_size * 1.3).ceil();
+        self.body_font_size = theme::FONT_SIZE_BASE * scale;
+
+        let logo_attrs = Attrs::new()
+            .family(glyphon::cosmic_text::Family::Name(self.family))
+            .color(theme::ACCENT)
+            .weight(Weight::BOLD);
+        self.logo = make_label(font_system, &logo_attrs, 15.0 * scale, "kite");
+        self.logo_width = measure(&self.logo).0;
+        self.status = make_label(
+            font_system,
+            &attrs(self.family, theme::TEXT_DIM),
+            self.status_font_size,
+            "",
+        );
+        self.status_key.clear();
+        self.refresh_status(font_system);
+        for index in 0..self.tabs.len() {
+            self.refresh_label(font_system, index);
+        }
+        self.sidebar.set_font_size(font_system, 13.5 * scale);
+        for tab in &mut self.tabs {
+            match &mut tab.content {
+                TabContent::Shell(shell) => shell.set_font_size(font_system, self.body_font_size),
+                TabContent::Editor(editor) => {
+                    editor.set_font_size(font_system, self.body_font_size)
+                }
+            }
+        }
+        self.recompute_layout(font_system);
+    }
+
+    pub fn toggle_sidebar(&mut self, font_system: &mut FontSystem) {
+        if self.sidebar.visible {
+            self.sidebar.visible = false;
+            self.focus = Focus::Right;
+            self.mode = Mode::Normal;
+            self.recompute_layout(font_system);
+        } else {
+            self.sidebar.visible = true;
+            self.focus = Focus::Sidebar;
+            self.mode = Mode::Normal;
+            self.recompute_layout(font_system);
+            self.sidebar.shape(font_system);
+        }
+    }
+
+    pub fn focus_right_insert(&mut self, font_system: &mut FontSystem) {
+        self.focus = Focus::Right;
+        self.mode = Mode::Insert;
+        if let Some(editor) = self.active_editor_mut() {
+            editor.ensure_cursor_visible(font_system);
+        }
+    }
+
+    pub fn focus_sidebar(&mut self, font_system: &mut FontSystem) {
+        if self.sidebar.visible {
+            self.focus = Focus::Sidebar;
+            self.mode = Mode::Normal;
+            self.sidebar.shape(font_system);
+        }
+    }
+
+    pub fn escape(&mut self, font_system: &mut FontSystem) {
+        if self.mode == Mode::Insert {
+            self.mode = Mode::Normal;
+            self.focus = if self.sidebar.visible {
+                Focus::Sidebar
+            } else {
+                Focus::Right
+            };
+            if self.focus == Focus::Sidebar {
+                self.sidebar.shape(font_system);
+            } else if let Some(editor) = self.active_editor_mut() {
+                editor.ensure_cursor_visible(font_system);
+            }
+        }
+    }
+
+    pub fn activate_tab(&mut self, font_system: &mut FontSystem, index: usize) {
+        if index >= self.tabs.len() || index == self.active {
+            return;
+        }
+        let previous = self.active;
+        self.active = index;
+        self.message = None;
+        self.refresh_label(font_system, previous);
+        self.refresh_label(font_system, index);
+        self.recompute_layout(font_system);
+    }
+
+    pub fn activate_digit(&mut self, font_system: &mut FontSystem, digit: u8) -> bool {
+        if digit == 0 {
+            if self.active != 0 {
+                self.activate_tab(font_system, 0);
+                return true;
+            }
+            return false;
+        }
+        let mut file_index = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.is_shell() {
+                continue;
+            }
+            file_index += 1;
+            if file_index == digit as usize {
+                if self.active != index {
+                    self.activate_tab(font_system, index);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn close_tab(&mut self, font_system: &mut FontSystem, index: usize) -> bool {
+        if index == 0 || index >= self.tabs.len() {
+            return false;
+        }
+        let was_active = index == self.active;
+        self.tabs.remove(index);
+        self.message = None;
+        if index < self.active {
+            self.active -= 1;
+        } else if was_active {
+            if index < self.tabs.len() {
+                self.active = index;
+            } else {
+                self.active = index - 1;
+            }
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        for index in 0..self.tabs.len() {
+            self.refresh_label(font_system, index);
+        }
+        self.recompute_layout(font_system);
+        if let Some(editor) = self.active_editor_mut() {
+            editor.ensure_cursor_visible(font_system);
+        }
+        true
+    }
+
+    pub fn close_active_file(&mut self, font_system: &mut FontSystem) -> bool {
+        if self.focus != Focus::Right || self.mode != Mode::Normal {
+            return false;
+        }
+        if self.active_tab().is_shell() {
+            return false;
+        }
+        self.close_tab(font_system, self.active)
+    }
+
+    pub fn open_file(&mut self, font_system: &mut FontSystem, path: PathBuf) -> Result<(), String> {
+        let key = file_key(&path).map_err(|error| error.to_string())?;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if let TabContent::Editor(editor) = &tab.content {
+                if file_key(editor.document.path()).ok().as_ref() == Some(&key) {
+                    self.activate_tab(font_system, index);
+                    self.focus_right_insert(font_system);
+                    return Ok(());
+                }
+            }
+        }
+
+        let document = Document::open(&path).map_err(|error| error.to_string())?;
+        let content = self.editor_content_rect();
+        let editor = Editor::new(
+            document,
+            font_system,
+            self.family,
+            content.w,
+            content.h,
+            self.body_font_size,
+        );
+        let title = editor.display_title();
+        let tab = make_tab(
+            font_system,
+            self.family,
+            self.tab_font_size,
+            self.tab_pad,
+            self.close_w,
+            4.0 * self.scale,
+            &title,
+            TabContent::Editor(editor),
+        );
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.focus = Focus::Right;
+        self.mode = Mode::Insert;
+        self.message = Some(format!("opened {title}"));
+        self.refresh_label(font_system, self.active);
+        self.recompute_layout(font_system);
+        Ok(())
+    }
+
+    pub fn save_active(&mut self) -> Result<(), String> {
+        let Some(editor) = self.active_editor_mut() else {
+            return Err("the shell has nothing to save".to_string());
+        };
+        let title = editor.display_title();
+        editor.save()?;
+        self.message = Some(format!("saved {title}"));
+        Ok(())
+    }
+
+    pub fn adjust_body_font(&mut self, font_system: &mut FontSystem, delta: f32) {
+        let min = theme::MIN_FONT_SIZE * self.scale;
+        let max = theme::MAX_FONT_SIZE * self.scale;
+        let size = (self.body_font_size + delta * self.scale).clamp(min, max);
+        if (size - self.body_font_size).abs() < 0.01 {
+            return;
+        }
+        self.body_font_size = size;
+        for tab in &mut self.tabs {
+            match &mut tab.content {
+                TabContent::Shell(shell) => shell.set_font_size(font_system, size),
+                TabContent::Editor(editor) => editor.set_font_size(font_system, size),
+            }
+        }
+        self.message = Some(format!("text size {:.0}px", size / self.scale));
+    }
+
+    pub fn poll_shell(&mut self, font_system: &mut FontSystem) -> bool {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if let TabContent::Shell(shell) = &mut tab.content {
+                if shell.poll(font_system) {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn any_shell_running(&self) -> bool {
+        self.tabs.iter().any(|tab| match &tab.content {
+            TabContent::Shell(shell) => shell.is_running(),
+            TabContent::Editor(_) => false,
+        })
+    }
+
+    pub fn kill_shells(&mut self) {
+        for tab in &mut self.tabs {
+            if let TabContent::Shell(shell) = &mut tab.content {
+                shell.kill_job();
+            }
+        }
+    }
+
+    pub fn sidebar_enter(&mut self, font_system: &mut FontSystem) -> Option<PathBuf> {
+        match self.sidebar.enter(font_system) {
+            Some(SidebarAction::Open(path)) => Some(path),
+            None => None,
+        }
+    }
+
+    pub fn handle_shell_effect(&mut self, font_system: &mut FontSystem, effect: ShellEffect) {
+        match effect {
+            ShellEffect::Open(path) => {
+                if let Err(error) = self.open_file(font_system, path) {
+                    if let Some(shell) = self.shell_tab_mut() {
+                        shell.print_error(font_system, format!("kkk: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn prepare(&mut self, font_system: &mut FontSystem) {
+        if let TabContent::Editor(editor) = &mut self.active_tab_mut().content {
+            editor.shape(font_system);
+        }
+        if let TabContent::Shell(shell) = &mut self.active_tab_mut().content {
+            shell.shape(font_system);
+        }
+        if self.sidebar.visible {
+            self.sidebar.shape(font_system);
+        }
+        self.refresh_status(font_system);
+    }
+
+    pub fn text_areas(&self) -> Vec<TextArea<'_>> {
+        let mut areas = Vec::new();
+        let logo_bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.size.width as i32,
+            bottom: self.titlebar_h as i32,
+        };
+        areas.push(TextArea {
+            buffer: &self.logo,
+            left: 16.0 * self.scale,
+            top: (self.titlebar_h - 15.0 * self.scale * 1.35) / 2.0,
+            scale: 1.0,
+            bounds: logo_bounds,
+            default_color: theme::ACCENT,
+            custom_glyphs: &[],
+        });
+
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.rect.w <= 1.0 {
+                continue;
+            }
+            let close_space = if tab.close_rect.is_some() {
+                self.close_w + 6.0 * self.scale
+            } else {
+                4.0 * self.scale
+            };
+            let clip_left = self.tab_strip.x + 2.0 * self.scale;
+            let clip_right = self.tab_strip.right();
+            let bounds = TextBounds {
+                left: (tab.rect.x + 2.0 * self.scale).max(clip_left) as i32,
+                top: tab.rect.y as i32,
+                right: (tab.rect.right() - close_space).min(clip_right) as i32,
+                bottom: tab.rect.bottom() as i32,
+            };
+            if bounds.right <= bounds.left {
+                continue;
+            }
+            areas.push(TextArea {
+                buffer: &tab.label,
+                left: (tab.rect.x + self.tab_pad).max(clip_left),
+                top: tab.rect.y + (tab.rect.h - self.tab_line_height) / 2.0
+                    - if index == self.active {
+                        0.0
+                    } else {
+                        0.5 * self.scale
+                    },
+                scale: 1.0,
+                bounds,
+                default_color: if index == self.active {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                },
+                custom_glyphs: &[],
+            });
+        }
+
+        match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                let content = self.editor_content_rect();
+                areas.push(TextArea {
+                    buffer: &editor.buffer,
+                    left: content.x,
+                    top: content.y,
+                    scale: 1.0,
+                    bounds: bounds_of(content),
+                    default_color: theme::TEXT,
+                    custom_glyphs: &[],
+                });
+            }
+            TabContent::Shell(shell) => {
+                let content = self.editor_content_rect();
+                areas.push(TextArea {
+                    buffer: &shell.buffer,
+                    left: content.x,
+                    top: content.y,
+                    scale: 1.0,
+                    bounds: bounds_of(content),
+                    default_color: theme::TEXT,
+                    custom_glyphs: &[],
+                });
+            }
+        }
+
+        if self.sidebar.visible {
+            let content = self.sidebar_content_rect();
+            areas.push(TextArea {
+                buffer: &self.sidebar.buffer,
+                left: content.x,
+                top: content.y,
+                scale: 1.0,
+                bounds: bounds_of(content),
+                default_color: theme::TEXT,
+                custom_glyphs: &[],
+            });
+        }
+
+        let status_bounds = bounds_of(self.status_rect);
+        areas.push(TextArea {
+            buffer: &self.status,
+            left: self.status_rect.x + 10.0 * self.scale,
+            top: self.status_rect.y + (self.status_rect.h - self.status_line_height) / 2.0,
+            scale: 1.0,
+            bounds: status_bounds,
+            default_color: theme::STATUS_TEXT,
+            custom_glyphs: &[],
+        });
+
+        areas
+    }
+
+    pub fn background_quads(&self) -> Vec<QuadVertex> {
+        let mut quads = Vec::new();
+        push_rect(&mut quads, self.right, theme::PANEL);
+        push_rect(&mut quads, self.status_rect, theme::STATUS);
+        push_rect(
+            &mut quads,
+            Rect {
+                x: self.right.x,
+                y: self.titlebar_h,
+                w: self.size.width as f32,
+                h: 1.0 * self.scale,
+            },
+            theme::BORDER,
+        );
+        push_rect(
+            &mut quads,
+            Rect {
+                x: 0.0,
+                y: self.status_rect.y - 1.0 * self.scale,
+                w: self.size.width as f32,
+                h: 1.0 * self.scale,
+            },
+            theme::BORDER,
+        );
+
+        if self.sidebar.visible {
+            push_rect(&mut quads, self.sidebar_rect, theme::SIDEBAR);
+            push_rect(
+                &mut quads,
+                Rect {
+                    x: self.sidebar_rect.right() - 1.0 * self.scale,
+                    y: self.sidebar_rect.y,
+                    w: 1.0 * self.scale,
+                    h: self.sidebar_rect.h,
+                },
+                theme::BORDER,
+            );
+            if let Some(row) = self.sidebar.selected_row() {
+                let visible_start = self.sidebar.buffer.scroll().line;
+                if self.sidebar.selected >= visible_start {
+                    let row_index = self.sidebar.selected - visible_start;
+                    let content = self.sidebar_content_rect();
+                    let y = content.y + row_index as f32 * self.sidebar.line_height();
+                    if y + self.sidebar.line_height() <= self.sidebar_rect.bottom() {
+                        push_rect(
+                            &mut quads,
+                            Rect {
+                                x: self.sidebar_rect.x + 4.0 * self.scale,
+                                y,
+                                w: self.sidebar_rect.w - 8.0 * self.scale,
+                                h: self.sidebar.line_height(),
+                            },
+                            theme::ACCENT_DIM,
+                        );
+                    }
+                    let _ = row;
+                }
+            }
+        }
+
+        push_rect(&mut quads, self.tabbar_rect(), theme::PANEL_DIM);
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let shown = tab.rect.clip_x(self.tab_strip.x, self.tab_strip.right());
+            if shown.w <= 1.0 {
+                continue;
+            }
+            let color = if index == self.active {
+                theme::TAB_ACTIVE
+            } else if self.hover_tab(index) {
+                theme::TAB_HOVER
+            } else {
+                theme::PANEL_DIM
+            };
+            push_rect(&mut quads, shown, color);
+            if index == self.active {
+                let underline = Rect {
+                    x: tab.rect.x + 6.0 * self.scale,
+                    y: tab.rect.bottom() - 2.0 * self.scale,
+                    w: (tab.rect.w - 12.0 * self.scale).max(0.0),
+                    h: 2.0 * self.scale,
+                }
+                .clip_x(self.tab_strip.x, self.tab_strip.right());
+                push_rect(&mut quads, underline, theme::ACCENT);
+            }
+            if let Some(close) = tab.close_rect {
+                let color = if self.hover_close(index) {
+                    theme::RED
+                } else {
+                    theme::TEXT_FAINT
+                };
+                let inset = 5.0 * self.scale;
+                push_line(
+                    &mut quads,
+                    close.x + inset,
+                    close.y + inset,
+                    close.right() - inset,
+                    close.bottom() - inset,
+                    1.3 * self.scale,
+                    color,
+                );
+                push_line(
+                    &mut quads,
+                    close.right() - inset,
+                    close.y + inset,
+                    close.x + inset,
+                    close.bottom() - inset,
+                    1.3 * self.scale,
+                    color,
+                );
+            }
+            if tab.is_modified() {
+                let dot_x = tab.rect.x
+                    + self.tab_pad
+                    + tab
+                        .label_width
+                        .min(tab.rect.w - self.close_w - 2.0 * self.tab_pad)
+                    + 3.0 * self.scale;
+                let dot = Rect {
+                    x: dot_x,
+                    y: tab.rect.y + tab.rect.h / 2.0 - 2.5 * self.scale,
+                    w: 5.0 * self.scale,
+                    h: 5.0 * self.scale,
+                }
+                .clip_x(self.tab_strip.x, self.tab_strip.right());
+                if dot.w >= 1.0 {
+                    push_rect(&mut quads, dot, theme::YELLOW);
+                }
+            }
+        }
+
+        if self.window_close.contains(self.mouse_x, self.mouse_y) {
+            push_rect(&mut quads, self.window_close, theme::RED);
+        }
+        {
+            let close = self.window_close;
+            let cx = close.x + close.w / 2.0;
+            let cy = close.y + close.h / 2.0;
+            let arm = 5.0 * self.scale;
+            let color = if close.contains(self.mouse_x, self.mouse_y) {
+                theme::BG
+            } else {
+                theme::TEXT_DIM
+            };
+            push_line(
+                &mut quads,
+                cx - arm,
+                cy - arm,
+                cx + arm,
+                cy + arm,
+                1.4 * self.scale,
+                color,
+            );
+            push_line(
+                &mut quads,
+                cx + arm,
+                cy - arm,
+                cx - arm,
+                cy + arm,
+                1.4 * self.scale,
+                color,
+            );
+        }
+
+        let content = self.editor_content_rect();
+        match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                for (x, y, width, height) in editor.selection_spans() {
+                    push_rect(
+                        &mut quads,
+                        Rect {
+                            x: content.x + x,
+                            y: content.y + y,
+                            w: width,
+                            h: height,
+                        },
+                        theme::SELECTION,
+                    );
+                }
+            }
+            TabContent::Shell(shell) => {
+                for (x, y, width, height) in shell.selection_spans() {
+                    push_rect(
+                        &mut quads,
+                        Rect {
+                            x: content.x + x,
+                            y: content.y + y,
+                            w: width,
+                            h: height,
+                        },
+                        theme::SELECTION,
+                    );
+                }
+            }
+        }
+
+        quads
+    }
+
+    pub fn foreground_quads(&self) -> Vec<QuadVertex> {
+        let mut quads = Vec::new();
+        let content = self.editor_content_rect();
+
+        if self.show_whitespace {
+            match &self.active_tab().content {
+                TabContent::Editor(editor) => {
+                    let line_height = editor.line_height();
+                    let breaks = |line: usize| editor.document.has_line_break(line);
+                    push_whitespace_markers(
+                        &mut quads,
+                        &editor.buffer,
+                        content,
+                        self.body_font_size,
+                        line_height,
+                        &breaks,
+                    );
+                }
+                TabContent::Shell(shell) => {
+                    let line_count = shell.lines.len();
+                    let line_height = shell.line_height();
+                    let breaks = |line: usize| line < line_count;
+                    push_whitespace_markers(
+                        &mut quads,
+                        &shell.buffer,
+                        content,
+                        self.body_font_size,
+                        line_height,
+                        &breaks,
+                    );
+                }
+            }
+        }
+
+        if self.focus == Focus::Sidebar && self.sidebar.visible {
+            push_rect(&mut quads, self.right, theme::OVERLAY_DIM);
+        } else if self.focus == Focus::Right && self.sidebar.visible {
+            push_rect(&mut quads, self.sidebar_rect, theme::OVERLAY_DIM);
+        }
+
+        if self.focus == Focus::Right && (self.mode == Mode::Normal || self.cursor_blink) {
+            let cursor = match &self.active_tab().content {
+                TabContent::Editor(editor) => editor.cursor_rect(),
+                TabContent::Shell(shell) => shell.cursor_rect(),
+            };
+            if let Some((x, y, height)) = cursor {
+                push_rect(
+                    &mut quads,
+                    Rect {
+                        x: content.x + x,
+                        y: content.y + y + 2.0 * self.scale,
+                        w: 2.0 * self.scale,
+                        h: (height - 4.0 * self.scale).max(2.0),
+                    },
+                    theme::CURSOR,
+                );
+            }
+        }
+
+        quads
+    }
+
+    pub fn ime_area(&self) -> Option<Rect> {
+        if self.focus != Focus::Right || self.mode != Mode::Insert {
+            return None;
+        }
+        let content = self.editor_content_rect();
+        let cursor = match &self.active_tab().content {
+            TabContent::Editor(editor) => editor.cursor_rect(),
+            TabContent::Shell(shell) => shell.cursor_rect(),
+        }?;
+        Some(Rect {
+            x: content.x + cursor.0,
+            y: content.y + cursor.1,
+            w: 2.0 * self.scale,
+            h: cursor.2,
+        })
+    }
+
+    pub fn cursor_blink_reset(&mut self) {
+        self.cursor_blink = true;
+    }
+
+    pub fn toggle_cursor_blink(&mut self) {
+        self.cursor_blink = !self.cursor_blink;
+    }
+
+    pub fn set_mouse(&mut self, x: f32, y: f32) {
+        self.mouse_x = x;
+        self.mouse_y = y;
+    }
+
+    pub fn mouse(&self) -> (f32, f32) {
+        (self.mouse_x, self.mouse_y)
+    }
+
+    pub fn hit_tab(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.tab_strip.contains(x, y) {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .position(|tab| tab.rect.w > 1.0 && tab.rect.contains(x, y))
+    }
+
+    pub fn hit_close(&self, x: f32, y: f32) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.close_rect.is_some_and(|close| close.contains(x, y)))
+    }
+
+    pub fn hit_window_close(&self, x: f32, y: f32) -> bool {
+        self.window_close.contains(x, y)
+    }
+
+    pub fn hit_titlebar(&self, y: f32) -> bool {
+        y < self.titlebar_h
+    }
+
+    pub fn hit_sidebar(&self, x: f32, y: f32) -> bool {
+        self.sidebar.visible && self.sidebar_rect.contains(x, y)
+    }
+
+    pub fn hit_right(&self, x: f32, y: f32) -> bool {
+        self.right.contains(x, y)
+    }
+
+    pub fn editor_position(
+        &mut self,
+        font_system: &mut FontSystem,
+        x: f32,
+        y: f32,
+    ) -> Option<Position> {
+        let content = self.editor_content_rect();
+        let editor = self.active_editor_mut()?;
+        editor.position_at(font_system, x - content.x, y - content.y)
+    }
+
+    pub fn set_editor_selection(&mut self, font_system: &mut FontSystem, selection: Selection) {
+        if let Some(editor) = self.active_editor_mut() {
+            editor.set_selection(font_system, selection);
+        }
+    }
+
+    pub fn scroll(&mut self, font_system: &mut FontSystem, x: f32, y: f32, lines: f32) {
+        if self.tab_overflow && self.tab_strip.contains(x, y) {
+            self.tab_scroll = (self.tab_scroll - lines * 48.0 * self.scale).max(0.0);
+            self.layout_tabs(false);
+            return;
+        }
+        if self.sidebar.visible && self.sidebar_rect.contains(x, y) {
+            self.sidebar.scroll_by(font_system, -lines);
+            return;
+        }
+        if !self.right.contains(x, y) {
+            return;
+        }
+        match &mut self.active_tab_mut().content {
+            TabContent::Editor(editor) => {
+                editor.scroll_by(font_system, -lines * editor.line_height());
+            }
+            TabContent::Shell(shell) => {
+                shell.scroll_by(font_system, -lines * shell.line_height());
+            }
+        }
+    }
+
+    pub fn refresh_status(&mut self, font_system: &mut FontSystem) {
+        let mut text = match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                let cursor = editor.cursor_position();
+                format!(
+                    "{}   {}   Ln {}, Col {}",
+                    kite_core::display_path(editor.document.path()),
+                    editor.encoding_name(),
+                    cursor.line + 1,
+                    cursor.ch + 1
+                )
+            }
+            TabContent::Shell(shell) => {
+                let (line, column) = shell.cursor_line_column();
+                let running = if shell.is_running() { "   running" } else { "" };
+                format!(
+                    "{}   shell{}   Ln {}, Col {}",
+                    kite_core::display_path(&shell.cwd),
+                    running,
+                    line,
+                    column
+                )
+            }
+        };
+        if let Some(message) = &self.message {
+            text.push_str("   ");
+            text.push_str(message);
+        }
+        text.push_str(match (self.focus, self.mode) {
+            (Focus::Sidebar, _) => "   [SIDEBAR]",
+            (Focus::Right, Mode::Insert) => "   [INSERT]",
+            (Focus::Right, Mode::Normal) => "   [NORMAL]",
+        });
+        if self.topmost {
+            text.push_str("   [TOP]");
+        }
+        let key = format!("{text}|{}", self.message.as_deref().unwrap_or(""));
+        if key == self.status_key {
+            return;
+        }
+        self.status_key = key;
+        let color = if self
+            .message
+            .as_deref()
+            .is_some_and(|message| message.starts_with('!'))
+        {
+            theme::RED
+        } else {
+            theme::STATUS_TEXT
+        };
+        self.status = make_label(
+            font_system,
+            &attrs(self.family, color),
+            self.status_font_size,
+            &text,
+        );
+    }
+
+    fn refresh_label(&mut self, font_system: &mut FontSystem, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let active = index == self.active;
+        let color = if active { theme::TEXT } else { theme::TEXT_DIM };
+        let font_size = self.tab_font_size;
+        let attr = attrs(self.family, color);
+        let title = tab.title.clone();
+        tab.label = make_label(font_system, &attr, font_size, &title);
+        let (width, _) = measure(&tab.label);
+        tab.label_width = width;
+        let close_extra = if tab.is_shell() {
+            4.0 * self.scale
+        } else {
+            self.close_w + 6.0 * self.scale
+        };
+        tab.desired_width = (width + self.tab_pad * 2.0 + close_extra)
+            .min(220.0 * self.scale)
+            .max(70.0 * self.scale);
+    }
+
+    fn recompute_layout(&mut self, font_system: &mut FontSystem) {
+        let width = self.size.width as f32;
+        let height = self.size.height as f32;
+        self.titlebar_h = 40.0 * self.scale;
+        self.status_h = 26.0 * self.scale;
+        let body_h = (height - self.titlebar_h - self.status_h).max(1.0);
+        self.status_rect = Rect {
+            x: 0.0,
+            y: height - self.status_h,
+            w: width,
+            h: self.status_h,
+        };
+        self.window_close = Rect {
+            x: width - 46.0 * self.scale,
+            y: 0.0,
+            w: 46.0 * self.scale,
+            h: self.titlebar_h,
+        };
+
+        if self.sidebar.visible {
+            self.sidebar_w = (280.0 * self.scale).min(width * 0.45);
+            self.sidebar_rect = Rect {
+                x: 0.0,
+                y: self.titlebar_h,
+                w: self.sidebar_w,
+                h: body_h,
+            };
+            self.right = Rect {
+                x: self.sidebar_w,
+                y: self.titlebar_h,
+                w: (width - self.sidebar_w).max(1.0),
+                h: body_h,
+            };
+        } else {
+            self.sidebar_w = 0.0;
+            self.sidebar_rect = Rect::default();
+            self.right = Rect {
+                x: 0.0,
+                y: self.titlebar_h,
+                w: width.max(1.0),
+                h: body_h,
+            };
+        }
+
+        let content = self.editor_content_rect();
+        for tab in &mut self.tabs {
+            match &mut tab.content {
+                TabContent::Editor(editor) => {
+                    editor.set_viewport(font_system, content.w, content.h)
+                }
+                TabContent::Shell(shell) => shell.set_viewport(font_system, content.w, content.h),
+            }
+        }
+        if self.sidebar.visible {
+            let sidebar_content = self.sidebar_content_rect();
+            self.sidebar
+                .set_viewport(font_system, sidebar_content.w, sidebar_content.h);
+        }
+
+        self.layout_tabs(true);
+        self.refresh_status(font_system);
+    }
+
+    fn layout_tabs(&mut self, reveal_active: bool) {
+        let y = 5.0 * self.scale;
+        let h = (self.titlebar_h - 10.0 * self.scale).max(1.0);
+        let start = self.logo_width + 42.0 * self.scale;
+        let max_right = self.window_close.x - 8.0 * self.scale;
+        let available = (max_right - start).max(1.0);
+        self.tab_strip = Rect {
+            x: start,
+            y,
+            w: (max_right - start).max(0.0),
+            h,
+        };
+        let count = self.tabs.len();
+        if count == 0 {
+            self.tab_scroll = 0.0;
+            self.tab_overflow = false;
+            return;
+        }
+
+        let gap = self.tab_gap;
+        let total_gap = gap * count.saturating_sub(1) as f32;
+        let min_width = 64.0 * self.scale;
+        let desired: Vec<f32> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.desired_width.max(min_width))
+            .collect();
+        let desired_sum: f32 = desired.iter().sum();
+        let mut widths = desired.clone();
+        self.tab_overflow = false;
+        if desired_sum + total_gap > available {
+            let room = (available - total_gap).max(1.0);
+            let min_sum = min_width * count as f32;
+            if min_sum <= room {
+                let slack: f32 = desired.iter().map(|width| width - min_width).sum();
+                let factor = if slack > 0.0 {
+                    ((room - min_sum) / slack).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                for (width, wanted) in widths.iter_mut().zip(&desired) {
+                    *width = min_width + (wanted - min_width) * factor;
+                }
+            } else {
+                widths = vec![min_width; count];
+                self.tab_overflow = true;
+            }
+        }
+
+        let content_width: f32 = widths.iter().sum::<f32>() + total_gap;
+        let max_scroll = (content_width - available).max(0.0);
+        self.tab_scroll = self.tab_scroll.clamp(0.0, max_scroll);
+        if reveal_active {
+            let active = self.active.min(count - 1);
+            let active_left: f32 = widths[..active].iter().map(|width| width + gap).sum();
+            let active_right = active_left + widths[active];
+            if active_left < self.tab_scroll {
+                self.tab_scroll = active_left;
+            } else if active_right > self.tab_scroll + available {
+                self.tab_scroll = active_right - available;
+            }
+            self.tab_scroll = self.tab_scroll.clamp(0.0, max_scroll);
+        }
+
+        let mut x = start - self.tab_scroll;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let width = widths[index];
+            let visible_width = (x + width).min(max_right) - x.max(start);
+            if visible_width <= 1.0 {
+                tab.rect = Rect { x, y, w: 0.0, h };
+                tab.close_rect = None;
+                x += width + gap;
+                continue;
+            }
+            tab.rect = Rect { x, y, w: width, h };
+            let close = Rect {
+                x: x + width - self.close_w - 3.0 * self.scale,
+                y: y + (h - self.close_w) / 2.0,
+                w: self.close_w,
+                h: self.close_w,
+            };
+            tab.close_rect = if tab.is_shell()
+                || width < 44.0 * self.scale
+                || close.x < start
+                || close.right() > max_right
+            {
+                None
+            } else {
+                Some(close)
+            };
+            x += width + gap;
+        }
+    }
+
+    fn tabbar_rect(&self) -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: self.size.width as f32,
+            h: self.titlebar_h,
+        }
+    }
+
+    fn hover_tab(&self, index: usize) -> bool {
+        self.tab_strip.contains(self.mouse_x, self.mouse_y)
+            && self
+                .tabs
+                .get(index)
+                .is_some_and(|tab| tab.rect.contains(self.mouse_x, self.mouse_y))
+    }
+
+    fn hover_close(&self, index: usize) -> bool {
+        self.tabs.get(index).is_some_and(|tab| {
+            tab.close_rect
+                .is_some_and(|close| close.contains(self.mouse_x, self.mouse_y))
+        })
+    }
+}
+
+fn make_tab(
+    font_system: &mut FontSystem,
+    family: &'static str,
+    font_size: f32,
+    tab_pad: f32,
+    close_w: f32,
+    shell_pad: f32,
+    title: &str,
+    content: TabContent,
+) -> Tab {
+    let attr = attrs(family, theme::TEXT_DIM);
+    let label = make_label(font_system, &attr, font_size, title);
+    let (label_width, _) = measure(&label);
+    let close_extra = match &content {
+        TabContent::Shell(_) => shell_pad,
+        TabContent::Editor(_) => close_w + 6.0,
+    };
+    Tab {
+        content,
+        title: title.to_string(),
+        label,
+        label_width,
+        desired_width: label_width + tab_pad * 2.0 + close_extra,
+        rect: Rect::default(),
+        close_rect: None,
+    }
+}
+
+fn make_label(
+    font_system: &mut FontSystem,
+    attr: &Attrs<'static>,
+    font_size: f32,
+    text: &str,
+) -> Buffer {
+    let line_height = (font_size * 1.35).ceil();
+    let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
+    buffer.set_wrap(Wrap::None);
+    buffer.set_size(None, None);
+    buffer.set_text(text, attr, Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+fn measure(buffer: &Buffer) -> (f32, f32) {
+    match buffer.layout_runs().next() {
+        Some(run) => (run.line_w, run.line_height),
+        None => (0.0, 0.0),
+    }
+}
+
+fn bounds_of(rect: Rect) -> TextBounds {
+    TextBounds {
+        left: rect.x as i32,
+        top: rect.y as i32,
+        right: rect.right() as i32,
+        bottom: rect.bottom() as i32,
+    }
+}
+
+fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    let [r, g, b, a] = color.as_rgba();
+    let color = [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ];
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.right();
+    let y1 = rect.bottom();
+    for [x, y] in [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]] {
+        quads.push(QuadVertex {
+            position: [x, y],
+            color,
+        });
+    }
+}
+
+fn push_line(
+    quads: &mut Vec<QuadVertex>,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    color: Color,
+) {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 0.001 {
+        return;
+    }
+    let nx = -dy / length * width / 2.0;
+    let ny = dx / length * width / 2.0;
+    let [r, g, b, a] = color.as_rgba();
+    let color = [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ];
+    let corners = [
+        [x1 + nx, y1 + ny],
+        [x2 + nx, y2 + ny],
+        [x2 - nx, y2 - ny],
+        [x1 - nx, y1 - ny],
+    ];
+    for index in [0usize, 1, 2, 0, 2, 3] {
+        quads.push(QuadVertex {
+            position: corners[index],
+            color,
+        });
+    }
+}
+
+fn push_whitespace_markers(
+    quads: &mut Vec<QuadVertex>,
+    buffer: &Buffer,
+    origin: Rect,
+    font_size: f32,
+    line_height: f32,
+    has_break: &dyn Fn(usize) -> bool,
+) {
+    let dot_color = Color::rgba(0x8a, 0x93, 0xb5, 0x72);
+    let mark_color = Color::rgba(0x7a, 0xa2, 0xf7, 0x8c);
+    let mut runs = buffer.layout_runs().peekable();
+    while let Some(run) = runs.next() {
+        for glyph in run.glyphs {
+            let cluster = &run.text[glyph.start..glyph.end];
+            let count = cluster.chars().count().max(1);
+            let cell = glyph.w / count as f32;
+            for (index, value) in cluster.chars().enumerate() {
+                let x = glyph.x + cell * index as f32;
+                match value {
+                    ' ' => {
+                        let size = (font_size * 0.12).max(1.5);
+                        push_rect(
+                            quads,
+                            Rect {
+                                x: origin.x + x + cell / 2.0 - size / 2.0,
+                                y: origin.y + run.line_top + line_height * 0.62,
+                                w: size,
+                                h: size,
+                            },
+                            dot_color,
+                        );
+                    }
+                    '\t' => {
+                        let y = origin.y + run.line_top + line_height * 0.62;
+                        let start = origin.x + x + 2.0;
+                        let end = origin.x + x + cell - 2.0;
+                        push_line(quads, start, y, end, y, 1.2, mark_color);
+                        push_line(quads, end, y, end - 4.0, y - 3.0, 1.2, mark_color);
+                        push_line(quads, end, y, end - 4.0, y + 3.0, 1.2, mark_color);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let last_visual = runs.peek().is_none_or(|next| next.line_i != run.line_i);
+        if last_visual && has_break(run.line_i) {
+            let x = origin.x + run.line_w + 3.0;
+            let y = origin.y + run.line_top + line_height * 0.55;
+            push_line(quads, x, y, x + 6.0, y, 1.2, mark_color);
+            push_line(quads, x + 6.0, y, x + 6.0, y + 4.5, 1.2, mark_color);
+            push_line(quads, x + 6.0, y + 4.5, x + 2.5, y + 4.5, 1.2, mark_color);
+        }
+    }
+}
