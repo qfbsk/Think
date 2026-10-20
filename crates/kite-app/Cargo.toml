@@ -20,4 +20,6 @@ bytemuck.workspace = true
 arboard.workspace = true
 trash.workspace = true
 unicode-segmentation.workspace = true
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+toml.workspace = true
+winreg.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

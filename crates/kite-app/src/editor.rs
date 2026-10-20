@@ -33,7 +33,7 @@ impl Editor {
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);
         buffer.set_size(Some(view_width.max(1.0)), Some(view_height.max(1.0)));
-        let line_attrs = attrs(family, theme::TEXT);
+        let line_attrs = attrs(family, theme::text());
         for index in 0..document.line_count() {
             let text = document.line_text(index);
             buffer.lines.push(buffer_line(&text, &line_attrs));
@@ -407,7 +407,7 @@ impl Editor {
                 let scroll = self.buffer.scroll();
                 self.buffer.set_scroll(Scroll { line, ..scroll });
             }
-            let line_attrs = attrs(self.family, theme::TEXT);
+            let line_attrs = attrs(self.family, theme::text());
             let new_lines = (0..change.new_count)
                 .map(|index| {
                     let text = self.document.line_text(change.start_line + index);
@@ -428,7 +428,7 @@ impl Editor {
     }
 
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
-        let line_attrs = attrs(self.family, theme::TEXT);
+        let line_attrs = attrs(self.family, theme::text());
         let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);

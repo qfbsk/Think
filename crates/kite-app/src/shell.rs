@@ -5,10 +5,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{AttrsList, Buffer, BufferLine, Cursor, Metrics, Scroll, Shaping, Wrap};
+use glyphon::cosmic_text::{
+    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Scroll, Shaping, Wrap,
+};
 use kite_core::display_path;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::banner;
 use crate::text::{attrs, byte_to_char, char_to_byte, force_relayout};
 use crate::theme;
 
@@ -25,6 +28,8 @@ pub enum LineKind {
 pub struct ShellLine {
     pub text: String,
     pub kind: LineKind,
+    prompt_bytes: usize,
+    spans: Vec<(std::ops::Range<usize>, Color)>,
 }
 
 pub enum ShellEffect {
@@ -86,6 +91,14 @@ impl Shell {
             prompt_bytes: 0,
             prompt_len: 0,
         };
+        for line in banner::lines() {
+            shell.lines.push(ShellLine {
+                text: line.text,
+                kind: LineKind::Output,
+                prompt_bytes: 0,
+                spans: line.spans,
+            });
+        }
         shell.rebuild_buffer(font_system);
         shell
     }
@@ -348,7 +361,7 @@ impl Shell {
         self.history_draft.clear();
 
         let prompt = self.prompt_text();
-        self.push_line(format!("{prompt}{command}"), LineKind::Echo);
+        self.push_echo(&prompt, &command);
 
         let trimmed = command.trim();
         if trimmed.is_empty() {
@@ -569,16 +582,54 @@ impl Shell {
         buffer.set_size(Some(self.view_width), Some(self.view_height));
 
         for line in &self.lines {
+            if line.kind == LineKind::Echo && line.prompt_bytes > 0 {
+                let base = attrs(
+                    self.family,
+                    theme::prompt().map_or(theme::text(), |prompt| prompt.input),
+                );
+                let mut list = AttrsList::new(&base);
+                match theme::prompt() {
+                    Some(prompt) if line.prompt_bytes >= 2 => {
+                        let path_end = line.prompt_bytes - 2;
+                        list.add_span(0..path_end, &attrs(self.family, prompt.path));
+                        list.add_span(
+                            path_end..line.prompt_bytes,
+                            &attrs(self.family, prompt.arrow),
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        list.add_span(0..line.prompt_bytes, &attrs(self.family, theme::text_dim()));
+                    }
+                }
+                add_syntax_spans(
+                    &mut list,
+                    self.family,
+                    &line.text[line.prompt_bytes..],
+                    line.prompt_bytes,
+                );
+                buffer.lines.push(BufferLine::new(
+                    line.text.clone(),
+                    glyphon::cosmic_text::LineEnding::Lf,
+                    list,
+                    Shaping::Advanced,
+                ));
+                continue;
+            }
             let color = match line.kind {
-                LineKind::Error => theme::RED,
-                LineKind::Echo => theme::TEXT_DIM,
-                LineKind::Output => theme::TEXT,
+                LineKind::Error => theme::red(),
+                LineKind::Echo => theme::text_dim(),
+                LineKind::Output => theme::text(),
             };
             let line_attrs = attrs(self.family, color);
+            let mut list = AttrsList::new(&line_attrs);
+            for (range, span_color) in &line.spans {
+                list.add_span(range.clone(), &attrs(self.family, *span_color));
+            }
             buffer.lines.push(BufferLine::new(
                 line.text.clone(),
                 glyphon::cosmic_text::LineEnding::Lf,
-                AttrsList::new(&line_attrs),
+                list,
                 Shaping::Advanced,
             ));
         }
@@ -608,17 +659,51 @@ impl Shell {
         self.prompt_len = prompt.chars().count();
         let prompt_bytes = prompt.len();
         let text = format!("{prompt}{}", self.input);
-        let base = attrs(self.family, theme::TEXT);
-        let dim = attrs(self.family, theme::TEXT_DIM);
+        let base = attrs(
+            self.family,
+            theme::prompt().map_or(theme::text(), |prompt| prompt.input),
+        );
         let mut list = AttrsList::new(&base);
         if prompt_bytes > 0 {
-            list.add_span(0..prompt_bytes, &dim);
+            if let Some(prompt) = theme::prompt() {
+                if prompt_bytes >= 2 {
+                    let path_end = prompt_bytes - 2;
+                    list.add_span(0..path_end, &attrs(self.family, prompt.path));
+                    list.add_span(path_end..prompt_bytes, &attrs(self.family, prompt.arrow));
+                }
+            } else {
+                list.add_span(0..prompt_bytes, &attrs(self.family, theme::text_dim()));
+            }
         }
+        add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes);
         (text, list, prompt_bytes)
     }
 
     fn push_line(&mut self, text: String, kind: LineKind) {
-        self.lines.push(ShellLine { text, kind });
+        self.lines.push(ShellLine {
+            text,
+            kind,
+            prompt_bytes: 0,
+            spans: Vec::new(),
+        });
+        self.trim_lines();
+    }
+
+    fn push_echo(&mut self, prompt: &str, command: &str) {
+        let mut text = String::with_capacity(prompt.len() + command.len());
+        text.push_str(prompt);
+        let prompt_bytes = text.len();
+        text.push_str(command);
+        self.lines.push(ShellLine {
+            text,
+            kind: LineKind::Echo,
+            prompt_bytes,
+            spans: Vec::new(),
+        });
+        self.trim_lines();
+    }
+
+    fn trim_lines(&mut self) {
         if self.lines.len() > SCROLLBACK_LIMIT {
             let overflow = self.lines.len() - SCROLLBACK_LIMIT;
             self.lines.drain(0..overflow);
@@ -953,6 +1038,101 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenKind {
+    Command,
+    Flag,
+    String,
+    Number,
+    Argument,
+}
+
+fn add_syntax_spans(list: &mut AttrsList, family: &'static str, text: &str, offset: usize) {
+    for (range, kind) in command_spans(text) {
+        let color = match kind {
+            TokenKind::Command => theme::accent(),
+            TokenKind::Flag => theme::pink(),
+            TokenKind::String => theme::green(),
+            TokenKind::Number => theme::yellow(),
+            TokenKind::Argument => continue,
+        };
+        list.add_span(
+            offset + range.start..offset + range.end,
+            &attrs(family, color),
+        );
+    }
+}
+
+fn command_spans(text: &str) -> Vec<(std::ops::Range<usize>, TokenKind)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    let mut first = true;
+    while index < text.len() {
+        let ch = text[index..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        let start = index;
+        let mut quote = None;
+        let mut quote_start = 0;
+        let mut quoted = Vec::new();
+        while index < text.len() {
+            let ch = text[index..].chars().next().unwrap();
+            if let Some(open) = quote {
+                index += ch.len_utf8();
+                if ch == open {
+                    quoted.push((quote_start, index));
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+                quote_start = index;
+                index += ch.len_utf8();
+                continue;
+            }
+            if ch.is_whitespace() {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        if quote.is_some() {
+            quoted.push((quote_start, text.len()));
+        }
+        let end = index;
+        let kind = if first {
+            TokenKind::Command
+        } else {
+            classify(&text[start..end])
+        };
+        let mut cursor = start;
+        for (from, to) in quoted {
+            if cursor < from {
+                spans.push((cursor..from, kind));
+            }
+            spans.push((from..to, TokenKind::String));
+            cursor = to;
+        }
+        if cursor < end {
+            spans.push((cursor..end, kind));
+        }
+        first = false;
+    }
+    spans
+}
+
+fn classify(word: &str) -> TokenKind {
+    if word.len() > 1 && word.starts_with('-') {
+        return TokenKind::Flag;
+    }
+    if !word.is_empty() && word.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+        return TokenKind::Number;
+    }
+    TokenKind::Argument
+}
+
 fn split_args(line: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -1002,4 +1182,45 @@ fn grapheme_next(text: &str, ch: usize) -> Option<usize> {
     }
     let grapheme = text[byte..].graphemes(true).next()?;
     Some(byte_to_char(text, byte + grapheme.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenizes_commands_flags_strings_and_numbers() {
+        let spans = command_spans("git commit -m \"hello world\" 42 file.txt");
+        assert_eq!(spans[0], (0..3, TokenKind::Command));
+        assert_eq!(spans[1], (4..10, TokenKind::Argument));
+        assert_eq!(spans[2], (11..13, TokenKind::Flag));
+        assert_eq!(spans[3], (14..27, TokenKind::String));
+        assert_eq!(spans[4], (28..30, TokenKind::Number));
+        assert_eq!(spans[5], (31..39, TokenKind::Argument));
+    }
+
+    #[test]
+    fn unmatched_quotes_stay_string_while_typing() {
+        let spans = command_spans("echo \"unfinished");
+        assert_eq!(
+            spans,
+            vec![(0..4, TokenKind::Command), (5..16, TokenKind::String)]
+        );
+    }
+
+    #[test]
+    fn quoted_segments_inside_a_word_keep_their_bounds() {
+        let spans = command_spans("cp foo\" bar\"baz out");
+        assert_eq!(spans[0], (0..2, TokenKind::Command));
+        assert_eq!(spans[1], (3..6, TokenKind::Argument));
+        assert_eq!(spans[2], (6..12, TokenKind::String));
+        assert_eq!(spans[3], (12..15, TokenKind::Argument));
+        assert_eq!(spans[4], (16..19, TokenKind::Argument));
+    }
+
+    #[test]
+    fn empty_input_has_no_spans() {
+        assert!(command_spans("").is_empty());
+        assert!(command_spans("   ").is_empty());
+    }
 }

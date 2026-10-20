@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use glyphon::{Cache, FontSystem, SwashCache, TextArea, TextAtlas, TextRenderer, Viewport};
+use glyphon::{
+    Cache, ColorMode, FontSystem, SwashCache, TextArea, TextAtlas, TextRenderer, Viewport,
+};
 use wgpu::{
     AddressMode, Backends, BindGroup, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType, BufferUsages,
@@ -42,8 +44,39 @@ struct BackgroundUniform {
     tint: [f32; 4],
 }
 
-const BACKGROUND: &[u8] = include_bytes!("../assets/background.jpg");
-const BACKGROUND_DIM: f32 = 0.18;
+const BACKGROUND_BLURRED: &[u8] = include_bytes!("../assets/background.jpg");
+const BACKGROUND_SHARP: &[u8] = include_bytes!("../assets/background-neo.jpg");
+
+fn embedded_background(wallpaper: theme::Wallpaper) -> image::RgbaImage {
+    let bytes = match wallpaper {
+        theme::Wallpaper::Blurred => BACKGROUND_BLURRED,
+        theme::Wallpaper::Sharp => BACKGROUND_SHARP,
+    };
+    image::load_from_memory(bytes)
+        .expect("embedded kite background is not a valid jpeg")
+        .to_rgba8()
+}
+
+fn load_background(max_dimension: u32) -> (image::RgbaImage, Option<String>) {
+    let embedded = || embedded_background(theme::background().wallpaper);
+    let Some(path) = theme::background().image.as_ref() else {
+        return (embedded(), None);
+    };
+    match image::open(path) {
+        Ok(image) => {
+            let image = if image.width() > max_dimension || image.height() > max_dimension {
+                image.thumbnail(max_dimension, max_dimension)
+            } else {
+                image
+            };
+            (image.to_rgba8(), None)
+        }
+        Err(error) => (
+            embedded(),
+            Some(format!("background {}: {error}", path.display())),
+        ),
+    }
+}
 
 pub struct Renderer {
     instance: Instance,
@@ -57,6 +90,7 @@ pub struct Renderer {
     bg_bind_group: BindGroup,
     bg_uniform_buffer: Buffer,
     bg_image_size: [f32; 2],
+    background_notice: Option<String>,
 
     pipeline: RenderPipeline,
     uniform_buffer: Buffer,
@@ -71,6 +105,10 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn background_notice(&self) -> Option<&str> {
+        self.background_notice.as_deref()
+    }
+
     pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
         let size = window.inner_size().max(PhysicalSize::new(1, 1));
         let instance = Instance::new(InstanceDescriptor {
@@ -192,9 +230,8 @@ impl Renderer {
             cache: None,
         });
 
-        let background = image::load_from_memory(BACKGROUND)
-            .expect("kite background is not a valid image")
-            .to_rgba8();
+        let (background, background_notice) =
+            load_background(device.limits().max_texture_dimension_2d);
         let (bg_width, bg_height) = background.dimensions();
         let background_texture = device.create_texture(&TextureDescriptor {
             label: Some("kite background"),
@@ -350,7 +387,7 @@ impl Renderer {
 
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        let mut atlas = TextAtlas::with_color_mode(&device, &queue, &cache, format, ColorMode::Web);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
@@ -365,6 +402,7 @@ impl Renderer {
             bg_bind_group,
             bg_uniform_buffer,
             bg_image_size: [bg_width as f32, bg_height as f32],
+            background_notice,
             pipeline,
             uniform_buffer,
             bind_group,
@@ -468,10 +506,10 @@ impl Renderer {
             size: [self.config.width as f32, self.config.height as f32],
             image: self.bg_image_size,
             tint: [
-                theme::BG.r() as f32 / 255.0,
-                theme::BG.g() as f32 / 255.0,
-                theme::BG.b() as f32 / 255.0,
-                BACKGROUND_DIM,
+                theme::bg().r() as f32 / 255.0,
+                theme::bg().g() as f32 / 255.0,
+                theme::bg().b() as f32 / 255.0,
+                theme::background().dim,
             ],
         };
         self.queue
@@ -490,9 +528,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color {
-                            r: theme::BG.r() as f64 / 255.0,
-                            g: theme::BG.g() as f64 / 255.0,
-                            b: theme::BG.b() as f64 / 255.0,
+                            r: theme::bg().r() as f64 / 255.0,
+                            g: theme::bg().g() as f64 / 255.0,
+                            b: theme::bg().b() as f64 / 255.0,
                             a: 1.0,
                         }),
                         store: StoreOp::Store,

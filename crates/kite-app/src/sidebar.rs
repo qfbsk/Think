@@ -301,17 +301,17 @@ impl Sidebar {
         buffer.set_size(Some(self.width), Some(self.height));
         for row in &self.rows {
             let color = if row.is_drive {
-                theme::GREEN
+                theme::green()
             } else if row.is_dir {
-                theme::ACCENT
+                theme::accent()
             } else {
-                theme::TEXT
+                theme::text()
             };
             let line_attrs = attrs(self.family, color);
             buffer.lines.push(buffer_line(&row.label, &line_attrs));
         }
         if buffer.lines.is_empty() {
-            let line_attrs = attrs(self.family, theme::TEXT_DIM);
+            let line_attrs = attrs(self.family, theme::text_dim());
             buffer.lines.push(buffer_line(" ", &line_attrs));
         }
         let line = self

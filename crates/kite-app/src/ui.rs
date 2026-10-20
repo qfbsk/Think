@@ -176,11 +176,11 @@ impl Ui {
 
         let logo_attrs = Attrs::new()
             .family(glyphon::cosmic_text::Family::Name(family))
-            .color(theme::ACCENT)
+            .color(theme::accent())
             .weight(Weight::BOLD);
         let logo = make_label(font_system, &logo_attrs, 15.0 * scale, "kite");
         let (logo_width, _) = measure(&logo);
-        let status_attrs = attrs(family, theme::TEXT_DIM);
+        let status_attrs = attrs(family, theme::text_dim());
         let status = make_label(font_system, &status_attrs, status_font_size, "");
 
         let shell_tab = make_tab(
@@ -324,13 +324,13 @@ impl Ui {
 
         let logo_attrs = Attrs::new()
             .family(glyphon::cosmic_text::Family::Name(self.family))
-            .color(theme::ACCENT)
+            .color(theme::accent())
             .weight(Weight::BOLD);
         self.logo = make_label(font_system, &logo_attrs, 15.0 * scale, "kite");
         self.logo_width = measure(&self.logo).0;
         self.status = make_label(
             font_system,
-            &attrs(self.family, theme::TEXT_DIM),
+            &attrs(self.family, theme::text_dim()),
             self.status_font_size,
             "",
         );
@@ -616,7 +616,7 @@ impl Ui {
             top: (self.titlebar_h - 15.0 * self.scale * 1.35) / 2.0,
             scale: 1.0,
             bounds: logo_bounds,
-            default_color: theme::ACCENT,
+            default_color: theme::accent(),
             custom_glyphs: &[],
         });
 
@@ -652,9 +652,9 @@ impl Ui {
                 scale: 1.0,
                 bounds,
                 default_color: if index == self.active {
-                    theme::TEXT
+                    theme::text()
                 } else {
-                    theme::TEXT_DIM
+                    theme::text_dim()
                 },
                 custom_glyphs: &[],
             });
@@ -669,7 +669,7 @@ impl Ui {
                     top: content.y,
                     scale: 1.0,
                     bounds: bounds_of(content),
-                    default_color: theme::TEXT,
+                    default_color: theme::text(),
                     custom_glyphs: &[],
                 });
             }
@@ -681,7 +681,7 @@ impl Ui {
                     top: content.y,
                     scale: 1.0,
                     bounds: bounds_of(content),
-                    default_color: theme::TEXT,
+                    default_color: theme::text(),
                     custom_glyphs: &[],
                 });
             }
@@ -695,7 +695,7 @@ impl Ui {
                 top: content.y,
                 scale: 1.0,
                 bounds: bounds_of(content),
-                default_color: theme::TEXT,
+                default_color: theme::text(),
                 custom_glyphs: &[],
             });
         }
@@ -707,7 +707,7 @@ impl Ui {
             top: self.status_rect.y + (self.status_rect.h - self.status_line_height) / 2.0,
             scale: 1.0,
             bounds: status_bounds,
-            default_color: theme::STATUS_TEXT,
+            default_color: theme::status_text(),
             custom_glyphs: &[],
         });
 
@@ -716,8 +716,8 @@ impl Ui {
 
     pub fn background_quads(&self) -> Vec<QuadVertex> {
         let mut quads = Vec::new();
-        push_rect(&mut quads, self.right, theme::PANEL);
-        push_rect(&mut quads, self.status_rect, theme::STATUS);
+        push_rect(&mut quads, self.right, theme::panel());
+        push_rect(&mut quads, self.status_rect, theme::status());
         push_rect(
             &mut quads,
             Rect {
@@ -726,7 +726,7 @@ impl Ui {
                 w: self.size.width as f32,
                 h: 1.0 * self.scale,
             },
-            theme::BORDER,
+            theme::border(),
         );
         push_rect(
             &mut quads,
@@ -736,11 +736,11 @@ impl Ui {
                 w: self.size.width as f32,
                 h: 1.0 * self.scale,
             },
-            theme::BORDER,
+            theme::border(),
         );
 
         if self.sidebar.visible {
-            push_rect(&mut quads, self.sidebar_rect, theme::SIDEBAR);
+            push_rect(&mut quads, self.sidebar_rect, theme::sidebar());
             push_rect(
                 &mut quads,
                 Rect {
@@ -749,7 +749,7 @@ impl Ui {
                     w: 1.0 * self.scale,
                     h: self.sidebar_rect.h,
                 },
-                theme::BORDER,
+                theme::border(),
             );
             if let Some(row) = self.sidebar.selected_row() {
                 let visible_start = self.sidebar.buffer.scroll().line;
@@ -766,7 +766,7 @@ impl Ui {
                                 w: self.sidebar_rect.w - 8.0 * self.scale,
                                 h: self.sidebar.line_height(),
                             },
-                            theme::ACCENT_DIM,
+                            theme::accent_dim(),
                         );
                     }
                     let _ = row;
@@ -774,18 +774,18 @@ impl Ui {
             }
         }
 
-        push_rect(&mut quads, self.tabbar_rect(), theme::PANEL_DIM);
+        push_rect(&mut quads, self.tabbar_rect(), theme::panel_dim());
         for (index, tab) in self.tabs.iter().enumerate() {
             let shown = tab.rect.clip_x(self.tab_strip.x, self.tab_strip.right());
             if shown.w <= 1.0 {
                 continue;
             }
             let color = if index == self.active {
-                theme::TAB_ACTIVE
+                theme::tab_active()
             } else if self.hover_tab(index) {
-                theme::TAB_HOVER
+                theme::tab_hover()
             } else {
-                theme::PANEL_DIM
+                theme::panel_dim()
             };
             push_rect(&mut quads, shown, color);
             if index == self.active {
@@ -796,13 +796,13 @@ impl Ui {
                     h: 2.0 * self.scale,
                 }
                 .clip_x(self.tab_strip.x, self.tab_strip.right());
-                push_rect(&mut quads, underline, theme::ACCENT);
+                push_rect(&mut quads, underline, theme::accent());
             }
             if let Some(close) = tab.close_rect {
                 let color = if self.hover_close(index) {
-                    theme::RED
+                    theme::red()
                 } else {
-                    theme::TEXT_FAINT
+                    theme::text_faint()
                 };
                 let inset = 5.0 * self.scale;
                 push_line(
@@ -839,13 +839,13 @@ impl Ui {
                 }
                 .clip_x(self.tab_strip.x, self.tab_strip.right());
                 if dot.w >= 1.0 {
-                    push_rect(&mut quads, dot, theme::YELLOW);
+                    push_rect(&mut quads, dot, theme::yellow());
                 }
             }
         }
 
         if self.window_close.contains(self.mouse_x, self.mouse_y) {
-            push_rect(&mut quads, self.window_close, theme::RED);
+            push_rect(&mut quads, self.window_close, theme::red());
         }
         {
             let close = self.window_close;
@@ -853,9 +853,9 @@ impl Ui {
             let cy = close.y + close.h / 2.0;
             let arm = 5.0 * self.scale;
             let color = if close.contains(self.mouse_x, self.mouse_y) {
-                theme::BG
+                theme::bg()
             } else {
-                theme::TEXT_DIM
+                theme::text_dim()
             };
             push_line(
                 &mut quads,
@@ -889,7 +889,7 @@ impl Ui {
                             w: width,
                             h: height,
                         },
-                        theme::SELECTION,
+                        theme::selection(),
                     );
                 }
             }
@@ -903,7 +903,7 @@ impl Ui {
                             w: width,
                             h: height,
                         },
-                        theme::SELECTION,
+                        theme::selection(),
                     );
                 }
             }
@@ -947,9 +947,9 @@ impl Ui {
         }
 
         if self.focus == Focus::Sidebar && self.sidebar.visible {
-            push_rect(&mut quads, self.right, theme::OVERLAY_DIM);
+            push_rect(&mut quads, self.right, theme::overlay_dim());
         } else if self.focus == Focus::Right && self.sidebar.visible {
-            push_rect(&mut quads, self.sidebar_rect, theme::OVERLAY_DIM);
+            push_rect(&mut quads, self.sidebar_rect, theme::overlay_dim());
         }
 
         if self.focus == Focus::Right && (self.mode == Mode::Normal || self.cursor_blink) {
@@ -966,7 +966,7 @@ impl Ui {
                         w: 2.0 * self.scale,
                         h: (height - 4.0 * self.scale).max(2.0),
                     },
-                    theme::CURSOR,
+                    theme::cursor(),
                 );
             }
         }
@@ -1125,9 +1125,9 @@ impl Ui {
             .as_deref()
             .is_some_and(|message| message.starts_with('!'))
         {
-            theme::RED
+            theme::red()
         } else {
-            theme::STATUS_TEXT
+            theme::status_text()
         };
         self.status = make_label(
             font_system,
@@ -1142,7 +1142,11 @@ impl Ui {
             return;
         };
         let active = index == self.active;
-        let color = if active { theme::TEXT } else { theme::TEXT_DIM };
+        let color = if active {
+            theme::text()
+        } else {
+            theme::text_dim()
+        };
         let font_size = self.tab_font_size;
         let attr = attrs(self.family, color);
         let title = tab.title.clone();
@@ -1351,7 +1355,7 @@ fn make_tab(
     title: &str,
     content: TabContent,
 ) -> Tab {
-    let attr = attrs(family, theme::TEXT_DIM);
+    let attr = attrs(family, theme::text_dim());
     let label = make_label(font_system, &attr, font_size, title);
     let (label_width, _) = measure(&label);
     let close_extra = match &content {
@@ -1469,8 +1473,8 @@ fn push_whitespace_markers(
     line_height: f32,
     has_break: &dyn Fn(usize) -> bool,
 ) {
-    let dot_color = Color::rgba(0x8a, 0x93, 0xb5, 0x72);
-    let mark_color = Color::rgba(0x7a, 0xa2, 0xf7, 0x8c);
+    let dot_color = theme::whitespace_dot();
+    let mark_color = theme::whitespace_mark();
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
         for glyph in run.glyphs {

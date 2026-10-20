@@ -13,6 +13,7 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowButto
 
 use crate::fonts::Fonts;
 use crate::renderer::Renderer;
+use crate::theme;
 use crate::ui::{Focus, Mode, Ui};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -85,10 +86,12 @@ pub struct App {
     ime_allowed: bool,
     fullscreen: bool,
     cursor_icon: CursorIcon,
+    startup_notice: Option<String>,
 }
 
 impl App {
     pub fn new() -> Self {
+        let startup_notice = theme::init();
         Self {
             fonts: None,
             window: None,
@@ -104,6 +107,7 @@ impl App {
             ime_allowed: true,
             fullscreen: false,
             cursor_icon: CursorIcon::Default,
+            startup_notice,
         }
     }
 
@@ -687,10 +691,15 @@ impl ApplicationHandler for App {
         }
 
         let renderer = pollster::block_on(Renderer::new(window.clone(), event_loop));
+        let background_notice = renderer.background_notice().map(str::to_owned);
         let fonts = self.fonts.get_or_insert_with(Fonts::load);
         let size = window.inner_size().max(PhysicalSize::new(1, 1));
         let scale = window.scale_factor() as f32;
-        let ui = Ui::new(&mut fonts.system, fonts.mono, size, scale);
+        let mut ui = Ui::new(&mut fonts.system, fonts.mono, size, scale);
+        ui.message = match (self.startup_notice.take(), background_notice) {
+            (Some(theme), Some(background)) => Some(format!("{theme} · {background}")),
+            (theme, background) => theme.or(background),
+        };
 
         window.set_ime_allowed(true);
         window.set_cursor(CursorIcon::Default);
