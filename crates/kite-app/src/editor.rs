@@ -1,8 +1,14 @@
+use std::sync::Arc;
+
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{Buffer, Cursor, Metrics, Scroll, Wrap};
-use kite_core::{Document, Position, Selection, Unencodable};
+use glyphon::cosmic_text::{AttrsList, Buffer, Cursor, Metrics, Scroll, Wrap};
+use kite_core::{Change, Document, Position, Selection, Unencodable};
+use ropey::Rope;
+use tree_house::tree_sitter::{InputEdit, Point};
+use tree_house::{Language, Syntax};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::syntax::{self, Engine, Run};
 use crate::text::{attrs, buffer_line, byte_to_char, char_to_byte, force_relayout};
 use crate::theme;
 
@@ -11,9 +17,28 @@ pub struct Editor {
     pub buffer: Buffer,
     pub selection: Selection,
     pub desired_x: Option<f32>,
+    /// Decoded mirror of the document, only for the highlighter; never saved.
+    rope: Option<Rope>,
+    language: Option<Language>,
+    tree: Option<Syntax>,
+    colored: Option<(u64, usize, usize, Position)>,
+    engine: Arc<Engine>,
+    numbers: Buffer,
+    numbers_key: Option<NumbersKey>,
+    cell_width: f32,
     family: &'static str,
     font_size: f32,
     line_height: f32,
+    view_width: f32,
+    view_height: f32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct NumbersKey {
+    scroll_line: usize,
+    scroll_vertical: f32,
+    line_count: usize,
+    font_size: f32,
     view_width: f32,
     view_height: f32,
 }
@@ -26,6 +51,7 @@ impl Editor {
         view_width: f32,
         view_height: f32,
         font_size: f32,
+        engine: Arc<Engine>,
     ) -> Self {
         let line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
         let metrics = Metrics::new(font_size, line_height);
@@ -38,11 +64,29 @@ impl Editor {
             let text = document.line_text(index);
             buffer.lines.push(buffer_line(&text, &line_attrs));
         }
+        let language = syntax::language_for_path(document.path());
+        let rope = if language.is_some() {
+            mirror(&document)
+        } else {
+            None
+        };
+        let tree = match (language, rope.as_ref()) {
+            (Some(language), Some(rope)) => engine.parse(language, rope),
+            _ => None,
+        };
         let mut editor = Self {
             document,
             buffer,
             selection: Selection::caret(Position::default()),
             desired_x: None,
+            rope,
+            language,
+            tree,
+            colored: None,
+            engine,
+            numbers: Buffer::new_empty(metrics),
+            numbers_key: None,
+            cell_width: measure_cell(font_system, family, font_size, line_height),
             family,
             font_size,
             line_height,
@@ -52,6 +96,142 @@ impl Editor {
         force_relayout(&mut editor.buffer);
         editor.buffer.shape_until_scroll(font_system, true);
         editor
+    }
+
+    /// Colour the rows the viewport can see with one query pass over that range.
+    /// Only glyph attributes change; the document is never touched.
+    pub fn highlight(&mut self, font_system: &mut FontSystem) {
+        let revision = self.document.revision();
+        let rows = (self.view_height / self.line_height).ceil() as usize + 8;
+        let count = self.document.line_count();
+        let first = self.buffer.scroll().line.min(count);
+        let last = (first + rows).min(count);
+        let key = (revision, first, last, self.selection.cursor);
+        if self.colored == Some(key) {
+            return;
+        }
+        let runs = match (self.rope.as_ref(), self.tree.as_ref()) {
+            (Some(rope), Some(tree)) => {
+                let lines = rope.len_lines();
+                let from = rope.line_to_byte(first.min(lines));
+                let to = rope.line_to_byte(last.min(lines)).min(rope.len_bytes());
+                let mut runs = self.engine.runs(tree, rope, from, to);
+                runs.extend(self.pair_runs(tree, rope));
+                runs
+            }
+            _ => Vec::new(),
+        };
+        let base = attrs(self.family, theme::text());
+        for index in first..last {
+            let text = self.document.line_text(index);
+            let start = self
+                .rope
+                .as_ref()
+                .filter(|rope| index < rope.len_lines())
+                .map(|rope| rope.line_to_byte(index))
+                .unwrap_or(0);
+            let mut list = AttrsList::new(&base);
+            for run in &runs {
+                let from = run.start.saturating_sub(start).min(text.len());
+                let to = run.end.saturating_sub(start).min(text.len());
+                if from < to {
+                    list.add_span(from..to, &attrs(self.family, run.color));
+                }
+            }
+            if let Some(line) = self.buffer.lines.get_mut(index) {
+                line.set_attrs_list(list);
+            }
+        }
+        self.colored = Some(key);
+        self.buffer.shape_until_scroll(font_system, true);
+    }
+
+    /// The pair the caret sits to the right of, as two runs in the theme's match colour.
+    fn pair_runs(&self, tree: &Syntax, rope: &Rope) -> Vec<Run> {
+        if !self.selection.is_empty() {
+            return Vec::new();
+        }
+        let caret = self.selection.cursor;
+        let byte = rope.line_to_byte(caret.line)
+            + byte_of_char(&self.document.line_text(caret.line), caret.ch);
+        let pair = match syntax::bracket_pair(tree, byte) {
+            Some(pair) => pair,
+            None => return Vec::new(),
+        };
+        [pair.0, pair.1]
+            .into_iter()
+            .map(|(start, end)| Run {
+                start,
+                end,
+                color: self.engine.pair_color(),
+            })
+            .collect()
+    }
+
+    /// Keep the highlighter's rope in step with the document and hand tree-sitter the
+    /// same edit, so only the touched region re-parses.
+    fn sync(&mut self, change: Change) {
+        let lines = match self.rope.as_ref() {
+            Some(rope) => rope.len_lines(),
+            None => {
+                // An undo can bring a document back under the highlighter's budget.
+                if self.language.is_some() && syntax::enabled(self.document.len_bytes()) {
+                    self.rebuild_tree();
+                }
+                return;
+            }
+        };
+        if change.start_line + change.old_count > lines {
+            self.rebuild_tree();
+            return;
+        }
+        let from = self.rope.as_ref().unwrap().line_to_byte(change.start_line);
+        let to = self
+            .rope
+            .as_ref()
+            .unwrap()
+            .line_to_byte(change.start_line + change.old_count);
+        let joined: Vec<String> = (0..change.new_count)
+            .map(|index| self.document.line_text(change.start_line + index))
+            .collect();
+        let mut text = joined.join("\n");
+        if change.start_line + change.old_count < lines {
+            text.push('\n');
+        }
+        {
+            let rope = self.rope.as_mut().expect("rope");
+            rope.remove(from..to);
+            rope.insert(from, &text);
+        }
+        self.colored = None;
+        let edit = InputEdit {
+            start_byte: from as u32,
+            old_end_byte: to as u32,
+            new_end_byte: (from + text.len()) as u32,
+            start_point: Point::ZERO,
+            old_end_point: Point::ZERO,
+            new_end_point: Point::ZERO,
+        };
+        // A timed-out update still leaves a usable partial tree behind, and rebuilding
+        // would pay for a full re-parse; the next edit simply tries again.
+        if let (Some(tree), Some(rope)) = (self.tree.as_mut(), self.rope.as_ref()) {
+            let _ = tree.update(rope.slice(..), syntax::TIMEOUT, &[edit], &*self.engine);
+        } else {
+            self.rebuild_tree();
+        }
+    }
+
+    fn rebuild_tree(&mut self) {
+        self.rope = if self.language.is_some() {
+            mirror(&self.document)
+        } else {
+            None
+        };
+        self.tree = match (self.language, self.rope.as_ref()) {
+            (Some(language), Some(rope)) => self.engine.parse(language, rope),
+            _ => None,
+        };
+        self.colored = None;
     }
 
     pub fn set_viewport(&mut self, font_system: &mut FontSystem, width: f32, height: f32) {
@@ -73,6 +253,7 @@ impl Editor {
         }
         self.font_size = font_size;
         self.line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
+        self.cell_width = measure_cell(font_system, self.family, font_size, self.line_height);
         self.buffer
             .set_metrics(Metrics::new(font_size, self.line_height));
         self.buffer
@@ -81,6 +262,90 @@ impl Editor {
 
     pub fn line_height(&self) -> f32 {
         self.line_height
+    }
+
+    pub fn gutter_width(&self) -> f32 {
+        self.cell_width * (self.digits() as f32 + 1.5)
+    }
+
+    pub fn numbers(&self) -> &Buffer {
+        &self.numbers
+    }
+
+    pub fn numbers_left(&self) -> f32 {
+        self.cell_width * 0.5
+    }
+
+    /// One row per visible layout run so the gutter stays aligned with wrapped rows.
+    pub fn refresh_numbers(&mut self, font_system: &mut FontSystem) {
+        let scroll = self.buffer.scroll();
+        let key = NumbersKey {
+            scroll_line: scroll.line,
+            scroll_vertical: scroll.vertical,
+            line_count: self.document.line_count(),
+            font_size: self.font_size,
+            view_width: self.view_width,
+            view_height: self.view_height,
+        };
+        if self.numbers_key == Some(key) {
+            return;
+        }
+        self.numbers_key = Some(key);
+
+        let digits = self.digits();
+        let mut rows = Vec::new();
+        let mut previous: Option<usize> = None;
+        for run in self.buffer.layout_runs() {
+            let first_row = previous != Some(run.line_i);
+            previous = Some(run.line_i);
+            let text = if first_row {
+                format!("{:>digits$}", run.line_i + 1)
+            } else {
+                " ".repeat(digits)
+            };
+            rows.push((text, theme::text_dim()));
+        }
+
+        let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
+        buffer.set_wrap(Wrap::None);
+        buffer.set_tab_width(4);
+        buffer.set_size(Some(self.gutter_width()), Some(self.view_height));
+        for (text, color) in rows {
+            buffer
+                .lines
+                .push(buffer_line(&text, &attrs(self.family, color)));
+        }
+        if buffer.lines.is_empty() {
+            buffer
+                .lines
+                .push(buffer_line(" ", &attrs(self.family, theme::text_dim())));
+        }
+        buffer.set_scroll(Scroll {
+            line: 0,
+            vertical: scroll.vertical,
+            horizontal: 0.0,
+        });
+        force_relayout(&mut buffer);
+        buffer.shape_until_scroll(font_system, false);
+        self.numbers = buffer;
+    }
+
+    fn digits(&self) -> usize {
+        let mut value = self.document.line_count().max(1);
+        let mut digits = 1;
+        while value >= 10 {
+            value /= 10;
+            digits += 1;
+        }
+        digits
+    }
+
+    pub fn retheme(&mut self, font_system: &mut FontSystem) {
+        let previous = self.buffer.scroll();
+        self.rebuild_buffer(font_system);
+        self.buffer.set_scroll(previous);
+        self.buffer.shape_until_scroll(font_system, true);
+        self.numbers_key = None;
     }
 
     pub fn shape(&mut self, font_system: &mut FontSystem) {
@@ -98,6 +363,58 @@ impl Editor {
         text: &str,
     ) -> Result<(), Unencodable> {
         self.selection = self.document.apply_edit(self.selection, text)?;
+        self.after_change(font_system);
+        Ok(())
+    }
+
+    /// Enter keeps the current line's leading whitespace, steps one literal tab
+    /// deeper after an unclosed opener, and splits a pair the caret sits inside
+    /// into three lines. Bytes outside the inserted text are never touched.
+    pub fn newline(&mut self, font_system: &mut FontSystem) -> Result<(), Unencodable> {
+        if !self.selection.is_empty() {
+            self.selection = self.document.apply_edit(self.selection, "\n")?;
+            self.after_change(font_system);
+            return Ok(());
+        }
+        let caret = self.selection.cursor;
+        let text = self.document.line_text(caret.line);
+        let split = byte_of_char(&text, caret.ch);
+        let (before, after) = (&text[..split], &text[split..]);
+        let lead: String = text
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+
+        let closes_here = after
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| matches!(c, '}' | ')' | ']'))
+            && after
+                .chars()
+                .rev()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(|c| matches!(c, '}' | ')' | ']'));
+        if closes_here {
+            let middle = format!("{lead}\t");
+            let inserted = format!("\n{middle}\n{lead}");
+            self.selection = self.document.apply_edit(self.selection, &inserted)?;
+            let inner = Position::new(caret.line + 1, middle.chars().count());
+            self.selection = Selection::caret(inner);
+            self.desired_x = None;
+            self.after_change(font_system);
+            return Ok(());
+        }
+
+        let opens = before
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| matches!(c, '{' | '(' | '['));
+        let middle = if opens { format!("{lead}\t") } else { lead };
+        self.selection = self
+            .document
+            .apply_edit(self.selection, &format!("\n{middle}"))?;
+        self.desired_x = None;
         self.after_change(font_system);
         Ok(())
     }
@@ -349,6 +666,10 @@ impl Editor {
         let end_cursor = self.position_cosmic(end);
         let mut spans = Vec::new();
         for run in self.buffer.layout_runs() {
+            // cosmic-text marks every glyph of a run outside the range
+            if run.line_i < start.line || run.line_i > end.line {
+                continue;
+            }
             for (x, width) in run.highlight(start_cursor, end_cursor) {
                 spans.push((x, run.line_top, width, run.line_height));
             }
@@ -394,12 +715,13 @@ impl Editor {
         self.document.encoding().name()
     }
 
-    pub fn is_modified(&self) -> bool {
-        self.document.is_modified()
+    pub fn line_delta(&mut self) -> (usize, usize) {
+        self.document.line_delta()
     }
 
     fn after_change(&mut self, font_system: &mut FontSystem) {
         if let Some(change) = self.document.take_change() {
+            self.sync(change);
             if change.start_line < self.buffer.scroll().line {
                 let current = self.buffer.scroll().line as isize;
                 let delta = change.new_count as isize - change.old_count as isize;
@@ -438,6 +760,7 @@ impl Editor {
             buffer.lines.push(buffer_line(&text, &line_attrs));
         }
         self.buffer = buffer;
+        self.colored = None;
         force_relayout(&mut self.buffer);
         self.buffer
             .shape_until_cursor(font_system, self.cursor_cosmic(), true);
@@ -546,6 +869,205 @@ impl Editor {
 
 fn is_word_char(value: char) -> bool {
     value.is_alphanumeric() || value == '_'
+}
+
+fn byte_of_char(text: &str, column: usize) -> usize {
+    text.char_indices()
+        .nth(column)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// Decoded copy of the document, kept only for the highlighter. A document over the
+/// tree-sitter budget returns `None` and stays uncoloured rather than trading memory
+/// for colour; nothing here is ever written back.
+fn mirror(document: &Document) -> Option<Rope> {
+    if !syntax::enabled(document.len_bytes()) {
+        return None;
+    }
+    let joined = (0..document.line_count())
+        .map(|index| document.line_text(index))
+        .collect::<Vec<String>>()
+        .join("\n");
+    Some(Rope::from(joined))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::Fonts;
+    use kite_core::Position;
+
+    fn editor(text: &str) -> (Editor, Fonts) {
+        let mut fonts = Fonts::load();
+        let document =
+            Document::from_bytes("kite-editor-test.txt", text.as_bytes().to_vec()).unwrap();
+        let editor = Editor::new(
+            document,
+            &mut fonts.system,
+            fonts.mono,
+            400.0,
+            200.0,
+            16.0,
+            Arc::new(Engine::new()),
+        );
+        (editor, fonts)
+    }
+
+    fn tops(editor: &Editor, line: usize) -> Vec<f32> {
+        editor
+            .buffer
+            .layout_runs()
+            .filter(|run| run.line_i == line)
+            .map(|run| run.line_top)
+            .collect()
+    }
+
+    #[test]
+    fn selection_stays_on_the_selected_rows() {
+        let (mut editor, mut fonts) = editor("alpha\nbravo\ncharlie delta\n");
+        editor.set_selection(
+            &mut fonts.system,
+            Selection::new(Position::new(2, 0), Position::new(2, 7)),
+        );
+        let spans = editor.selection_spans();
+        assert!(!spans.is_empty());
+        let rows = tops(&editor, 2);
+        assert!(
+            spans.iter().all(|(_, y, _, _)| rows.contains(y)),
+            "spans leaked onto other lines: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn multiline_selection_covers_only_its_range() {
+        let (mut editor, mut fonts) = editor("alpha\nbravo\ncharlie\ndelta\n");
+        editor.set_selection(
+            &mut fonts.system,
+            Selection::new(Position::new(1, 2), Position::new(2, 3)),
+        );
+        let spans = editor.selection_spans();
+        let mut rows = tops(&editor, 1);
+        rows.extend(tops(&editor, 2));
+        assert!(!spans.is_empty());
+        assert!(
+            spans.iter().all(|(_, y, _, _)| rows.contains(y)),
+            "spans leaked outside the selection: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn gutter_holds_one_row_per_visible_run() {
+        let (mut editor, mut fonts) = editor("one\ntwo\nthree\n");
+        editor.refresh_numbers(&mut fonts.system);
+        let rows: Vec<String> = editor
+            .numbers
+            .lines
+            .iter()
+            .map(|line| line.text().to_string())
+            .collect();
+        assert_eq!(rows, vec!["1", "2", "3", "4"]);
+    }
+
+    fn place(editor: &mut Editor, fonts: &mut Fonts, line: usize, ch: usize) {
+        editor.set_selection(&mut fonts.system, Selection::caret(Position::new(line, ch)));
+    }
+
+    fn rows(editor: &Editor) -> Vec<String> {
+        (0..editor.document.line_count())
+            .map(|index| editor.document.line_text(index))
+            .collect()
+    }
+
+    #[test]
+    fn enter_repeats_the_leading_whitespace() {
+        let (mut editor, mut fonts) = editor("\tint x = 1;\n");
+        place(&mut editor, &mut fonts, 0, 11);
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(rows(&editor), vec!["\tint x = 1;", "\t", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 1));
+    }
+
+    #[test]
+    fn enter_copies_tabs_and_spaces_in_order() {
+        let (mut editor, mut fonts) = editor("  \tx\n");
+        place(&mut editor, &mut fonts, 0, 4);
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(rows(&editor)[1], "  \t");
+    }
+
+    #[test]
+    fn enter_steps_one_tab_after_an_opener() {
+        let (mut editor, mut fonts) = editor("int main() {\n}\n");
+        place(&mut editor, &mut fonts, 0, 12);
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(rows(&editor), vec!["int main() {", "\t", "}", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 1));
+    }
+
+    #[test]
+    fn enter_inside_a_pair_splits_into_three_lines() {
+        let (mut editor, mut fonts) = editor("    if (x) {}\n");
+        place(&mut editor, &mut fonts, 0, 12);
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(rows(&editor), vec!["    if (x) {", "    \t", "    }", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 5));
+    }
+
+    #[test]
+    fn enter_never_touches_the_other_side_of_a_pair() {
+        let (mut editor, mut fonts) = editor("f(ab)\n");
+        place(&mut editor, &mut fonts, 0, 3);
+        editor.newline(&mut fonts.system).unwrap();
+        // Nothing at the caret is a closer and the line does not end with an
+        // opener, so this is a plain line break: text after the caret is intact.
+        assert_eq!(rows(&editor), vec!["f(a", "b)", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 0));
+    }
+
+    #[test]
+    fn one_undo_undoes_the_whole_split() {
+        let (mut editor, mut fonts) = editor("if (x) {\n}\n");
+        place(&mut editor, &mut fonts, 0, 8);
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(editor.document.is_modified(), true);
+        assert!(editor.undo(&mut fonts.system));
+        assert_eq!(rows(&editor), vec!["if (x) {", "}", ""]);
+        assert_eq!(editor.document.line_delta(), (0, 0));
+    }
+
+    #[test]
+    fn enter_with_a_selection_replaces_it_and_stays_atomic() {
+        let (mut editor, mut fonts) = editor("alpha\nbravo\n");
+        editor.set_selection(
+            &mut fonts.system,
+            Selection::new(Position::new(0, 5), Position::new(1, 5)),
+        );
+        editor.newline(&mut fonts.system).unwrap();
+        assert_eq!(rows(&editor), vec!["alpha", "", ""]);
+        assert!(editor.undo(&mut fonts.system));
+        assert_eq!(rows(&editor), vec!["alpha", "bravo", ""]);
+    }
+}
+
+pub(crate) fn measure_cell(
+    font_system: &mut FontSystem,
+    family: &'static str,
+    font_size: f32,
+    line_height: f32,
+) -> f32 {
+    const SAMPLE: &str = "0000000000";
+    let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
+    buffer.set_wrap(Wrap::None);
+    buffer.set_size(None, None);
+    buffer
+        .lines
+        .push(buffer_line(SAMPLE, &attrs(family, theme::text())));
+    buffer.shape_until_scroll(font_system, false);
+    match buffer.layout_runs().next() {
+        Some(run) => run.line_w / SAMPLE.chars().count() as f32,
+        None => font_size * 0.6,
+    }
 }
 
 fn index_in_cluster(

@@ -1,15 +1,34 @@
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{Buffer, Metrics, Scroll, Wrap};
+use glyphon::cosmic_text::{
+    AttrsList, Buffer, BufferLine, Color, LineEnding, Metrics, Scroll, Shaping, Wrap,
+};
+use kite_core::display_path;
 
+use crate::editor::measure_cell;
+use crate::git;
 use crate::text::{attrs, buffer_line, force_relayout};
 use crate::theme;
 
-const FOLDER_ICON: char = '\u{f07b}';
-const FILE_ICON: char = '\u{f15b}';
+const FOLDER_ICON: char = '󰉋';
+const EMPTY_FOLDER_ICON: char = '';
+const FILE_ICON: char = '󰈔';
+const DRIVE_ICON: char = '󰋊';
+const GIT_FOLDER_ICON: char = '';
+
+const ICON_BLUE: Color = Color::rgb(0x89, 0xb4, 0xfa);
+const ICON_SAPPHIRE: Color = Color::rgb(0x74, 0xc7, 0xec);
+const ICON_TEAL: Color = Color::rgb(0x94, 0xe2, 0xd5);
+const ICON_GREEN: Color = Color::rgb(0xa6, 0xe3, 0xa1);
+const ICON_YELLOW: Color = Color::rgb(0xf9, 0xe2, 0xaf);
+const ICON_ORANGE: Color = Color::rgb(0xfa, 0xb3, 0x87);
+const ICON_RED: Color = Color::rgb(0xf3, 0x8b, 0xa8);
+const ICON_MAUVE: Color = Color::rgb(0xcb, 0xa6, 0xf7);
+const ICON_GREY: Color = Color::rgb(0xcd, 0xd6, 0xf4);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Root {
@@ -23,12 +42,42 @@ pub struct Row {
     pub is_dir: bool,
     pub label: String,
     pub is_drive: bool,
+    /// Tracked by git but gone from the work tree: listed, never opened.
+    pub missing: bool,
+    icon: Range<usize>,
+    icon_color: Color,
+    /// git's own letter for the state, in the leftmost column.
+    mark: Option<(char, Color)>,
+    delta: Option<(Range<usize>, Range<usize>)>,
 }
 
 pub enum SidebarAction {
     Open(PathBuf),
+    Missing,
 }
 
+impl Row {
+    /// Command the shell input receives when Space sends this row across.
+    pub fn quick_command(&self) -> String {
+        let path = display_path(&self.path);
+        let target = if path.chars().any(char::is_whitespace) {
+            format!("\"{path}\"")
+        } else {
+            path
+        };
+        if self.is_dir {
+            format!("cd {target}")
+        } else if self
+            .path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        {
+            target
+        } else {
+            format!("kkk {target}")
+        }
+    }
+}
 pub struct Sidebar {
     pub visible: bool,
     pub root: Root,
@@ -36,9 +85,11 @@ pub struct Sidebar {
     pub selected: usize,
     pub buffer: Buffer,
     expanded: HashSet<PathBuf>,
+    git: git::Probe,
     family: &'static str,
     font_size: f32,
     line_height: f32,
+    cell_width: f32,
     width: f32,
     height: f32,
 }
@@ -54,6 +105,7 @@ impl Sidebar {
         let root = initial_root();
         let line_height = (font_size * 1.4).ceil();
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
+        let cell_width = measure_cell(font_system, family, font_size, line_height);
         let mut sidebar = Self {
             visible: false,
             root,
@@ -61,9 +113,11 @@ impl Sidebar {
             selected: 0,
             buffer,
             expanded: HashSet::new(),
+            git: git::Probe::new(),
             family,
             font_size,
             line_height,
+            cell_width,
             width: width.max(1.0),
             height: height.max(1.0),
         };
@@ -92,6 +146,28 @@ impl Sidebar {
         }
         self.font_size = font_size;
         self.line_height = (font_size * 1.4).ceil();
+        self.cell_width = measure_cell(font_system, self.family, font_size, self.line_height);
+        self.rebuild(font_system);
+    }
+
+    /// Take whatever the git worker has finished; `true` means the listing redrew.
+    pub fn poll_git(&mut self, font_system: &mut FontSystem) -> bool {
+        if !self.git.poll() {
+            return false;
+        }
+        self.rebuild(font_system);
+        true
+    }
+
+    pub fn git_pending(&self) -> bool {
+        self.git.pending()
+    }
+
+    /// A save, a shell-tab commit or simply opening the panel changes what git
+    /// reports. Ask again and redraw now — a bump alone would wait for a rebuild
+    /// that nothing promises to make.
+    pub fn git_changed(&mut self, font_system: &mut FontSystem) {
+        self.git.invalidate();
         self.rebuild(font_system);
     }
 
@@ -125,6 +201,9 @@ impl Sidebar {
                 None
             }
             Root::Dir(_) => {
+                if row.missing {
+                    return Some(SidebarAction::Missing);
+                }
                 if row.is_dir {
                     let path = row.path.clone();
                     if !self.expanded.remove(&path) {
@@ -203,6 +282,10 @@ impl Sidebar {
         }
     }
 
+    pub fn retheme(&mut self, font_system: &mut FontSystem) {
+        self.rebuild(font_system);
+    }
+
     pub fn scroll_by(&mut self, font_system: &mut FontSystem, delta_lines: f32) {
         if delta_lines.abs() < f32::EPSILON {
             return;
@@ -271,22 +354,37 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self, font_system: &mut FontSystem) {
+        let columns = (self.width / self.cell_width.max(1.0)).floor() as usize;
         self.rows = match &self.root {
             Root::Drives => drives()
                 .into_iter()
                 .map(|path| {
-                    let label = path.to_string_lossy().trim_end_matches('\\').to_string();
+                    let name = path.to_string_lossy().trim_end_matches('\\').to_string();
+                    let (label, icon, _) = row_text(None, 0, DRIVE_ICON, &name, None, columns);
                     Row {
                         path,
                         is_dir: true,
                         label,
                         is_drive: true,
+                        missing: false,
+                        icon,
+                        icon_color: ICON_GREEN,
+                        mark: None,
+                        delta: None,
                     }
                 })
                 .collect(),
             Root::Dir(root) => {
+                let root = root.clone();
+                let expanded = self.expanded.clone();
+                // Ask for every directory the walk is about to open, so one rebuild
+                // covers them all; the listing itself only ever reads the cache.
+                self.git.want(&root);
+                for dir in &expanded {
+                    self.git.want(dir);
+                }
                 let mut rows = Vec::new();
-                append_directory(&mut rows, root, 0, &self.expanded);
+                self.append_directory(&mut rows, &root, 0, &expanded, columns);
                 rows
             }
         };
@@ -300,7 +398,9 @@ impl Sidebar {
         buffer.set_tab_width(4);
         buffer.set_size(Some(self.width), Some(self.height));
         for row in &self.rows {
-            let color = if row.is_drive {
+            let color = if row.missing {
+                theme::red()
+            } else if row.is_drive {
                 theme::green()
             } else if row.is_dir {
                 theme::accent()
@@ -308,7 +408,22 @@ impl Sidebar {
                 theme::text()
             };
             let line_attrs = attrs(self.family, color);
-            buffer.lines.push(buffer_line(&row.label, &line_attrs));
+            let mut spans = AttrsList::new(&line_attrs);
+            if let Some((mark, color)) = &row.mark {
+                let width = mark.len_utf8();
+                spans.add_span(0..width, &attrs(self.family, *color));
+            }
+            spans.add_span(row.icon.clone(), &attrs(self.family, row.icon_color));
+            if let Some((added, removed)) = &row.delta {
+                spans.add_span(added.clone(), &attrs(self.family, theme::green()));
+                spans.add_span(removed.clone(), &attrs(self.family, theme::red()));
+            }
+            buffer.lines.push(BufferLine::new(
+                row.label.clone(),
+                LineEnding::Lf,
+                spans,
+                Shaping::Advanced,
+            ));
         }
         if buffer.lines.is_empty() {
             let line_attrs = attrs(self.family, theme::text_dim());
@@ -329,53 +444,269 @@ impl Sidebar {
         self.buffer.shape_until_scroll(font_system, true);
         self.ensure_visible(font_system);
     }
-}
 
-fn append_directory(rows: &mut Vec<Row>, dir: &Path, depth: usize, expanded: &HashSet<PathBuf>) {
-    if depth > 64 {
-        return;
-    }
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = Vec::new();
-    for entry in read_dir.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    fn append_directory(
+        &self,
+        rows: &mut Vec<Row>,
+        dir: &Path,
+        depth: usize,
+        expanded: &HashSet<PathBuf>,
+        columns: usize,
+    ) {
+        if depth > 64 {
+            return;
+        }
+        let Ok(read_dir) = fs::read_dir(dir) else {
+            return;
         };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = file_type.is_dir() && !file_type.is_symlink();
-        entries.push((!is_dir, name.to_lowercase(), name, path, is_dir));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut entries: Vec<(bool, String, String, PathBuf, bool, Option<git::Entry>)> =
+            Vec::new();
+        for entry in read_dir.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = file_type.is_dir() && !file_type.is_symlink();
+            let found = if is_dir {
+                self.git.folder(&path).map(|state| git::Entry {
+                    state,
+                    added: 0,
+                    removed: 0,
+                })
+            } else {
+                self.git.entry(&path).copied()
+            };
+            entries.push((!is_dir, name.to_lowercase(), name, path, is_dir, found));
+        }
+        // Tracked files gone from the work tree are not in the listing; git says so,
+        // and they stay visible until they leave git too. A path can also be reported
+        // as deleted while a fresh file of the same name sits there, so the listing
+        // itself has the final say.
+        {
+            let present: HashSet<String> = entries
+                .iter()
+                .map(|(_, _, name, path, _, _)| {
+                    kite_core::identity(&path.parent().unwrap_or(dir).join(name))
+                })
+                .collect();
+            for (path, entry) in self.git.missing_in(dir) {
+                if present.contains(&kite_core::identity(path)) {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                entries.push((
+                    true,
+                    name.to_lowercase(),
+                    name.to_string(),
+                    path.clone(),
+                    false,
+                    Some(*entry),
+                ));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    for (_, _, name, path, is_dir) in entries {
-        let icon = if is_dir { FOLDER_ICON } else { FILE_ICON };
-        let indent = "  ".repeat(depth);
-        let label = format!("{indent}{icon}  {name}");
-        let expanded_here = is_dir && expanded.contains(&path);
-        rows.push(Row {
-            path: path.clone(),
-            is_dir,
-            label,
-            is_drive: false,
-        });
-        if expanded_here {
-            append_directory(rows, &path, depth + 1, expanded);
+        for (_, _, name, path, is_dir, found) in entries {
+            let missing = found.is_some_and(|entry| entry.state == git::State::Deleted) && !is_dir;
+            let (icon, icon_color) = if is_dir {
+                directory_icon(&path, &name)
+            } else {
+                file_icon(&name)
+            };
+            let mark = mark_of(found.map(|entry| entry.state));
+            let delta = found
+                .and_then(|entry| entry.delta())
+                .map(|(added, removed)| format!("+{added} -{removed}"));
+            let (label, icon_range, delta) = row_text(
+                mark.map(|(mark, _)| mark),
+                depth,
+                icon,
+                &name,
+                delta,
+                columns,
+            );
+            let expanded_here = is_dir && expanded.contains(&path);
+            rows.push(Row {
+                path: path.clone(),
+                is_dir,
+                label,
+                is_drive: false,
+                missing,
+                icon: icon_range,
+                icon_color,
+                mark,
+                delta,
+            });
+            if expanded_here {
+                self.append_directory(rows, &path, depth + 1, expanded, columns);
+            }
         }
     }
 }
 
+/// git's own letters, so the column reads like `git status` rather than a private icon set.
+fn mark_of(state: Option<git::State>) -> Option<(char, Color)> {
+    let (mark, color) = match state? {
+        git::State::Added => ('A', ICON_GREEN),
+        git::State::Conflicted => ('U', theme::pink()),
+        git::State::Deleted => ('D', theme::red()),
+        git::State::Ignored => ('!', theme::text_faint()),
+        git::State::Modified => ('M', ICON_YELLOW),
+        git::State::Renamed => ('R', ICON_BLUE),
+        git::State::Untracked => ('?', ICON_TEAL),
+    };
+    Some((mark, color))
+}
+
+/// The row's text: git's letter, the indent, the icon, the name, and the line counts
+/// pushed to the right edge of the panel. The name is what remains when there is no
+/// room left for that alignment.
+fn row_text(
+    mark: Option<char>,
+    depth: usize,
+    icon: char,
+    name: &str,
+    delta: Option<String>,
+    columns: usize,
+) -> (String, Range<usize>, Option<(Range<usize>, Range<usize>)>) {
+    let indent = "  ".repeat(depth);
+    let mark = mark.unwrap_or(' ');
+    let start = mark.len_utf8() + indent.len();
+    let mut label = format!("{mark}{indent}{icon}  {name}");
+    let end = start + icon.len_utf8();
+    let delta = match delta {
+        Some(delta) => {
+            let width = delta.chars().count();
+            let taken = label.chars().count();
+            if taken + width <= columns {
+                label.push_str(&" ".repeat(columns - taken - width));
+            } else {
+                label.push_str("   ");
+            }
+            let added = label.len();
+            label.push_str(&delta);
+            let plus = delta.find(' ').unwrap_or(1);
+            let removed = added + plus + 1;
+            Some((added..added + plus, removed..label.len()))
+        }
+        None => None,
+    };
+    (label, start..end, delta)
+}
+
+fn directory_icon(path: &Path, name: &str) -> (char, Color) {
+    if name.eq_ignore_ascii_case(".git") || path.join(".git").exists() {
+        return (GIT_FOLDER_ICON, ICON_ORANGE);
+    }
+    if is_empty_dir(path) {
+        return (EMPTY_FOLDER_ICON, ICON_SAPPHIRE);
+    }
+    match name.to_lowercase().as_str() {
+        ".github" => ('', ICON_SAPPHIRE),
+        ".cache" => ('󰪺', ICON_TEAL),
+        ".config" | ".local" => ('󱁿', ICON_TEAL),
+        ".vim" => ('', ICON_GREEN),
+        "src" => ('󰴉', ICON_MAUVE),
+        "doc" | "docs" => ('󱂷', ICON_MAUVE),
+        "bin" => ('󱧺', ICON_YELLOW),
+        "build" => ('󱧼', ICON_GREY),
+        "node_modules" => ('', ICON_GREEN),
+        "test" | "tests" => ('󱞊', ICON_BLUE),
+        "lib" => ('󰲂', ICON_YELLOW),
+        "desktop" => ('󰚝', ICON_ORANGE),
+        "documents" => ('󱧶', ICON_ORANGE),
+        "downloads" => ('󰉍', ICON_ORANGE),
+        "music" => ('󱍙', ICON_ORANGE),
+        "pictures" => ('󰉏', ICON_ORANGE),
+        "videos" => ('󱞊', ICON_ORANGE),
+        _ => (FOLDER_ICON, ICON_SAPPHIRE),
+    }
+}
+
+fn is_empty_dir(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+fn file_icon(name: &str) -> (char, Color) {
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "readme" | "readme.md" | "readme.txt" => return ('', ICON_YELLOW),
+        "license" | "license.md" | "license.txt" | "licence" | "licence.md" | "licence.txt" => {
+            return ('', ICON_TEAL);
+        }
+        "makefile" | "gnumakefile" => return ('󱁤', ICON_GREY),
+        "cmakelists.txt" => return ('󱁤', ICON_ORANGE),
+        "dockerfile" => return ('󰡨', ICON_BLUE),
+        "init.lua" => return ('', ICON_GREEN),
+        _ => {}
+    }
+    let ext = lower.rsplit_once('.').map_or("", |(_, ext)| ext);
+    match ext {
+        "c" => ('󰙱', ICON_BLUE),
+        "h" | "hpp" | "hh" | "hxx" => ('󰫵', ICON_MAUVE),
+        "cpp" | "cc" | "cxx" => ('󰙲', ICON_SAPPHIRE),
+        "cs" => ('󰌛', ICON_GREEN),
+        "rs" => ('󱘗', ICON_ORANGE),
+        "go" => ('󰟓', ICON_SAPPHIRE),
+        "py" | "pyw" => ('󰌠', ICON_YELLOW),
+        "js" | "mjs" | "cjs" => ('󰌞', ICON_YELLOW),
+        "jsx" => ('', ICON_SAPPHIRE),
+        "ts" => ('󰛦', ICON_SAPPHIRE),
+        "tsx" => ('', ICON_BLUE),
+        "html" | "htm" => ('󰌝', ICON_ORANGE),
+        "css" => ('󰌜', ICON_SAPPHIRE),
+        "scss" | "sass" => ('󰟬', ICON_RED),
+        "json" | "jsonc" => ('󰘦', ICON_YELLOW),
+        "toml" => ('', ICON_ORANGE),
+        "yaml" | "yml" => ('', ICON_MAUVE),
+        "xml" => ('󰗀', ICON_ORANGE),
+        "md" | "markdown" => ('󰍔', ICON_GREY),
+        "txt" => ('󰦪', ICON_YELLOW),
+        "lua" => ('󰢱', ICON_SAPPHIRE),
+        "vim" => ('', ICON_GREEN),
+        "sh" | "bash" | "zsh" | "fish" => ('', ICON_GREEN),
+        "ps1" | "psm1" => ('󰨊', ICON_BLUE),
+        "bat" | "cmd" => ('󰭟', ICON_GREY),
+        "java" => ('󰬷', ICON_ORANGE),
+        "kt" | "kts" => ('󱈙', ICON_BLUE),
+        "rb" => ('󰴭', ICON_RED),
+        "php" => ('󰌟', ICON_MAUVE),
+        "swift" => ('󰛥', ICON_ORANGE),
+        "m" | "mm" => ('󰀵', ICON_ORANGE),
+        "sql" | "db" | "sqlite" => ('󰆼', ICON_GREY),
+        "exe" | "msi" => ('󰖳', ICON_RED),
+        "zip" => ('󰗄', ICON_SAPPHIRE),
+        "7z" => ('󰗄', ICON_BLUE),
+        "rar" => ('󰗄', ICON_GREEN),
+        "gz" | "bz2" | "xz" | "zst" => ('󰗄', ICON_GREY),
+        "tar" => ('󰬁', ICON_TEAL),
+        "jpg" | "jpeg" => ('󰈥', ICON_ORANGE),
+        "png" => ('󰸭', ICON_MAUVE),
+        "gif" => ('󰵸', ICON_SAPPHIRE),
+        "webp" | "bmp" => ('󰈟', ICON_SAPPHIRE),
+        "svg" => ('󰜡', ICON_YELLOW),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => ('󰈣', ICON_TEAL),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" => ('󰈫', ICON_MAUVE),
+        "pdf" => ('󰈦', ICON_RED),
+        "doc" | "docx" => ('󱎒', ICON_SAPPHIRE),
+        "xls" | "xlsx" => ('󱎏', ICON_GREEN),
+        "ppt" | "pptx" => ('󱎐', ICON_RED),
+        "gitignore" | "gitmodules" => ('󰊢', ICON_MAUVE),
+        "gitattributes" => ('󰊢', ICON_YELLOW),
+        "gitconfig" => ('󰒓', ICON_ORANGE),
+        "editorconfig" => ('', ICON_GREY),
+        "cfg" | "conf" | "ini" => ('󰒓', ICON_GREY),
+        _ => (FILE_ICON, ICON_GREY),
+    }
+}
+
 fn initial_root() -> Root {
-    let Ok(cwd) = std::env::current_dir() else {
-        return Root::Drives;
-    };
-    let Some(root) = cwd.ancestors().last() else {
-        return Root::Drives;
-    };
+    let root = kite_core::start_dir();
     if root.is_dir() {
-        Root::Dir(root.to_path_buf())
+        Root::Dir(root)
     } else {
         Root::Drives
     }
@@ -401,4 +732,148 @@ fn drives() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 fn drives() -> Vec<PathBuf> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::Fonts;
+
+    fn listing(dir: &Path) -> Vec<Row> {
+        let mut fonts = Fonts::load();
+        let sidebar = Sidebar::new(&mut fonts.system, fonts.mono, 13.5, 280.0, 400.0);
+        let mut rows = Vec::new();
+        sidebar.append_directory(&mut rows, dir, 0, &HashSet::new(), 40);
+        rows
+    }
+
+    #[test]
+    fn resolves_known_file_icons() {
+        assert_eq!(file_icon("main.rs"), ('󱘗', ICON_ORANGE));
+        assert_eq!(file_icon("README.md"), ('', ICON_YELLOW));
+        assert_eq!(file_icon(".gitignore"), ('󰊢', ICON_MAUVE));
+        assert_eq!(file_icon("Cargo.toml"), ('', ICON_ORANGE));
+        assert_eq!(file_icon("no-extension"), (FILE_ICON, ICON_GREY));
+    }
+
+    #[test]
+    fn resolves_directories_and_git_repos() {
+        let base = std::env::temp_dir().join(format!("kite-sidebar-icons-{}", std::process::id()));
+        let repo = base.join("repo");
+        let plain = base.join("src");
+        let empty = base.join("empty");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(plain.join("main.rs"), "").unwrap();
+
+        assert_eq!(
+            directory_icon(&repo, "repo"),
+            (GIT_FOLDER_ICON, ICON_ORANGE)
+        );
+        assert_eq!(
+            directory_icon(&repo.join(".git"), ".git"),
+            (GIT_FOLDER_ICON, ICON_ORANGE)
+        );
+        assert_eq!(directory_icon(&plain, "src"), ('󰴉', ICON_MAUVE));
+        assert_eq!(
+            directory_icon(&empty, "empty"),
+            (EMPTY_FOLDER_ICON, ICON_SAPPHIRE)
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shows_hidden_entries_and_full_names() {
+        let base = std::env::temp_dir().join(format!("kite-sidebar-tree-{}", std::process::id()));
+        let hidden = base.join(".hidden_dir");
+        let empty = base.join("empty");
+        let repo = base.join("repo");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(hidden.join("keep"), "x").unwrap();
+        fs::write(base.join(".hidden.txt"), "x").unwrap();
+        fs::write(base.join("archive.tar.gz"), "x").unwrap();
+
+        let rows = listing(&base);
+
+        fn row<'a>(rows: &'a [Row], name: &str) -> &'a Row {
+            rows.iter()
+                .find(|row| row.path.file_name().and_then(|value| value.to_str()) == Some(name))
+                .unwrap_or_else(|| panic!("missing row for {name}"))
+        }
+        fn glyph(row: &Row) -> char {
+            row.label[row.icon.clone()].chars().next().unwrap()
+        }
+
+        assert!(row(&rows, ".hidden.txt").label.ends_with(".hidden.txt"));
+        assert!(
+            row(&rows, "archive.tar.gz")
+                .label
+                .ends_with("archive.tar.gz")
+        );
+        assert_eq!(glyph(row(&rows, ".hidden_dir")), FOLDER_ICON);
+        assert_eq!(glyph(row(&rows, "empty")), EMPTY_FOLDER_ICON);
+        assert_eq!(glyph(row(&rows, "repo")), GIT_FOLDER_ICON);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn icon_range_matches_glyph_bytes() {
+        let (label, range, _) = row_text(Some('M'), 2, GLYPH, "main.c", None, 80);
+        let glyph = label[range.clone()].chars().next().unwrap();
+        assert_eq!(glyph, GLYPH);
+        assert_eq!(range.len(), glyph.len_utf8());
+        // One git column, then two indent levels.
+        assert_eq!(range.start, 5);
+        assert_eq!(label.chars().next().unwrap(), 'M');
+    }
+
+    #[test]
+    fn line_counts_sit_on_the_right_edge() {
+        let (label, _, delta) = row_text(None, 0, GLYPH, "main.c", Some("+1 -19".into()), 40);
+        assert_eq!(label.chars().count(), 40);
+        assert!(label.ends_with("+1 -19"));
+        let (added, removed) = delta.unwrap();
+        assert_eq!(&label[added], "+1");
+        assert_eq!(&label[removed], "-19");
+
+        // A name that fills the panel keeps the counts, just not the alignment.
+        let (long, _, _) = row_text(None, 0, GLYPH, &"n".repeat(50), Some("+2 -3".into()), 40);
+        assert!(long.ends_with("+2 -3"));
+        assert!(long.chars().count() > 40);
+    }
+
+    const GLYPH: char = '󰙱';
+
+    #[test]
+    fn builds_quick_commands_for_space() {
+        let make = |path: &str, is_dir: bool| Row {
+            path: PathBuf::from(path),
+            is_dir,
+            label: String::new(),
+            is_drive: false,
+            missing: false,
+            icon: 0..0,
+            icon_color: ICON_SAPPHIRE,
+            mark: None,
+            delta: None,
+        };
+        assert_eq!(
+            make(r"E:\My Tools", true).quick_command(),
+            r#"cd "E:\My Tools""#
+        );
+        assert_eq!(make(r"E:\Think", true).quick_command(), r"cd E:\Think");
+        assert_eq!(
+            make(r"E:\Think\Cargo.toml", false).quick_command(),
+            r"kkk E:\Think\Cargo.toml"
+        );
+        assert_eq!(
+            make(r"E:\learn2test\Main.EXE", false).quick_command(),
+            r"E:\learn2test\Main.EXE"
+        );
+    }
 }

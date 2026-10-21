@@ -14,4 +14,4 @@ pub use document::{Change, Document, DocumentError, Line, Position, SaveError, S
 pub use encoding::{
     DetectedEncoding, EncodingKind, TextEncoding, Unencodable, UnsupportedEncoding,
 };
-pub use path::{FileKey, absolute_bound_path, display_path, file_key};
+pub use path::{FileKey, absolute_bound_path, display_path, file_key, identity, start_dir};

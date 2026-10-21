@@ -1,6 +1,9 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use glyphon::cosmic_text::{Attrs, Buffer, Color, Metrics, Shaping, Weight, Wrap};
+use glyphon::cosmic_text::{
+    Attrs, AttrsList, Buffer, BufferLine, Color, LineEnding, Metrics, Shaping, Weight, Wrap,
+};
 use glyphon::{FontSystem, TextArea, TextBounds};
 use kite_core::{Document, Position, Selection, file_key};
 use winit::dpi::PhysicalSize;
@@ -8,7 +11,8 @@ use winit::dpi::PhysicalSize;
 use crate::editor::Editor;
 use crate::renderer::QuadVertex;
 use crate::shell::{Shell, ShellEffect};
-use crate::sidebar::{Sidebar, SidebarAction};
+use crate::sidebar::{Row, Sidebar, SidebarAction};
+use crate::syntax::Engine;
 use crate::text::attrs;
 use crate::theme;
 
@@ -77,18 +81,14 @@ pub struct Tab {
     pub label: Buffer,
     pub label_width: f32,
     pub desired_width: f32,
+    /// The `+added -removed` the label was built with, so the counter only
+    /// reshapes when it actually changes.
+    label_delta: (usize, usize),
     pub rect: Rect,
     pub close_rect: Option<Rect>,
 }
 
 impl Tab {
-    pub fn is_modified(&self) -> bool {
-        match &self.content {
-            TabContent::Editor(editor) => editor.is_modified(),
-            TabContent::Shell(_) => false,
-        }
-    }
-
     pub fn is_shell(&self) -> bool {
         matches!(self.content, TabContent::Shell(_))
     }
@@ -108,6 +108,7 @@ pub struct Ui {
     pub topmost: bool,
     pub message: Option<String>,
     family: &'static str,
+    engine: Arc<Engine>,
 
     logo: Buffer,
     logo_width: f32,
@@ -182,6 +183,7 @@ impl Ui {
         let (logo_width, _) = measure(&logo);
         let status_attrs = attrs(family, theme::text_dim());
         let status = make_label(font_system, &status_attrs, status_font_size, "");
+        let engine = Arc::new(Engine::new());
 
         let shell_tab = make_tab(
             font_system,
@@ -207,6 +209,7 @@ impl Ui {
             topmost: false,
             message: None,
             family,
+            engine,
             logo,
             logo_width,
             status,
@@ -288,6 +291,23 @@ impl Ui {
         self.right.inset(self.body_pad)
     }
 
+    /// Body text area, inset by the line-number gutter on file tabs.
+    pub fn body_text_rect(&self) -> Rect {
+        let content = self.editor_content_rect();
+        match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                let gutter = editor.gutter_width();
+                Rect {
+                    x: content.x + gutter,
+                    y: content.y,
+                    w: (content.w - gutter).max(1.0),
+                    h: content.h,
+                }
+            }
+            TabContent::Shell(_) => content,
+        }
+    }
+
     pub fn sidebar_content_rect(&self) -> Rect {
         Rect {
             x: self.sidebar_rect.x + self.body_pad * 0.8,
@@ -362,6 +382,9 @@ impl Ui {
             self.focus = Focus::Sidebar;
             self.mode = Mode::Normal;
             self.recompute_layout(font_system);
+            // Reopening is the moment to ask git again; the viewport size has not
+            // changed, so nothing else would rebuild the listing.
+            self.sidebar.git_changed(font_system);
             self.sidebar.shape(font_system);
         }
     }
@@ -494,6 +517,7 @@ impl Ui {
             content.w,
             content.h,
             self.body_font_size,
+            self.engine.clone(),
         );
         let title = editor.display_title();
         let tab = make_tab(
@@ -516,13 +540,19 @@ impl Ui {
         Ok(())
     }
 
-    pub fn save_active(&mut self) -> Result<(), String> {
-        let Some(editor) = self.active_editor_mut() else {
-            return Err("the shell has nothing to save".to_string());
+    pub fn save_active(&mut self, font_system: &mut FontSystem) -> Result<(), String> {
+        let index = self.active;
+        let title = match &mut self.tabs[index].content {
+            TabContent::Editor(editor) => {
+                let title = editor.display_title();
+                editor.save()?;
+                title
+            }
+            TabContent::Shell(_) => return Err("the shell has nothing to save".to_string()),
         };
-        let title = editor.display_title();
-        editor.save()?;
+        self.refresh_label(font_system, index);
         self.message = Some(format!("saved {title}"));
+        self.sidebar.git_changed(font_system);
         Ok(())
     }
 
@@ -570,10 +600,38 @@ impl Ui {
         }
     }
 
+    pub fn sidebar_git_pending(&self) -> bool {
+        self.sidebar.visible && self.sidebar.git_pending()
+    }
+
+    pub fn poll_sidebar_git(&mut self, font_system: &mut FontSystem) -> bool {
+        self.sidebar.poll_git(font_system)
+    }
+
     pub fn sidebar_enter(&mut self, font_system: &mut FontSystem) -> Option<PathBuf> {
         match self.sidebar.enter(font_system) {
             Some(SidebarAction::Open(path)) => Some(path),
+            Some(SidebarAction::Missing) => {
+                self.message = Some("! deleted in the work tree".to_string());
+                None
+            }
             None => None,
+        }
+    }
+
+    /// Space hands the selected row to the shell input, without running it.
+    pub fn sidebar_space(&mut self, font_system: &mut FontSystem) {
+        if self.sidebar.selected_row().is_some_and(|row| row.missing) {
+            self.message = Some("! deleted in the work tree".to_string());
+            return;
+        }
+        let Some(command) = self.sidebar.selected_row().map(Row::quick_command) else {
+            return;
+        };
+        self.activate_tab(font_system, 0);
+        self.focus_right_insert(font_system);
+        if let Some(shell) = self.shell_tab_mut() {
+            shell.insert_text(font_system, &command);
         }
     }
 
@@ -586,15 +644,77 @@ impl Ui {
                     }
                 }
             }
+            ShellEffect::Retheme => self.retheme(font_system),
+            ShellEffect::Restart => self.restart_shell(font_system),
         }
     }
 
-    pub fn prepare(&mut self, font_system: &mut FontSystem) {
-        if let TabContent::Editor(editor) = &mut self.active_tab_mut().content {
-            editor.shape(font_system);
+    /// Rebuilds the shell inside its own tab. Other tabs, the tab strip and
+    /// the page on screen are untouched.
+    pub fn restart_shell(&mut self, font_system: &mut FontSystem) {
+        let Some(index) = self.tabs.iter().position(Tab::is_shell) else {
+            return;
+        };
+        let content = self.editor_content_rect();
+        self.tabs[index].content = TabContent::Shell(Shell::new(
+            font_system,
+            self.family,
+            self.body_font_size,
+            content.w,
+            content.h,
+        ));
+        self.active = index;
+        self.focus_right_insert(font_system);
+        self.recompute_layout(font_system);
+    }
+
+    /// Repaint every buffer that baked theme colors into its glyphs. Geometry,
+    /// text, scroll and caret are left exactly as they were.
+    pub fn retheme(&mut self, font_system: &mut FontSystem) {
+        let logo_attrs = Attrs::new()
+            .family(glyphon::cosmic_text::Family::Name(self.family))
+            .color(theme::accent())
+            .weight(Weight::BOLD);
+        self.logo = make_label(font_system, &logo_attrs, 15.0 * self.scale, "kite");
+        self.logo_width = measure(&self.logo).0;
+        self.status = make_label(
+            font_system,
+            &attrs(self.family, theme::text_dim()),
+            self.status_font_size,
+            "",
+        );
+        self.status_key.clear();
+        for index in 0..self.tabs.len() {
+            self.refresh_label(font_system, index);
         }
-        if let TabContent::Shell(shell) = &mut self.active_tab_mut().content {
-            shell.shape(font_system);
+        for tab in &mut self.tabs {
+            match &mut tab.content {
+                TabContent::Shell(shell) => shell.retheme(font_system),
+                TabContent::Editor(editor) => editor.retheme(font_system),
+            }
+        }
+        self.sidebar.retheme(font_system);
+        self.recompute_layout(font_system);
+    }
+
+    pub fn prepare(&mut self, font_system: &mut FontSystem) {
+        let delta = match &mut self.tabs[self.active].content {
+            TabContent::Editor(editor) => {
+                editor.highlight(font_system);
+                editor.shape(font_system);
+                editor.refresh_numbers(font_system);
+                editor.line_delta()
+            }
+            TabContent::Shell(shell) => {
+                shell.shape(font_system);
+                (0, 0)
+            }
+        };
+        if delta != self.tabs[self.active].label_delta {
+            self.refresh_label(font_system, self.active);
+            // The counter widened the label, so the strip has to hand this tab
+            // more room or the new text is clipped away.
+            self.layout_tabs(false);
         }
         if self.sidebar.visible {
             self.sidebar.shape(font_system);
@@ -664,11 +784,21 @@ impl Ui {
             TabContent::Editor(editor) => {
                 let content = self.editor_content_rect();
                 areas.push(TextArea {
-                    buffer: &editor.buffer,
-                    left: content.x,
+                    buffer: editor.numbers(),
+                    left: content.x + editor.numbers_left(),
                     top: content.y,
                     scale: 1.0,
                     bounds: bounds_of(content),
+                    default_color: theme::text_dim(),
+                    custom_glyphs: &[],
+                });
+                let text = self.body_text_rect();
+                areas.push(TextArea {
+                    buffer: &editor.buffer,
+                    left: text.x,
+                    top: text.y,
+                    scale: 1.0,
+                    bounds: bounds_of(text),
                     default_color: theme::text(),
                     custom_glyphs: &[],
                 });
@@ -824,24 +954,6 @@ impl Ui {
                     color,
                 );
             }
-            if tab.is_modified() {
-                let dot_x = tab.rect.x
-                    + self.tab_pad
-                    + tab
-                        .label_width
-                        .min(tab.rect.w - self.close_w - 2.0 * self.tab_pad)
-                    + 3.0 * self.scale;
-                let dot = Rect {
-                    x: dot_x,
-                    y: tab.rect.y + tab.rect.h / 2.0 - 2.5 * self.scale,
-                    w: 5.0 * self.scale,
-                    h: 5.0 * self.scale,
-                }
-                .clip_x(self.tab_strip.x, self.tab_strip.right());
-                if dot.w >= 1.0 {
-                    push_rect(&mut quads, dot, theme::yellow());
-                }
-            }
         }
 
         if self.window_close.contains(self.mouse_x, self.mouse_y) {
@@ -877,7 +989,7 @@ impl Ui {
             );
         }
 
-        let content = self.editor_content_rect();
+        let content = self.body_text_rect();
         match &self.active_tab().content {
             TabContent::Editor(editor) => {
                 for (x, y, width, height) in editor.selection_spans() {
@@ -914,7 +1026,7 @@ impl Ui {
 
     pub fn foreground_quads(&self) -> Vec<QuadVertex> {
         let mut quads = Vec::new();
-        let content = self.editor_content_rect();
+        let content = self.body_text_rect();
 
         if self.show_whitespace {
             match &self.active_tab().content {
@@ -978,7 +1090,7 @@ impl Ui {
         if self.focus != Focus::Right || self.mode != Mode::Insert {
             return None;
         }
-        let content = self.editor_content_rect();
+        let content = self.body_text_rect();
         let cursor = match &self.active_tab().content {
             TabContent::Editor(editor) => editor.cursor_rect(),
             TabContent::Shell(shell) => shell.cursor_rect(),
@@ -1045,7 +1157,7 @@ impl Ui {
         x: f32,
         y: f32,
     ) -> Option<Position> {
-        let content = self.editor_content_rect();
+        let content = self.body_text_rect();
         let editor = self.active_editor_mut()?;
         editor.position_at(font_system, x - content.x, y - content.y)
     }
@@ -1084,11 +1196,12 @@ impl Ui {
             TabContent::Editor(editor) => {
                 let cursor = editor.cursor_position();
                 format!(
-                    "{}   {}   Ln {}, Col {}",
+                    "{}   {}   Ln {}, Col {}   {} chars",
                     kite_core::display_path(editor.document.path()),
                     editor.encoding_name(),
                     cursor.line + 1,
-                    cursor.ch + 1
+                    cursor.ch + 1,
+                    editor.document.char_count()
                 )
             }
             TabContent::Shell(shell) => {
@@ -1148,9 +1261,13 @@ impl Ui {
             theme::text_dim()
         };
         let font_size = self.tab_font_size;
-        let attr = attrs(self.family, color);
+        let delta = match &mut tab.content {
+            TabContent::Editor(editor) => editor.line_delta(),
+            TabContent::Shell(_) => (0, 0),
+        };
         let title = tab.title.clone();
-        tab.label = make_label(font_system, &attr, font_size, &title);
+        tab.label_delta = delta;
+        tab.label = make_counted_label(font_system, self.family, &title, delta, color, font_size);
         let (width, _) = measure(&tab.label);
         tab.label_width = width;
         let close_extra = if tab.is_shell() {
@@ -1211,7 +1328,8 @@ impl Ui {
         for tab in &mut self.tabs {
             match &mut tab.content {
                 TabContent::Editor(editor) => {
-                    editor.set_viewport(font_system, content.w, content.h)
+                    let gutter = editor.gutter_width();
+                    editor.set_viewport(font_system, (content.w - gutter).max(1.0), content.h)
                 }
                 TabContent::Shell(shell) => shell.set_viewport(font_system, content.w, content.h),
             }
@@ -1367,10 +1485,49 @@ fn make_tab(
         title: title.to_string(),
         label,
         label_width,
+        label_delta: (0, 0),
         desired_width: label_width + tab_pad * 2.0 + close_extra,
         rect: Rect::default(),
         close_rect: None,
     }
+}
+
+/// Tab title plus its `+added -removed` line counter, in the counter colors.
+fn make_counted_label(
+    font_system: &mut FontSystem,
+    family: &'static str,
+    title: &str,
+    delta: (usize, usize),
+    color: Color,
+    font_size: f32,
+) -> Buffer {
+    let (added, removed) = delta;
+    let text = if added == 0 && removed == 0 {
+        title.to_string()
+    } else {
+        format!("{title}  +{added} -{removed}")
+    };
+    let mut list = AttrsList::new(&attrs(family, color));
+    if added != 0 || removed != 0 {
+        let plus = title.len() + 2;
+        let plus_end = plus + 1 + added.to_string().len();
+        let minus = plus_end + 1;
+        let minus_end = minus + 1 + removed.to_string().len();
+        list.add_span(plus..plus_end, &attrs(family, theme::green()));
+        list.add_span(minus..minus_end, &attrs(family, theme::red()));
+    }
+    let line_height = (font_size * 1.35).ceil();
+    let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
+    buffer.set_wrap(Wrap::None);
+    buffer.set_size(None, None);
+    buffer.lines.push(BufferLine::new(
+        text,
+        LineEnding::Lf,
+        list,
+        Shaping::Advanced,
+    ));
+    buffer.shape_until_scroll(font_system, false);
+    buffer
 }
 
 fn make_label(
@@ -1517,5 +1674,82 @@ fn push_whitespace_markers(
             push_line(quads, x + 6.0, y, x + 6.0, y + 4.5, 1.2, mark_color);
             push_line(quads, x + 6.0, y + 4.5, x + 2.5, y + 4.5, 1.2, mark_color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::Fonts;
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn dirty_tabs_carry_a_line_counter() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        ui.open_file(&mut fonts.system, path.clone()).unwrap();
+
+        ui.prepare(&mut fonts.system);
+        assert_eq!(
+            ui.tabs[1].label_delta,
+            (0, 0),
+            "an untouched file has no counter"
+        );
+        assert_eq!(ui.tabs[1].label.lines[0].text(), "sample.txt");
+        let width = ui.tabs[1].rect.w;
+
+        let editor = ui.active_editor_mut().unwrap();
+        editor.insert_text(&mut fonts.system, "zero\n").unwrap();
+        ui.prepare(&mut fonts.system);
+        assert_eq!(ui.tabs[1].label_delta, (1, 0));
+        assert_eq!(
+            ui.tabs[1].label.lines[0].text(),
+            "sample.txt  +1 -0",
+            "the counter follows the edit"
+        );
+        assert!(
+            ui.tabs[1].rect.w > width,
+            "the strip gives the tab room for its counter"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_status_bar_counts_characters_only_on_a_file_page() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.txt");
+        // "one", "two" and "three" without their separators.
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        ui.open_file(&mut fonts.system, path.clone()).unwrap();
+
+        ui.prepare(&mut fonts.system);
+        let text = ui.status.lines[0].text().to_string();
+        assert!(text.contains("11 chars"), "{text}");
+
+        ui.activate_tab(&mut fonts.system, 0);
+        ui.prepare(&mut fonts.system);
+        let text = ui.status.lines[0].text().to_string();
+        assert!(
+            !text.contains("chars"),
+            "the shell has no character count: {text}"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

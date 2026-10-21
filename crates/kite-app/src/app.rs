@@ -13,11 +13,14 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowButto
 
 use crate::fonts::Fonts;
 use crate::renderer::Renderer;
+use crate::shell::TextPos;
 use crate::theme;
 use crate::ui::{Focus, Mode, Ui};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Only used while a `git` query is in flight, so the wait loop can wake for its reply.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const WHEEL_LINES: f32 = 3.0;
 const VERTICAL_DELAY: Duration = Duration::from_millis(320);
 const VERTICAL_INTERVAL: Duration = Duration::from_millis(90);
@@ -30,7 +33,7 @@ enum Drag {
         cursor: PhysicalPosition<i32>,
     },
     Editor(Position),
-    Shell(usize),
+    Shell(TextPos),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +232,14 @@ impl App {
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
 
+        if ui.sidebar_git_pending() {
+            if ui.poll_sidebar_git(&mut fonts.system) {
+                window.request_redraw();
+            }
+            let poll_at = now + GIT_POLL_INTERVAL;
+            deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
+        }
+
         match deadline {
             Some(deadline) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -269,7 +280,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, event: KeyEvent) {
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if event.state != ElementState::Pressed {
             if let Some(direction) = VerticalDir::from_key(&event.logical_key) {
                 if self
@@ -297,6 +308,13 @@ impl App {
         if matches!(key, Key::Named(NamedKey::F11)) {
             if !repeat {
                 self.toggle_fullscreen();
+            }
+            return;
+        }
+
+        if ctrl && (char_is(&key, "w") || char_is(&key, "W")) {
+            if !repeat {
+                self.shutdown(event_loop);
             }
             return;
         }
@@ -390,6 +408,7 @@ impl App {
                     Key::Named(NamedKey::Backspace) => ui.sidebar.back(system),
                     Key::Named(NamedKey::ArrowLeft) => ui.sidebar.left(system),
                     Key::Named(NamedKey::ArrowRight) => ui.sidebar.right(system),
+                    Key::Named(NamedKey::Space) => ui.sidebar_space(system),
                     Key::Character(value) if value.as_str() == "-" => ui.toggle_sidebar(system),
                     Key::Character(value) if value.as_str() == "i" || value.as_str() == "I" => {
                         ui.focus_right_insert(system)
@@ -549,14 +568,11 @@ impl App {
                 }
             } else {
                 let content = ui.editor_content_rect();
-                let hit = ui
-                    .active_shell_mut()
-                    .and_then(|shell| shell.position_at(system, x - content.x, y - content.y));
-                if let Some(position) = hit {
-                    if let Some(shell) = ui.active_shell_mut() {
-                        shell.set_input_caret(system, position);
+                if let Some(shell) = ui.active_shell_mut() {
+                    if let Some(position) = shell.mouse_press(system, x - content.x, y - content.y)
+                    {
+                        *drag = Some(Drag::Shell(position));
                     }
-                    *drag = Some(Drag::Shell(position));
                 }
             }
             window.request_redraw();
@@ -580,7 +596,7 @@ impl App {
 
         match drag {
             Some(Drag::Editor(anchor)) => {
-                let content = ui.editor_content_rect();
+                let content = ui.body_text_rect();
                 let cx = x.clamp(content.x, content.right() - 1.0);
                 let cy = y.clamp(content.y, content.bottom() - 1.0);
                 if let Some(position) = ui.editor_position(system, cx, cy) {
@@ -591,12 +607,11 @@ impl App {
                 let content = ui.editor_content_rect();
                 let cx = x.clamp(content.x, content.right() - 1.0);
                 let cy = y.clamp(content.y, content.bottom() - 1.0);
-                let position = ui
-                    .active_shell_mut()
-                    .and_then(|shell| shell.position_at(system, cx - content.x, cy - content.y));
-                if let Some(position) = position {
-                    if let Some(shell) = ui.active_shell_mut() {
-                        shell.set_input_selection(system, *anchor, position);
+                if let Some(shell) = ui.active_shell_mut() {
+                    if let Some(position) =
+                        shell.position_at(system, cx - content.x, cy - content.y)
+                    {
+                        shell.mouse_drag(*anchor, position);
                     }
                 }
             }
@@ -769,7 +784,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let is_command = event.state == ElementState::Pressed;
-                self.handle_key(event);
+                self.handle_key(event_loop, event);
                 if is_command {
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
@@ -972,7 +987,7 @@ fn handle_insert_key(
                     }
                 }
                 "s" | "S" => {
-                    if let Err(error) = ui.save_active() {
+                    if let Err(error) = ui.save_active(system) {
                         ui.message = Some(format!("!{error}"));
                     }
                 }
@@ -1014,17 +1029,12 @@ fn handle_insert_key(
     match key {
         Key::Named(NamedKey::Enter) => {
             let effect = if let Some(editor) = ui.active_editor_mut() {
-                if let Err(error) = editor.insert_text(system, "\n") {
+                if let Err(error) = editor.newline(system) {
                     ui.message = Some(format!("!{error}"));
                 }
                 None
             } else if let Some(shell) = ui.active_shell_mut() {
-                if shell.is_running() {
-                    ui.message = Some("a job is running; Ctrl+C interrupts it".to_string());
-                    None
-                } else {
-                    shell.submit(system)
-                }
+                shell.submit(system)
             } else {
                 None
             };

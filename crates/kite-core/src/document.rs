@@ -1,5 +1,8 @@
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs::{self, OpenOptions};
+use std::hash::Hasher;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,10 +106,30 @@ impl Eol {
     }
 }
 
+impl Line {
+    fn raw(&self, original: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pieces.iter().map(Piece::raw_len).sum());
+        for piece in &self.pieces {
+            match piece {
+                Piece::Original { start, end } => out.extend_from_slice(&original[*start..*end]),
+                Piece::Owned(bytes) => out.extend_from_slice(bytes),
+            }
+        }
+        out
+    }
+
+    fn chars(&self, original: &[u8], encoding: &TextEncoding) -> usize {
+        encoding.decode_lossy(&self.raw(original)).chars().count()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
     pieces: Vec<Piece>,
     eol: Eol,
+    /// Line identity for the tab's added/removed counter. Pieces never change,
+    /// so an edited line is a fresh `Line` with a fresh cache.
+    hash: Cell<Option<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +214,9 @@ impl LineView {
 pub struct Document {
     path: PathBuf,
     original: Vec<u8>,
+    /// Hashes of the state on disk, kept only while the document is dirty.
+    saved_hashes: Option<Vec<u64>>,
+    delta: Option<(u64, usize, usize)>,
     encoding: TextEncoding,
     lines: Vec<Line>,
     default_eol: Eol,
@@ -199,6 +225,8 @@ pub struct Document {
     last_change: Option<Change>,
     revision: u64,
     saved_revision: u64,
+    /// Cached whole-document character count; `None` until someone asks for it.
+    chars: Cell<Option<usize>>,
 }
 
 impl Document {
@@ -238,6 +266,8 @@ impl Document {
         Ok(Self {
             path: bound,
             original: bytes,
+            saved_hashes: None,
+            delta: None,
             encoding,
             lines,
             default_eol,
@@ -246,6 +276,7 @@ impl Document {
             last_change: None,
             revision: 0,
             saved_revision: 0,
+            chars: Cell::new(None),
         })
     }
 
@@ -259,6 +290,14 @@ impl Document {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Raw bytes held by the piece table, line separators excluded.
+    pub fn len_bytes(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| line.pieces.iter().map(Piece::raw_len).sum::<usize>())
+            .sum()
     }
 
     pub fn is_modified(&self) -> bool {
@@ -276,6 +315,37 @@ impl Document {
 
     pub fn line_char_len(&self, index: usize) -> usize {
         self.line_text(index).chars().count()
+    }
+
+    /// Characters in the whole document, line separators excluded. The full pass
+    /// happens once, on the first question; edits keep the total exact from there,
+    /// so a keystroke never re-reads the file.
+    pub fn char_count(&self) -> usize {
+        if let Some(count) = self.chars.get() {
+            return count;
+        }
+        let count = self
+            .lines
+            .iter()
+            .map(|line| line.chars(&self.original, &self.encoding))
+            .sum();
+        self.chars.set(Some(count));
+        count
+    }
+
+    fn recount_chars(&self, removed: &[Line], added: &[Line]) {
+        let Some(count) = self.chars.get() else {
+            return;
+        };
+        let before: usize = removed
+            .iter()
+            .map(|line| line.chars(&self.original, &self.encoding))
+            .sum();
+        let after: usize = added
+            .iter()
+            .map(|line| line.chars(&self.original, &self.encoding))
+            .sum();
+        self.chars.set(Some(count - before + after));
     }
 
     pub fn has_line_break(&self, index: usize) -> bool {
@@ -369,7 +439,11 @@ impl Document {
                 pieces.extend(end_suffix.iter().cloned());
             }
             let eol = if is_last { old_eol } else { self.default_eol };
-            new_lines.push(Line { pieces, eol });
+            new_lines.push(Line {
+                pieces,
+                eol,
+                hash: Cell::new(None),
+            });
         }
 
         let last_part_chars = inserted_parts.last().map_or(0, |part| part.chars().count());
@@ -381,12 +455,14 @@ impl Document {
         let before = Selection::new(start, end);
         let after = Selection::caret(caret);
 
+        self.remember_saved();
         let old_lines: Vec<Line> = self.lines[start.line..=end.line].to_vec();
         let old_total = self.lines.len();
         let removed_count = end.line - start.line + 1;
         let added_count = new_lines.len();
         let record_lines = new_lines.clone();
         self.lines.splice(start.line..=end.line, new_lines);
+        self.recount_chars(&old_lines, &record_lines);
         debug_assert_eq!(self.lines.len(), old_total - removed_count + added_count);
 
         self.undo.push(EditRecord {
@@ -408,6 +484,7 @@ impl Document {
 
     pub fn undo(&mut self) -> Option<Selection> {
         let record = self.undo.pop()?;
+        self.remember_saved();
         let end = record.start_line + record.new_lines.len();
         if end > self.lines.len() {
             self.undo.push(record);
@@ -415,6 +492,7 @@ impl Document {
         }
         self.lines
             .splice(record.start_line..end, record.old_lines.iter().cloned());
+        self.recount_chars(&record.new_lines, &record.old_lines);
         let selection = record.before;
         self.last_change = Some(Change {
             start_line: record.start_line,
@@ -428,6 +506,7 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<Selection> {
         let record = self.redo.pop()?;
+        self.remember_saved();
         let end = record.start_line + record.old_lines.len();
         if end > self.lines.len() {
             self.redo.push(record);
@@ -435,6 +514,7 @@ impl Document {
         }
         self.lines
             .splice(record.start_line..end, record.new_lines.iter().cloned());
+        self.recount_chars(&record.old_lines, &record.new_lines);
         let selection = record.after;
         self.last_change = Some(Change {
             start_line: record.start_line,
@@ -474,6 +554,8 @@ impl Document {
             source,
         })?;
         self.saved_revision = self.revision;
+        self.saved_hashes = None;
+        self.delta = None;
         Ok(())
     }
 
@@ -483,18 +565,94 @@ impl Document {
         Position::new(line, ch)
     }
 
-    fn line_raw(&self, index: usize) -> Vec<u8> {
+    /// Freezes the current lines as the comparison base. Called from every
+    /// mutator, so the first call happens while the document still matches
+    /// what is on disk.
+    fn remember_saved(&mut self) {
+        if self.saved_hashes.is_none() {
+            let hashes = (0..self.diff_lines())
+                .map(|index| self.line_hash(index))
+                .collect();
+            self.saved_hashes = Some(hashes);
+        }
+    }
+
+    /// How many lines a diff sees: the empty line after a final newline is not
+    /// a line, and a line is only the same line as before if it ends the same
+    /// way, so adding the missing newline at the end of a file is one removed
+    /// and one added, exactly as `git diff --numstat` counts it.
+    fn diff_lines(&self) -> usize {
+        let last = &self.lines[self.lines.len() - 1];
+        let terminated = !last.eol.is_empty();
+        let blank = last.pieces.iter().all(|piece| piece.raw_len() == 0);
+        if !terminated && blank {
+            self.lines.len() - 1
+        } else {
+            self.lines.len()
+        }
+    }
+
+    fn line_hash(&self, index: usize) -> u64 {
         let line = &self.lines[index];
-        let mut out = Vec::with_capacity(line.pieces.iter().map(Piece::raw_len).sum());
+        if let Some(hash) = line.hash.get() {
+            return hash;
+        }
+        let mut hasher = DefaultHasher::new();
         for piece in &line.pieces {
             match piece {
-                Piece::Original { start, end } => {
-                    out.extend_from_slice(&self.original[*start..*end]);
-                }
-                Piece::Owned(bytes) => out.extend_from_slice(bytes),
+                Piece::Original { start, end } => hasher.write(&self.original[*start..*end]),
+                Piece::Owned(bytes) => hasher.write(bytes),
             }
         }
-        out
+        hasher.write(line.eol.as_bytes());
+        let hash = hasher.finish();
+        line.hash.set(Some(hash));
+        hash
+    }
+
+    /// Lines added and removed against the state on disk. Only the window
+    /// between the first and last differing line is aligned, so an edit in a
+    /// ten-megabyte file costs the size of that window.
+    pub fn line_delta(&mut self) -> (usize, usize) {
+        if self.revision == self.saved_revision {
+            return (0, 0);
+        }
+        if let Some((revision, added, removed)) = self.delta {
+            if revision == self.revision {
+                return (added, removed);
+            }
+        }
+        let Some(saved) = self.saved_hashes.as_ref() else {
+            return (0, 0);
+        };
+        let current = self.diff_lines();
+        let mut head = 0;
+        while head < saved.len() && head < current && self.line_hash(head) == saved[head] {
+            head += 1;
+        }
+        let mut tail = 0;
+        while tail + head < saved.len()
+            && tail + head < current
+            && self.line_hash(current - tail - 1) == saved[saved.len() - tail - 1]
+        {
+            tail += 1;
+        }
+        let before = &saved[head..saved.len() - tail];
+        let after: Vec<u64> = (head..current - tail)
+            .map(|index| self.line_hash(index))
+            .collect();
+        let (added, removed) = if before.len().max(after.len()) > ALIGN_LIMIT {
+            (after.len(), before.len())
+        } else {
+            let common = common_lines(before, &after);
+            (after.len() - common, before.len() - common)
+        };
+        self.delta = Some((self.revision, added, removed));
+        (added, removed)
+    }
+
+    fn line_raw(&self, index: usize) -> Vec<u8> {
+        self.lines[index].raw(&self.original)
     }
 
     fn line_view(&self, index: usize) -> LineView {
@@ -573,6 +731,7 @@ fn split_lines(bytes: &[u8], content_start: usize, kind: EncodingKind) -> (Vec<L
                 lines.push(Line {
                     pieces: content_pieces(bytes, position, bytes.len()),
                     eol: Eol::NONE,
+                    hash: Cell::new(None),
                 });
                 break;
             }
@@ -583,12 +742,14 @@ fn split_lines(bytes: &[u8], content_start: usize, kind: EncodingKind) -> (Vec<L
                 lines.push(Line {
                     pieces: content_pieces(bytes, position, eol_start),
                     eol,
+                    hash: Cell::new(None),
                 });
                 position = eol_end;
                 if position >= bytes.len() {
                     lines.push(Line {
                         pieces: Vec::new(),
                         eol: Eol::NONE,
+                        hash: Cell::new(None),
                     });
                     break;
                 }
@@ -766,6 +927,46 @@ fn save_atomically(target: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Beyond this many changed lines the counter stops aligning the window and
+/// reports all of it as replaced.
+const ALIGN_LIMIT: usize = 2_048;
+
+/// Lines the two windows share, i.e. the length of their longest common
+/// subsequence, found with Myers' greedy edit graph.
+fn common_lines(before: &[u64], after: &[u64]) -> usize {
+    let n = before.len() as isize;
+    let m = after.len() as isize;
+    let max = n + m;
+    if max == 0 {
+        return 0;
+    }
+    // One slot of slack on each side so the k-1 and k+1 reads at the extremes
+    // of the diagonal stay inside the vector.
+    let offset = max + 1;
+    let mut frontier = vec![0isize; (2 * max + 3) as usize];
+    for distance in 0..=max {
+        for k in (-(distance)..=distance).step_by(2) {
+            let up = frontier[(offset + k + 1) as usize];
+            let left = frontier[(offset + k - 1) as usize];
+            let mut x = if k == -distance || (k != distance && left < up) {
+                up
+            } else {
+                left + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && before[x as usize] == after[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            frontier[(offset + k) as usize] = x;
+            if x >= n && y >= m {
+                return ((n + m - distance) / 2) as usize;
+            }
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +982,318 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let document = Document::open(&path).unwrap();
         (dir, path, document)
+    }
+
+    #[test]
+    fn delta_counts_against_the_state_on_disk() {
+        let (_dir, _path, mut document) = open_bytes(
+            b"one
+two
+three
+"
+            .to_vec(),
+        );
+        assert_eq!(
+            document.line_delta(),
+            (0, 0),
+            "an untouched file has no delta"
+        );
+
+        document
+            .apply_edit(
+                Selection::caret(Position::new(1, 0)),
+                "zero
+",
+            )
+            .unwrap();
+        assert_eq!(document.line_delta(), (1, 0));
+
+        document
+            .apply_edit(
+                Selection::new(Position::new(2, 0), Position::new(2, 3)),
+                "TWO",
+            )
+            .unwrap();
+        assert_eq!(document.line_delta(), (2, 1), "a new line plus a rewrite");
+
+        document.undo();
+        assert_eq!(document.line_delta(), (1, 0));
+        document.undo();
+        assert_eq!(document.line_delta(), (0, 0), "back to the bytes on disk");
+
+        document
+            .apply_edit(
+                Selection::caret(Position::new(0, 0)),
+                "
+",
+            )
+            .unwrap();
+        document.save().unwrap();
+        assert_eq!(document.line_delta(), (0, 0), "saving moves the base");
+    }
+
+    #[test]
+    fn delta_agrees_with_git_at_the_end_of_a_file() {
+        let (_dir, _path, mut document) = open_bytes(
+            b"one
+two
+three"
+                .to_vec(),
+        );
+        document
+            .apply_edit(
+                Selection::caret(Position::new(2, 5)),
+                "
+",
+            )
+            .unwrap();
+        assert_eq!(
+            document.line_delta(),
+            (1, 1),
+            "closing an unterminated last line rewrites it"
+        );
+
+        let (_dir, _path, mut document) = open_bytes(
+            b"one
+two
+three
+"
+            .to_vec(),
+        );
+        document
+            .apply_edit(Selection::new(Position::new(1, 3), Position::new(2, 5)), "")
+            .unwrap();
+        assert_eq!(
+            document.line_delta(),
+            (0, 1),
+            "the final newline is not a line"
+        );
+    }
+
+    /// The counter must read exactly like `git diff --numstat`, so the numbers
+    /// are checked against git itself on the bytes kite produced.
+    #[test]
+    fn delta_matches_git_numstat() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let file = repo.join("f.txt");
+        git(repo, &["init", "-q"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "config",
+                "core.autocrlf",
+                "false",
+            ],
+        );
+
+        let cases: Vec<(&[u8], Selection, &str)> = vec![
+            (b"a\nb\nc\n", Selection::caret(Position::new(1, 0)), "X\n"),
+            (
+                b"a\nb\nc\n",
+                Selection::new(Position::new(1, 0), Position::new(2, 0)),
+                "",
+            ),
+            (b"a\nb\nc", Selection::caret(Position::new(2, 1)), "\n"),
+            (
+                b"a\nb\nc\n",
+                Selection::new(Position::new(2, 1), Position::new(3, 0)),
+                "",
+            ),
+            (
+                b"a\nb\nc\n",
+                Selection::new(Position::new(1, 0), Position::new(1, 1)),
+                "B",
+            ),
+            (b"a\n", Selection::caret(Position::new(1, 0)), "b\nc\n"),
+            (b"", Selection::caret(Position::new(0, 0)), "a\n"),
+            (b"a\r\nb\r\n", Selection::caret(Position::new(1, 0)), "X\n"),
+        ];
+        for (before, selection, text) in cases {
+            std::fs::write(&file, before).unwrap();
+            git(repo, &["add", "f.txt"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "before",
+                ],
+            );
+
+            let mut document = Document::from_bytes(&file, before.to_vec()).unwrap();
+            document.apply_edit(selection, text).unwrap();
+            let kite = document.line_delta();
+            std::fs::write(&file, document.to_bytes()).unwrap();
+            assert_eq!(
+                kite,
+                git_numstat(repo),
+                "for {} edited at {:?}",
+                String::from_utf8_lossy(before),
+                selection
+            );
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_numstat(repo: &Path) -> (usize, usize) {
+        let output = std::process::Command::new("git")
+            .args(["diff", "--numstat", "--", "f.txt"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).replace('\r', "\n");
+        let first = text.lines().next().unwrap_or_default();
+        let mut counts = first.split('\t');
+        let added: usize = counts.next().unwrap_or("0").parse().unwrap_or(0);
+        let removed: usize = counts.next().unwrap_or("0").parse().unwrap_or(0);
+        (added, removed)
+    }
+
+    #[test]
+    fn delta_aligns_lines_across_a_shift() {
+        let (_dir, _path, mut document) = open_bytes(
+            b"a
+
+b
+c
+"
+            .to_vec(),
+        );
+        document
+            .apply_edit(Selection::caret(Position::new(0, 0)), "x")
+            .unwrap();
+        document
+            .apply_edit(Selection::new(Position::new(1, 0), Position::new(2, 0)), "")
+            .unwrap();
+        assert_eq!(document.line_delta(), (1, 2), "what git numstat reports");
+    }
+
+    #[test]
+    fn two_edits_in_a_crlf_file_match_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let file = repo.join("f.txt");
+        let before = b"#include <stdio.h>\r\n\r\nint main()\r\n{\r\n    return 0;\r\n}";
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(&file, before).unwrap();
+        git(repo, &["add", "f.txt"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+
+        let mut document = Document::from_bytes(&file, before.to_vec()).unwrap();
+        document
+            .apply_edit(Selection::caret(Position::new(0, 0)), "x")
+            .unwrap();
+        document
+            .apply_edit(Selection::caret(Position::new(5, 1)), "\n")
+            .unwrap();
+        let kite = document.line_delta();
+        std::fs::write(&file, document.to_bytes()).unwrap();
+        assert_eq!(kite, git_numstat(repo), "one at the top, one at the bottom");
+    }
+
+    /// A fuzz pass over random small edits, each one checked against git.
+    #[test]
+    fn random_edits_match_git_numstat() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let file = repo.join("f.txt");
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "core.autocrlf", "false"]);
+        let mut state = 0x2f_6e_2b_1u32;
+        let mut random = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) % 7
+        };
+        for round in 0..12 {
+            let lines = 3 + (random() as usize);
+            let before: String = (0..lines).map(|index| format!("line {index}\n")).collect();
+            std::fs::write(&file, before.as_bytes()).unwrap();
+            git(repo, &["add", "f.txt"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "base",
+                ],
+            );
+            let mut document = Document::from_bytes(&file, before.as_bytes().to_vec()).unwrap();
+            for _ in 0..1 + random() {
+                let line = random() as usize % document.line_count();
+                if random() % 2 == 0 {
+                    document
+                        .apply_edit(Selection::caret(Position::new(line, 0)), "typed\n")
+                        .unwrap();
+                } else if line + 1 < document.line_count() {
+                    document
+                        .apply_edit(
+                            Selection::new(Position::new(line, 0), Position::new(line + 1, 0)),
+                            "",
+                        )
+                        .unwrap();
+                }
+            }
+            let kite = document.line_delta();
+            std::fs::write(&file, document.to_bytes()).unwrap();
+            assert_eq!(kite, git_numstat(repo), "round {round} of {before}");
+        }
     }
 
     #[test]
@@ -988,6 +1501,20 @@ mod tests {
         let redone = document.redo().unwrap();
         assert_eq!(redone, Selection::caret(Position::new(1, 1)));
         assert_eq!(document.to_bytes(), edited);
+    }
+
+    #[test]
+    fn the_character_count_stays_exact_through_undo_and_redo() {
+        let (_dir, _path, mut document) = open_bytes("aé\n中\n".as_bytes().to_vec());
+        assert_eq!(document.char_count(), 3);
+        document
+            .apply_edit(Selection::caret(Position::new(1, 1)), "x")
+            .unwrap();
+        assert_eq!(document.char_count(), 4);
+        document.undo().unwrap();
+        assert_eq!(document.char_count(), 3);
+        document.redo().unwrap();
+        assert_eq!(document.char_count(), 4);
     }
 
     #[test]

@@ -1,12 +1,12 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use glyphon::FontSystem;
 use glyphon::cosmic_text::{
-    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Scroll, Shaping, Wrap,
+    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Scroll, Shaping, Weight, Wrap,
 };
 use kite_core::display_path;
 use unicode_segmentation::UnicodeSegmentation;
@@ -16,6 +16,10 @@ use crate::text::{attrs, byte_to_char, char_to_byte, force_relayout};
 use crate::theme;
 
 const SCROLLBACK_LIMIT: usize = 4000;
+const OS_ICON: char = '\u{f17a}';
+const GIT_BRANCH_ICON: char = '\u{f418}';
+#[cfg(windows)]
+pub(crate) const NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -28,17 +32,67 @@ pub enum LineKind {
 pub struct ShellLine {
     pub text: String,
     pub kind: LineKind,
-    prompt_bytes: usize,
+    prompt: Option<Prompt>,
     spans: Vec<(std::ops::Range<usize>, Color)>,
+}
+
+/// The prompt of one input line, split into the parts that get their own
+/// colors. Byte ranges are offsets into the line's own text.
+#[derive(Clone, Debug)]
+struct Prompt {
+    text: String,
+    identity: std::ops::Range<usize>,
+    path: std::ops::Range<usize>,
+    git: std::ops::Range<usize>,
+    branch: std::ops::Range<usize>,
+    arrow: std::ops::Range<usize>,
+}
+
+impl Prompt {
+    fn len(&self) -> usize {
+        self.arrow.end
+    }
+
+    fn chars(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn paint(&self, list: &mut AttrsList, family: &'static str) {
+        let Some(prompt) = theme::prompt() else {
+            list.add_span(0..self.len(), &attrs(family, theme::text_dim()));
+            return;
+        };
+        if !self.identity.is_empty() {
+            list.add_span(self.identity.clone(), &attrs(family, theme::accent()));
+        }
+        list.add_span(self.path.clone(), &attrs(family, prompt.path));
+        if !self.git.is_empty() {
+            list.add_span(self.git.clone(), &attrs(family, theme::accent()));
+            list.add_span(
+                self.branch.clone(),
+                &attrs(family, theme::text()).weight(Weight::BOLD),
+            );
+        }
+        list.add_span(self.arrow.clone(), &attrs(family, prompt.arrow));
+    }
 }
 
 pub enum ShellEffect {
     Open(PathBuf),
+    Retheme,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPos {
+    pub line: usize,
+    pub ch: usize,
 }
 
 struct Job {
     child: Child,
     rx: Receiver<(bool, String)>,
+    stdin: Option<Sender<Vec<u8>>>,
 }
 
 pub struct Shell {
@@ -48,6 +102,8 @@ pub struct Shell {
     pub input_cursor: usize,
     pub input_selection: Option<(usize, usize)>,
     pub buffer: Buffer,
+    view_selection: Option<(TextPos, TextPos)>,
+    follow: bool,
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -57,8 +113,30 @@ pub struct Shell {
     line_height: f32,
     view_width: f32,
     view_height: f32,
-    prompt_bytes: usize,
-    prompt_len: usize,
+    prompt: Prompt,
+    branch: Option<String>,
+    identity: String,
+    /// Set once the running child writes something: a child that speaks is the
+    /// one holding the console, so kite keeps out of its way.
+    child_spoke: bool,
+}
+
+/// Kills the whole process tree. The helper is a console program, so without
+/// `CREATE_NO_WINDOW` it flashes a console and steals kite's focus.
+fn kill_tree(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(NO_WINDOW);
+    }
+    command.status().is_ok()
 }
 
 impl Shell {
@@ -69,7 +147,10 @@ impl Shell {
         view_width: f32,
         view_height: f32,
     ) -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+        let cwd = kite_core::start_dir();
+        let branch = git_branch(&cwd);
+        let identity = identity_label();
+        let prompt = build_prompt(&cwd, branch.as_deref(), &identity);
         let line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
         let mut shell = Self {
@@ -79,6 +160,8 @@ impl Shell {
             input_cursor: 0,
             input_selection: None,
             buffer,
+            view_selection: None,
+            follow: true,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -88,14 +171,16 @@ impl Shell {
             line_height,
             view_width: view_width.max(1.0),
             view_height: view_height.max(1.0),
-            prompt_bytes: 0,
-            prompt_len: 0,
+            prompt,
+            branch,
+            identity,
+            child_spoke: false,
         };
         for line in banner::lines() {
             shell.lines.push(ShellLine {
                 text: line.text,
                 kind: LineKind::Output,
-                prompt_bytes: 0,
+                prompt: None,
                 spans: line.spans,
             });
         }
@@ -123,21 +208,32 @@ impl Shell {
         self.rebuild_buffer(font_system);
     }
 
+    pub fn retheme(&mut self, font_system: &mut FontSystem) {
+        self.rebuild_buffer(font_system);
+    }
+
     pub fn line_height(&self) -> f32 {
         self.line_height
     }
 
     pub fn shape(&mut self, font_system: &mut FontSystem) {
-        self.buffer
-            .shape_until_cursor(font_system, self.prompt_cursor(), true);
+        self.buffer.shape_until_scroll(font_system, true);
     }
 
     pub fn is_running(&self) -> bool {
         self.running.is_some()
     }
 
-    pub fn prompt_text(&self) -> String {
-        format!("{}> ", display_path(&self.cwd))
+    fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd = cwd;
+        self.refresh_branch();
+    }
+
+    /// Re-reads HEAD so a branch switched from an external program shows up.
+    fn refresh_branch(&mut self) {
+        self.branch = git_branch(&self.cwd);
+        let prompt = build_prompt(&self.cwd, self.branch.as_deref(), &self.identity);
+        self.prompt = prompt;
     }
 
     pub fn insert_text(&mut self, font_system: &mut FontSystem, text: &str) {
@@ -246,6 +342,38 @@ impl Shell {
     }
 
     pub fn selected_text(&self) -> Option<String> {
+        if let Some((first, second)) = self.view_selection {
+            let (start, end) = if (first.line, first.ch) <= (second.line, second.ch) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if start == end {
+                return None;
+            }
+            let last = self.buffer.lines.len().saturating_sub(1);
+            let mut out = String::new();
+            for line in start.line..=end.line.min(last) {
+                let chars: Vec<char> = self
+                    .buffer
+                    .lines
+                    .get(line)
+                    .map(|value| value.text().chars().collect())
+                    .unwrap_or_default();
+                let from = if line == start.line { start.ch } else { 0 }.min(chars.len());
+                let to = if line == end.line {
+                    end.ch
+                } else {
+                    chars.len()
+                }
+                .max(from);
+                out.extend(chars[from..to.min(chars.len())].iter());
+                if line != end.line {
+                    out.push('\n');
+                }
+            }
+            return Some(out);
+        }
         let (start, end) = self.input_selection?;
         let (start, end) = if start <= end {
             (start, end)
@@ -258,15 +386,52 @@ impl Shell {
         Some(chars[start..end].iter().collect())
     }
 
-    pub fn position_at(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<usize> {
+    pub fn position_at(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<TextPos> {
         self.buffer.shape_until_scroll(font_system, true);
-        let line = self.buffer.lines.len().checked_sub(1)?;
         let cursor = self.buffer.hit(x, y)?;
-        if cursor.line != line {
-            return None;
+        let line = cursor.line.min(self.buffer.lines.len().saturating_sub(1));
+        let text = self
+            .buffer
+            .lines
+            .get(line)
+            .map(|value| value.text())
+            .unwrap_or("");
+        Some(TextPos {
+            line,
+            ch: byte_to_char(text, cursor.index),
+        })
+    }
+
+    pub fn mouse_press(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<TextPos> {
+        let position = self.position_at(font_system, x, y)?;
+        self.view_selection = Some((position, position));
+        if position.line == self.buffer.lines.len().saturating_sub(1) {
+            self.input_cursor = position
+                .ch
+                .saturating_sub(self.input_line_chars())
+                .min(self.input.chars().count());
+            self.input_selection = None;
+            self.refresh_prompt(font_system);
         }
-        let byte = cursor.index.saturating_sub(self.prompt_bytes);
-        Some(byte_to_char(&self.input, byte.min(self.input.len())))
+        Some(position)
+    }
+
+    pub fn mouse_drag(&mut self, anchor: TextPos, cursor: TextPos) {
+        self.view_selection = Some((anchor, cursor));
+        let last = self.buffer.lines.len().saturating_sub(1);
+        if anchor.line != last || cursor.line != last {
+            self.input_selection = None;
+            return;
+        }
+        let len = self.input.chars().count();
+        let anchor = anchor.ch.saturating_sub(self.input_line_chars()).min(len);
+        let cursor = cursor.ch.saturating_sub(self.input_line_chars()).min(len);
+        self.input_cursor = cursor;
+        self.input_selection = if anchor == cursor {
+            None
+        } else {
+            Some((anchor, cursor))
+        };
     }
 
     pub fn cut_selection(&mut self, font_system: &mut FontSystem) -> Option<String> {
@@ -275,30 +440,6 @@ impl Shell {
             self.refresh_prompt(font_system);
         }
         Some(text)
-    }
-
-    pub fn set_input_caret(&mut self, font_system: &mut FontSystem, ch: usize) {
-        self.input_cursor = ch.min(self.input.chars().count());
-        self.input_selection = None;
-        self.refresh_prompt(font_system);
-    }
-
-    pub fn set_input_selection(
-        &mut self,
-        font_system: &mut FontSystem,
-        anchor: usize,
-        cursor: usize,
-    ) {
-        let len = self.input.chars().count();
-        let anchor = anchor.min(len);
-        let cursor = cursor.min(len);
-        self.input_cursor = cursor;
-        self.input_selection = if anchor == cursor {
-            None
-        } else {
-            Some((anchor, cursor))
-        };
-        self.refresh_prompt(font_system);
     }
 
     pub fn delete_selection(&mut self) -> bool {
@@ -355,13 +496,21 @@ impl Shell {
 
     pub fn submit(&mut self, font_system: &mut FontSystem) -> Option<ShellEffect> {
         self.input_selection = None;
+        self.view_selection = None;
+        self.follow = true;
         let command = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.history_index = None;
         self.history_draft.clear();
 
-        let prompt = self.prompt_text();
-        self.push_echo(&prompt, &command);
+        if self.running.is_some() {
+            self.send_input(&command);
+            self.rebuild_buffer(font_system);
+            return None;
+        }
+
+        let prompt = self.prompt.clone();
+        self.push_echo(prompt, &command);
 
         let trimmed = command.trim();
         if trimmed.is_empty() {
@@ -399,6 +548,9 @@ impl Shell {
             }
         }
         let changed = !pending.is_empty() || finished.is_some();
+        if !pending.is_empty() {
+            self.child_spoke = true;
+        }
         for (is_error, text) in pending {
             self.push_line(
                 text,
@@ -427,6 +579,8 @@ impl Shell {
                 );
             }
             self.running = None;
+            self.child_spoke = false;
+            self.refresh_branch();
             if let Some(Some(status)) = finished {
                 if !status.success() {
                     let code = status
@@ -447,19 +601,13 @@ impl Shell {
         let Some(job) = &mut self.running else {
             return false;
         };
-        let pid = job.child.id().to_string();
-        let killed = Command::new("taskkill")
-            .args(["/PID", &pid, "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
+        let killed = kill_tree(job.child.id());
         if !killed {
             let _ = job.child.kill();
         }
         let _ = job.child.try_wait();
         self.running = None;
+        self.child_spoke = false;
         self.push_line("^C".to_string(), LineKind::Error);
         self.rebuild_buffer(font_system);
         true
@@ -467,16 +615,11 @@ impl Shell {
 
     pub fn kill_job(&mut self) {
         if let Some(job) = &mut self.running {
-            let pid = job.child.id().to_string();
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid, "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            kill_tree(job.child.id());
             let _ = job.child.kill();
             let _ = job.child.try_wait();
             self.running = None;
+            self.child_spoke = false;
         }
     }
 
@@ -486,6 +629,9 @@ impl Shell {
     }
 
     pub fn scroll_by(&mut self, font_system: &mut FontSystem, delta: f32) {
+        if delta.abs() < f32::EPSILON {
+            return;
+        }
         let scroll = self.buffer.scroll();
         self.buffer.set_scroll(Scroll {
             line: scroll.line,
@@ -493,11 +639,21 @@ impl Shell {
             horizontal: 0.0,
         });
         self.buffer.shape_until_scroll(font_system, true);
+        self.follow = self.at_bottom();
+    }
+
+    fn at_bottom(&self) -> bool {
+        let last = self.buffer.lines.len().saturating_sub(1);
+        let mut lowest = None;
+        for run in self.buffer.layout_runs() {
+            lowest = Some(run.line_i);
+        }
+        lowest.is_none_or(|line| line >= last)
     }
 
     pub fn cursor_rect(&self) -> Option<(f32, f32, f32)> {
         let line = self.buffer.lines.len().checked_sub(1)?;
-        let byte = self.prompt_bytes + char_to_byte(&self.input, self.input_cursor);
+        let byte = self.input_line_bytes() + char_to_byte(&self.input, self.input_cursor);
         let cursor = Cursor::new(line, byte);
         for run in self.buffer.layout_runs() {
             if run.line_i != line {
@@ -511,6 +667,37 @@ impl Shell {
     }
 
     pub fn selection_spans(&self) -> Vec<(f32, f32, f32, f32)> {
+        if let Some((first, second)) = self.view_selection {
+            let (start, end) = if (first.line, first.ch) <= (second.line, second.ch) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if start == end {
+                return Vec::new();
+            }
+            let last = self.buffer.lines.len().saturating_sub(1);
+            let end = TextPos {
+                line: end.line.min(last),
+                ch: end.ch,
+            };
+            let start_cursor = self.text_cursor(start);
+            let end_cursor = self.text_cursor(end);
+            let mut spans = Vec::new();
+            for run in self.buffer.layout_runs() {
+                if run.line_i < start.line || run.line_i > end.line {
+                    continue;
+                }
+                for (x, width) in run.highlight(start_cursor, end_cursor) {
+                    spans.push((x, run.line_top, width, run.line_height));
+                }
+                if run.glyphs.is_empty() && run.line_i > start.line && run.line_i < end.line {
+                    spans.push((0.0, run.line_top, self.font_size * 0.5, run.line_height));
+                }
+            }
+            return spans;
+        }
+
         let Some((start, end)) = self.input_selection else {
             return Vec::new();
         };
@@ -520,8 +707,8 @@ impl Shell {
         } else {
             (end, start)
         };
-        let start_byte = self.prompt_bytes + char_to_byte(&self.input, start);
-        let end_byte = self.prompt_bytes + char_to_byte(&self.input, end);
+        let start_byte = self.input_line_bytes() + char_to_byte(&self.input, start);
+        let end_byte = self.input_line_bytes() + char_to_byte(&self.input, end);
         let start_cursor = Cursor::new(line, start_byte);
         let end_cursor = Cursor::new(line, end_byte);
         let mut spans = Vec::new();
@@ -536,21 +723,27 @@ impl Shell {
         spans
     }
 
+    fn text_cursor(&self, pos: TextPos) -> Cursor {
+        let text = self
+            .buffer
+            .lines
+            .get(pos.line)
+            .map(|value| value.text())
+            .unwrap_or("");
+        Cursor::new(pos.line, char_to_byte(text, pos.ch))
+    }
+
     pub fn cursor_line_column(&self) -> (usize, usize) {
         (
             self.lines.len() + 1,
-            self.prompt_len + self.input_cursor + 1,
+            self.input_line_chars() + self.input_cursor + 1,
         )
     }
 
     fn refresh_prompt(&mut self, font_system: &mut FontSystem) {
+        self.follow = true;
+        self.view_selection = None;
         self.rebuild_last_line(font_system);
-        let last = self.buffer.lines.len().saturating_sub(1);
-        self.buffer.set_scroll(Scroll {
-            line: last,
-            vertical: 0.0,
-            horizontal: 0.0,
-        });
         self.buffer
             .shape_until_cursor(font_system, self.prompt_cursor(), true);
     }
@@ -559,13 +752,12 @@ impl Shell {
         let line = self.buffer.lines.len().saturating_sub(1);
         Cursor::new(
             line,
-            self.prompt_bytes + char_to_byte(&self.input, self.input_cursor),
+            self.input_line_bytes() + char_to_byte(&self.input, self.input_cursor),
         )
     }
 
     fn rebuild_last_line(&mut self, font_system: &mut FontSystem) {
-        let (text, list, prompt_bytes) = self.prompt_line();
-        self.prompt_bytes = prompt_bytes;
+        let (text, list) = self.prompt_line();
         let Some(line) = self.buffer.lines.last_mut() else {
             self.rebuild_buffer(font_system);
             return;
@@ -575,6 +767,7 @@ impl Shell {
     }
 
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
+        let previous = self.buffer.scroll();
         let metrics = Metrics::new(self.font_size, self.line_height);
         let mut buffer = Buffer::new_empty(metrics);
         buffer.set_wrap(Wrap::WordOrGlyph);
@@ -582,50 +775,36 @@ impl Shell {
         buffer.set_size(Some(self.view_width), Some(self.view_height));
 
         for line in &self.lines {
-            if line.kind == LineKind::Echo && line.prompt_bytes > 0 {
-                let base = attrs(
-                    self.family,
-                    theme::prompt().map_or(theme::text(), |prompt| prompt.input),
-                );
-                let mut list = AttrsList::new(&base);
-                match theme::prompt() {
-                    Some(prompt) if line.prompt_bytes >= 2 => {
-                        let path_end = line.prompt_bytes - 2;
-                        list.add_span(0..path_end, &attrs(self.family, prompt.path));
-                        list.add_span(
-                            path_end..line.prompt_bytes,
-                            &attrs(self.family, prompt.arrow),
-                        );
-                    }
-                    Some(_) => {}
-                    None => {
-                        list.add_span(0..line.prompt_bytes, &attrs(self.family, theme::text_dim()));
-                    }
+            let list = match &line.prompt {
+                Some(prompt) => {
+                    let base = attrs(
+                        self.family,
+                        theme::prompt().map_or(theme::text(), |input| input.input),
+                    );
+                    let mut list = AttrsList::new(&base);
+                    prompt.paint(&mut list, self.family);
+                    add_syntax_spans(
+                        &mut list,
+                        self.family,
+                        &line.text[prompt.len()..],
+                        prompt.len(),
+                    );
+                    list
                 }
-                add_syntax_spans(
-                    &mut list,
-                    self.family,
-                    &line.text[line.prompt_bytes..],
-                    line.prompt_bytes,
-                );
-                buffer.lines.push(BufferLine::new(
-                    line.text.clone(),
-                    glyphon::cosmic_text::LineEnding::Lf,
-                    list,
-                    Shaping::Advanced,
-                ));
-                continue;
-            }
-            let color = match line.kind {
-                LineKind::Error => theme::red(),
-                LineKind::Echo => theme::text_dim(),
-                LineKind::Output => theme::text(),
+                None => {
+                    let color = match line.kind {
+                        LineKind::Error => theme::red(),
+                        LineKind::Echo => theme::text_dim(),
+                        LineKind::Output => theme::text(),
+                    };
+                    let base = attrs(self.family, color);
+                    let mut list = AttrsList::new(&base);
+                    for (range, span_color) in &line.spans {
+                        list.add_span(range.clone(), &attrs(self.family, *span_color));
+                    }
+                    list
+                }
             };
-            let line_attrs = attrs(self.family, color);
-            let mut list = AttrsList::new(&line_attrs);
-            for (range, span_color) in &line.spans {
-                list.add_span(range.clone(), &attrs(self.family, *span_color));
-            }
             buffer.lines.push(BufferLine::new(
                 line.text.clone(),
                 glyphon::cosmic_text::LineEnding::Lf,
@@ -634,8 +813,7 @@ impl Shell {
             ));
         }
 
-        let (prompt, list, prompt_bytes) = self.prompt_line();
-        self.prompt_bytes = prompt_bytes;
+        let (prompt, list) = self.prompt_line();
         buffer.lines.push(BufferLine::new(
             prompt,
             glyphon::cosmic_text::LineEnding::Lf,
@@ -644,60 +822,74 @@ impl Shell {
         ));
 
         self.buffer = buffer;
-        let last = self.buffer.lines.len().saturating_sub(1);
-        self.buffer.set_scroll(Scroll {
-            line: last,
-            vertical: 0.0,
-            horizontal: 0.0,
-        });
-        self.buffer
-            .shape_until_cursor(font_system, self.prompt_cursor(), true);
+        if self.follow {
+            self.buffer
+                .shape_until_cursor(font_system, self.prompt_cursor(), true);
+        } else {
+            self.buffer.set_scroll(previous);
+            self.buffer.shape_until_scroll(font_system, true);
+        }
     }
 
-    fn prompt_line(&mut self) -> (String, AttrsList, usize) {
-        let prompt = self.prompt_text();
-        self.prompt_len = prompt.chars().count();
-        let prompt_bytes = prompt.len();
-        let text = format!("{prompt}{}", self.input);
+    /// A child that owns the session prints its own prompt, so kite adds
+    /// nothing in front of the line and highlights none of what is typed.
+    fn owns_session(&self) -> bool {
+        self.running.is_some() && self.child_spoke
+    }
+
+    fn input_line_bytes(&self) -> usize {
+        if self.owns_session() {
+            0
+        } else {
+            self.prompt.len()
+        }
+    }
+
+    fn input_line_chars(&self) -> usize {
+        if self.owns_session() {
+            0
+        } else {
+            self.prompt.chars()
+        }
+    }
+
+    fn prompt_line(&self) -> (String, AttrsList) {
+        let prompt_bytes = self.input_line_bytes();
+        let text = if self.owns_session() {
+            self.input.clone()
+        } else {
+            format!("{}{}", self.prompt.text, self.input)
+        };
         let base = attrs(
             self.family,
             theme::prompt().map_or(theme::text(), |prompt| prompt.input),
         );
         let mut list = AttrsList::new(&base);
-        if prompt_bytes > 0 {
-            if let Some(prompt) = theme::prompt() {
-                if prompt_bytes >= 2 {
-                    let path_end = prompt_bytes - 2;
-                    list.add_span(0..path_end, &attrs(self.family, prompt.path));
-                    list.add_span(path_end..prompt_bytes, &attrs(self.family, prompt.arrow));
-                }
-            } else {
-                list.add_span(0..prompt_bytes, &attrs(self.family, theme::text_dim()));
-            }
+        if !self.owns_session() {
+            self.prompt.paint(&mut list, self.family);
+            add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes);
         }
-        add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes);
-        (text, list, prompt_bytes)
+        (text, list)
     }
 
     fn push_line(&mut self, text: String, kind: LineKind) {
         self.lines.push(ShellLine {
             text,
             kind,
-            prompt_bytes: 0,
+            prompt: None,
             spans: Vec::new(),
         });
         self.trim_lines();
     }
 
-    fn push_echo(&mut self, prompt: &str, command: &str) {
-        let mut text = String::with_capacity(prompt.len() + command.len());
-        text.push_str(prompt);
-        let prompt_bytes = text.len();
+    fn push_echo(&mut self, prompt: Prompt, command: &str) {
+        let mut text = String::with_capacity(prompt.text.len() + command.len());
+        text.push_str(&prompt.text);
         text.push_str(command);
         self.lines.push(ShellLine {
             text,
             kind: LineKind::Echo,
-            prompt_bytes,
+            prompt: Some(prompt),
             spans: Vec::new(),
         });
         self.trim_lines();
@@ -707,6 +899,7 @@ impl Shell {
         if self.lines.len() > SCROLLBACK_LIMIT {
             let overflow = self.lines.len() - SCROLLBACK_LIMIT;
             self.lines.drain(0..overflow);
+            self.view_selection = None;
         }
     }
 
@@ -727,7 +920,9 @@ impl Shell {
                     "  touch <file>    create an empty file",
                     "  echo <text>     print text",
                     "  kkk <file>      open a file in a new tab",
-                    "  clear           clear the scrollback",
+                    "  theme <name>    switch theme (index, neo)",
+                    "  cls / clear     clear the screen",
+                    "  restart         start a new shell, other tabs untouched",
                     "",
                     "Anything else runs as an external program.",
                 ] {
@@ -735,8 +930,26 @@ impl Shell {
                 }
                 true
             }
-            "clear" => {
+            "clear" | "cls" => {
                 self.lines.clear();
+                true
+            }
+            "restart" => {
+                *effect = Some(ShellEffect::Restart);
+                true
+            }
+            "theme" => {
+                let Some(name) = rest.first() else {
+                    self.push_line("theme: expected index or neo".to_string(), LineKind::Error);
+                    return true;
+                };
+                match theme::set_preset(name) {
+                    Ok(applied) => {
+                        self.push_line(format!("theme: {applied}"), LineKind::Output);
+                        *effect = Some(ShellEffect::Retheme);
+                    }
+                    Err(error) => self.push_line(format!("theme: {error}"), LineKind::Error),
+                }
                 true
             }
             "pwd" => {
@@ -748,7 +961,7 @@ impl Shell {
                     .first()
                     .map_or_else(|| home_dir(), |arg| resolve_path(&self.cwd, arg));
                 match fs::canonicalize(&target) {
-                    Ok(path) if path.is_dir() => self.cwd = path,
+                    Ok(path) if path.is_dir() => self.set_cwd(path),
                     Ok(path) => self.push_line(
                         format!("cd: not a directory: {}", path.display()),
                         LineKind::Error,
@@ -881,14 +1094,13 @@ impl Shell {
         command
             .args(&args[1..])
             .current_dir(&self.cwd)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
+            command.creation_flags(NO_WINDOW);
         }
         match command.spawn() {
             Ok(mut child) => {
@@ -899,11 +1111,23 @@ impl Shell {
                 if let Some(stderr) = child.stderr.take() {
                     spawn_reader(stderr, true, tx);
                 }
-                self.running = Some(Job { child, rx });
+                let stdin = child.stdin.take().map(spawn_writer);
+                self.child_spoke = false;
+                self.running = Some(Job { child, rx, stdin });
             }
             Err(error) => {
                 self.push_line(format!("{}: {error}", args[0]), LineKind::Error);
             }
+        }
+    }
+
+    /// Enter while a job runs feeds its stdin instead of starting a command.
+    fn send_input(&mut self, line: &str) {
+        let mut bytes = encode_console(line);
+        bytes.push(b'\n');
+        self.push_line(line.to_string(), LineKind::Output);
+        if let Some(stdin) = self.running.as_ref().and_then(|job| job.stdin.as_ref()) {
+            let _ = stdin.send(bytes);
         }
     }
 }
@@ -963,6 +1187,82 @@ fn decode_oem(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&wide[..written as usize]))
+}
+
+fn spawn_writer(mut writer: ChildStdin) -> Sender<Vec<u8>> {
+    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
+    std::thread::spawn(move || {
+        for bytes in rx {
+            if writer
+                .write_all(&bytes)
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    tx
+}
+
+/// Bytes a console program expects on its pipe, mirroring `decode_oem`.
+#[cfg(windows)]
+fn encode_console(text: &str) -> Vec<u8> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetOEMCP() -> u32;
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            multi: *mut u8,
+            multi_len: i32,
+            default_char: *const u8,
+            used_default: *mut bool,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let wide_len = i32::try_from(wide.len()).unwrap_or(i32::MAX);
+    let code_page = unsafe { GetOEMCP() };
+    let needed = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if needed <= 0 {
+        return text.as_bytes().to_vec();
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    let written = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            bytes.as_mut_ptr(),
+            needed,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if written <= 0 {
+        return text.as_bytes().to_vec();
+    }
+    bytes.truncate(written as usize);
+    bytes
+}
+
+#[cfg(not(windows))]
+fn encode_console(text: &str) -> Vec<u8> {
+    text.as_bytes().to_vec()
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -1036,6 +1336,79 @@ fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+/// `` + `user@host`, the segment that opens every prompt line.
+fn identity_label() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+    if user.is_empty() || host.is_empty() {
+        return String::new();
+    }
+    format!("{OS_ICON} {user}@{host}")
+}
+
+/// `  ⑂  branch > ` when the directory is inside a work tree, `> ` when it is
+/// not. The ranges are byte offsets into the prompt text.
+fn build_prompt(cwd: &Path, branch: Option<&str>, identity: &str) -> Prompt {
+    let mut text = String::new();
+    let identity_start = text.len();
+    text.push_str(identity);
+    if !identity.is_empty() {
+        text.push_str("  ");
+    }
+    let identity = identity_start..(identity_start + identity.len());
+    let path_start = text.len();
+    text.push_str(&display_path(cwd));
+    let path_end = text.len();
+    let mut git = path_end..path_end;
+    let mut name = path_end..path_end;
+    if let Some(branch) = branch {
+        let start = text.len();
+        text.push_str("  ");
+        text.push(GIT_BRANCH_ICON);
+        text.push_str("  ");
+        let name_start = text.len();
+        text.push_str(branch);
+        name = name_start..text.len();
+        text.push(' ');
+        git = start..text.len();
+    }
+    let arrow_start = text.len();
+    text.push_str("> ");
+    let arrow = arrow_start..text.len();
+    Prompt {
+        text,
+        identity,
+        path: path_start..path_end,
+        git,
+        branch: name,
+        arrow,
+    }
+}
+
+/// Branch label for the prompt: the HEAD ref name, or a short hash when the
+/// work tree is detached.
+fn git_branch(cwd: &Path) -> Option<String> {
+    let dot_git = cwd
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|entry| entry.exists())?;
+    let head = if dot_git.is_dir() {
+        dot_git.join("HEAD")
+    } else {
+        let pointer = fs::read_to_string(&dot_git).ok()?;
+        let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+        if git_dir.is_empty() {
+            return None;
+        }
+        Path::new(git_dir).join("HEAD")
+    };
+    let head = fs::read_to_string(head).ok()?;
+    match head.trim_end().strip_prefix("ref: ") {
+        Some(reference) => reference.rsplit('/').next().map(str::to_string),
+        None => head.trim_end().get(..7).map(str::to_string),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1187,6 +1560,30 @@ fn grapheme_next(text: &str, ch: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fonts::Fonts;
+
+    #[test]
+    fn view_selection_copies_across_output_lines() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.push_line("first line".to_string(), LineKind::Output);
+        shell.push_line("second line".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+
+        let prompt = shell.buffer.lines.len() - 1;
+        shell.mouse_drag(
+            TextPos {
+                line: prompt - 2,
+                ch: 6,
+            },
+            TextPos {
+                line: prompt - 1,
+                ch: 6,
+            },
+        );
+        assert_eq!(shell.selected_text().as_deref(), Some("line\nsecond"));
+        assert_eq!(shell.selection_spans().len(), 2);
+    }
 
     #[test]
     fn tokenizes_commands_flags_strings_and_numbers() {
@@ -1222,5 +1619,126 @@ mod tests {
     fn empty_input_has_no_spans() {
         assert!(command_spans("").is_empty());
         assert!(command_spans("   ").is_empty());
+    }
+
+    fn fake_repo(head: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir(&git).unwrap();
+        fs::write(git.join("HEAD"), head).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prompt_shows_the_branch_inside_a_repo() {
+        let repo = fake_repo("ref: refs/heads/main\n");
+        let work = repo.path().join("sub");
+        fs::create_dir(&work).unwrap();
+
+        let prompt = build_prompt(&work, git_branch(&work).as_deref(), "");
+        assert_eq!(&prompt.text[prompt.path.clone()], display_path(&work));
+        assert_eq!(&prompt.text[prompt.git.clone()], "  \u{f418}  main ");
+        assert_eq!(&prompt.text[prompt.branch.clone()], "main");
+        assert_eq!(&prompt.text[prompt.arrow.clone()], "> ");
+    }
+
+    #[test]
+    fn prompt_stays_plain_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(dir.path()), None);
+        let prompt = build_prompt(dir.path(), None, "");
+        assert!(prompt.git.is_empty());
+        assert_eq!(
+            prompt.text,
+            format!("{}> ", display_path(dir.path())),
+            "the arrow still closes the prompt"
+        );
+    }
+
+    #[test]
+    fn prompt_opens_with_the_windows_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = "\u{f17a} qfbsk@清枫不识客";
+        let prompt = build_prompt(dir.path(), None, identity);
+        assert_eq!(&prompt.text[prompt.identity.clone()], identity);
+        assert_eq!(&prompt.text[prompt.path.clone()], display_path(dir.path()));
+        assert_eq!(
+            prompt.text,
+            format!("{identity}  {}> ", display_path(dir.path()))
+        );
+    }
+
+    #[test]
+    fn detached_head_and_linked_work_trees_label_too() {
+        let repo = fake_repo("0d1f2e3a4b5c6d7e8f901234567890123456789a\n");
+        let prompt = build_prompt(repo.path(), git_branch(repo.path()).as_deref(), "");
+        assert_eq!(&prompt.text[prompt.branch.clone()], "0d1f2e3");
+
+        let common = fake_repo("ref: refs/heads/dev\n");
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join(".git"),
+            format!("gitdir: {}\n", common.path().join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(git_branch(work.path()).as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn cd_into_a_repo_relabels_the_live_prompt() {
+        let mut fonts = Fonts::load();
+        let repo = fake_repo("ref: refs/heads/main\n");
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.set_cwd(fs::canonicalize(repo.path()).unwrap());
+        assert_eq!(Some("main".to_string()), shell.branch);
+        assert!(shell.prompt.text.contains("\u{f418}  main > "));
+    }
+
+    #[test]
+    fn cls_clears_the_screen_and_keeps_the_shell() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.push_line("output".to_string(), LineKind::Output);
+        shell.input = "cls".to_string();
+        assert!(shell.submit(&mut fonts.system).is_none());
+        assert!(shell.lines.is_empty());
+        assert_eq!(shell.buffer.lines.len(), 1, "only the prompt is left");
+    }
+
+    #[test]
+    fn restart_reports_an_effect_instead_of_restarting_itself() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.input = "restart".to_string();
+        assert!(matches!(
+            shell.submit(&mut fonts.system),
+            Some(ShellEffect::Restart)
+        ));
+    }
+
+    #[test]
+    fn a_talking_child_takes_the_prompt_away() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        let prompt_bytes = shell.prompt.len();
+        shell.input = "cmd /c \"echo spoken && pause\"".to_string();
+        assert!(shell.submit(&mut fonts.system).is_none());
+        for _ in 0..200 {
+            shell.poll(&mut fonts.system);
+            if shell.child_spoke {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(shell.child_spoke, "the child never wrote to the pipe");
+        assert!(shell.owns_session());
+        shell.input = "still typing".to_string();
+        shell.refresh_prompt(&mut fonts.system);
+        let line = shell.buffer.lines.last().unwrap();
+        assert_eq!(line.text(), "still typing", "kite stays out of the way");
+        assert_eq!(shell.input_line_bytes(), 0);
+        assert_ne!(prompt_bytes, 0);
+        shell.kill_job();
+        assert!(!shell.owns_session());
     }
 }

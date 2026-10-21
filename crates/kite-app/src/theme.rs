@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 
 use glyphon::Color;
 
@@ -61,7 +61,7 @@ pub struct Background {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            name: "catppuccin-mocha".to_string(),
+            name: "index".to_string(),
             colors: Colors::default(),
             background: Background::default(),
             prompt: None,
@@ -161,24 +161,22 @@ impl Prompt {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preset {
-    CatppuccinMocha,
+    Index,
     Neo,
 }
 
 impl Preset {
     fn from_name(name: &str) -> Result<Self, String> {
         match name {
-            "catppuccin-mocha" => Ok(Self::CatppuccinMocha),
+            "index" => Ok(Self::Index),
             "neo" => Ok(Self::Neo),
-            other => Err(format!(
-                "unknown preset `{other}` (expected catppuccin-mocha or neo)"
-            )),
+            other => Err(format!("unknown preset `{other}` (expected index or neo)")),
         }
     }
 
     fn theme(self) -> Theme {
         match self {
-            Self::CatppuccinMocha => Theme::default(),
+            Self::Index => Theme::default(),
             Self::Neo => Theme {
                 name: "neo".to_string(),
                 colors: Colors::neo(),
@@ -189,43 +187,81 @@ impl Preset {
     }
 }
 
-static ACTIVE: OnceLock<Theme> = OnceLock::new();
+static ACTIVE: RwLock<Option<Arc<Theme>>> = RwLock::new(None);
+static SOURCE: RwLock<Option<(String, PathBuf)>> = RwLock::new(None);
+
+/// Swap the theme while the app runs; the caller repaints everything that baked
+/// colors in (buffers, labels, background texture).
+pub fn set_preset(name: &str) -> Result<String, String> {
+    let preset = Preset::from_name(name)?;
+    let source = SOURCE.read().expect("theme source").clone();
+    let theme = match &source {
+        Some((text, base)) => Theme::parse(text, base, Some(name))?,
+        None => preset.theme(),
+    };
+    let notice = theme.name.clone();
+    set_active(theme);
+    Ok(notice)
+}
+
+fn set_active(theme: Theme) {
+    *ACTIVE.write().expect("theme lock") = Some(Arc::new(theme));
+}
 
 pub fn init() -> Option<String> {
     let path = config_path()?;
-    if !path.is_file() {
+    let Some(text) = path
+        .is_file()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+    else {
+        set_active(Theme::default());
         return None;
-    }
-    let loaded = std::fs::read_to_string(&path)
-        .map_err(|error| error.to_string())
-        .and_then(|text| Theme::from_toml(&text, path.parent().unwrap_or(Path::new("."))));
-    match loaded {
+    };
+    let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    *SOURCE.write().expect("theme source") = Some((text.clone(), base.clone()));
+    match Theme::from_toml(&text, &base) {
         Ok(theme) => {
             let notice = format!("theme: {}", theme.name);
-            let _ = ACTIVE.set(theme);
+            set_active(theme);
             Some(notice)
         }
-        Err(error) => Some(format!("theme.toml: {error}")),
+        Err(error) => {
+            set_active(Theme::default());
+            Some(format!("theme.toml: {error}"))
+        }
     }
 }
 
-pub fn active() -> &'static Theme {
-    ACTIVE.get_or_init(Theme::default)
+fn current() -> Arc<Theme> {
+    ACTIVE
+        .read()
+        .expect("theme lock")
+        .clone()
+        .unwrap_or_default()
 }
 
-pub fn background() -> &'static Background {
-    &active().background
+pub fn background_image() -> Option<PathBuf> {
+    current().background.image.clone()
 }
 
-pub fn prompt() -> Option<&'static Prompt> {
-    active().prompt.as_ref()
+pub fn wallpaper() -> Wallpaper {
+    current().background.wallpaper
+}
+
+pub fn background_dim() -> f32 {
+    current().background.dim
+}
+
+pub fn prompt() -> Option<Prompt> {
+    current().prompt
 }
 
 macro_rules! color_accessors {
     ($($name:ident),* $(,)?) => {
         $(
             pub fn $name() -> Color {
-                active().colors.$name
+                current().colors.$name
             }
         )*
     };
@@ -258,7 +294,13 @@ color_accessors!(
 );
 
 impl Theme {
-    fn from_toml(text: &str, base: &Path) -> Result<Self, String> {
+    pub fn from_toml(text: &str, base: &Path) -> Result<Self, String> {
+        Self::parse(text, base, None)
+    }
+
+    /// `preset_override` lets a running session switch presets while keeping the
+    /// overrides the config file applies on top of them.
+    fn parse(text: &str, base: &Path, preset_override: Option<&str>) -> Result<Self, String> {
         let value: toml::Value = toml::from_str(text).map_err(|error| error.to_string())?;
         let table = value
             .as_table()
@@ -271,21 +313,21 @@ impl Theme {
                 return Err(format!("unknown key `{key}`"));
             }
         }
-        let preset = match table.get("preset") {
-            Some(value) => Preset::from_name(
-                value
-                    .as_str()
-                    .ok_or_else(|| "preset must be a string".to_string())?,
-            )?,
-            None => Preset::CatppuccinMocha,
+        let preset = match preset_override
+            .or_else(|| table.get("preset").and_then(|value| value.as_str()))
+        {
+            Some(name) => Preset::from_name(name)?,
+            None => Preset::Index,
         };
         let mut theme = preset.theme();
-        if let Some(value) = table.get("name") {
-            theme.name = value
-                .as_str()
-                .ok_or_else(|| "name must be a string".to_string())?
-                .trim()
-                .to_string();
+        if preset_override.is_none() {
+            if let Some(value) = table.get("name") {
+                theme.name = value
+                    .as_str()
+                    .ok_or_else(|| "name must be a string".to_string())?
+                    .trim()
+                    .to_string();
+            }
         }
         if let Some(value) = table.get("colors") {
             apply_colors(&mut theme.colors, value)?;
@@ -443,7 +485,7 @@ mod tests {
     #[test]
     fn defaults_stand_when_file_is_empty() {
         let theme = Theme::from_toml("", Path::new(".")).unwrap();
-        assert_eq!(theme.name, "catppuccin-mocha");
+        assert_eq!(theme.name, "index");
         assert_eq!(theme.colors.text, Color::rgb(0xcd, 0xd6, 0xf4));
         assert_eq!(theme.background.dim, 0.18);
         assert_eq!(theme.background.wallpaper, Wallpaper::Blurred);
@@ -493,6 +535,18 @@ mod tests {
         assert_eq!(theme.colors.accent, Color::rgb(0x89, 0xb4, 0xfa));
         assert_eq!(theme.background.wallpaper, Wallpaper::Sharp);
         assert_eq!(theme.background.dim, 0.3);
+    }
+
+    #[test]
+    fn preset_override_keeps_colors_but_not_the_custom_name() {
+        let theme = Theme::parse(
+            "preset = \"index\"\nname = \"mine\"\n\n[colors]\ntext = \"#010203\"\n",
+            Path::new("."),
+            Some("neo"),
+        )
+        .unwrap();
+        assert_eq!(theme.name, "neo");
+        assert_eq!(theme.colors.text, Color::rgb(0x01, 0x02, 0x03));
     }
 
     #[test]

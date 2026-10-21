@@ -17,10 +17,12 @@ impl FileKey {
 
 pub fn file_key(path: &Path) -> io::Result<FileKey> {
     let canonical = fs::canonicalize(path)?;
-    Ok(FileKey(normalize_identity(&canonical)))
+    Ok(FileKey(identity(&canonical)))
 }
 
-fn normalize_identity(path: &Path) -> String {
+/// Case- and separator-folded form of a path, so two spellings of the same file
+/// compare equal. The file does not have to exist.
+pub fn identity(path: &Path) -> String {
     let mut text = path.to_string_lossy().replace('/', "\\");
     while let Some(rest) = text.strip_prefix(r"\\?\") {
         text = rest.to_string();
@@ -43,6 +45,17 @@ pub fn display_path(path: &Path) -> String {
 /// It does not resolve symlinks and does not require the file to exist.
 pub fn absolute_bound_path(path: &Path) -> io::Result<PathBuf> {
     std::path::absolute(path)
+}
+
+/// Where the shell and the sidebar start: the X drive, or the drive the
+/// process was launched from when X: is not mounted.
+pub fn start_dir() -> PathBuf {
+    let x = PathBuf::from("X:\\");
+    if x.is_dir() {
+        return x;
+    }
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+    current.ancestors().last().unwrap_or(&current).to_path_buf()
 }
 
 #[cfg(test)]

@@ -23,3 +23,17 @@ unicode-segmentation.workspace = true
 toml.workspace = true
 winreg.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+tree-house = "0.4.0"
+tree-house-bindings = { version = "0.3.2", features = ["ropey", "tree-sitter-language"] }
+ropey = "1.6"
+tree-sitter-c = "0.24.2"
+tree-sitter-rust = "0.24.2"
+tree-sitter-powershell = "0.26.4"
+tree-sitter-json = "0.24.8"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-python = "0.25.0"
+tree-sitter-bash = "0.25.1"
+
+[dev-dependencies]
+tempfile = "3"

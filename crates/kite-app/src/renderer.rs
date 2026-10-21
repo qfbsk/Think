@@ -1,18 +1,19 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use glyphon::{
     Cache, ColorMode, FontSystem, SwashCache, TextArea, TextAtlas, TextRenderer, Viewport,
 };
 use wgpu::{
-    AddressMode, Backends, BindGroup, BindGroupEntry, BindGroupLayoutDescriptor,
+    AddressMode, Backends, BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType, BufferUsages,
     ColorTargetState, ColorWrites, CommandEncoderDescriptor, CompositeAlphaMode, Device,
     DeviceDescriptor, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor, Limits,
     LoadOp, MemoryHints, MipmapFilterMode, MultisampleState, Operations,
     PipelineCompilationOptions, PresentMode, PrimitiveState, Queue, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, Sampler,
     SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp, Surface, SurfaceColorSpace,
-    SurfaceConfiguration, TexelCopyBufferLayout, TextureDescriptor, TextureDimension,
+    SurfaceConfiguration, TexelCopyBufferLayout, Texture, TextureDescriptor, TextureDimension,
     TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
     VertexState,
 };
@@ -58,11 +59,11 @@ fn embedded_background(wallpaper: theme::Wallpaper) -> image::RgbaImage {
 }
 
 fn load_background(max_dimension: u32) -> (image::RgbaImage, Option<String>) {
-    let embedded = || embedded_background(theme::background().wallpaper);
-    let Some(path) = theme::background().image.as_ref() else {
+    let embedded = || embedded_background(theme::wallpaper());
+    let Some(path) = theme::background_image() else {
         return (embedded(), None);
     };
-    match image::open(path) {
+    match image::open(&path) {
         Ok(image) => {
             let image = if image.width() > max_dimension || image.height() > max_dimension {
                 image.thumbnail(max_dimension, max_dimension)
@@ -87,9 +88,13 @@ pub struct Renderer {
     config: SurfaceConfiguration,
 
     bg_pipeline: RenderPipeline,
+    bg_layout: BindGroupLayout,
     bg_bind_group: BindGroup,
     bg_uniform_buffer: Buffer,
     bg_image_size: [f32; 2],
+    background_texture: Texture,
+    background_sampler: Sampler,
+    background_source: (theme::Wallpaper, Option<PathBuf>),
     background_notice: Option<String>,
 
     pipeline: RenderPipeline,
@@ -399,9 +404,13 @@ impl Renderer {
             queue,
             config,
             bg_pipeline,
+            bg_layout,
             bg_bind_group,
             bg_uniform_buffer,
             bg_image_size: [bg_width as f32, bg_height as f32],
+            background_texture,
+            background_sampler,
+            background_source: (theme::wallpaper(), theme::background_image()),
             background_notice,
             pipeline,
             uniform_buffer,
@@ -425,6 +434,67 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    /// Re-upload the wallpaper when a `theme` command changed its source.
+    fn sync_background(&mut self) {
+        let source = (theme::wallpaper(), theme::background_image());
+        if source == self.background_source {
+            return;
+        }
+        let (image, notice) = load_background(self.device.limits().max_texture_dimension_2d);
+        let (width, height) = image.dimensions();
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("kite background"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            image.as_raw(),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        self.bg_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kite background bind group"),
+            layout: &self.bg_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: self.bg_uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&self.background_sampler),
+                },
+            ],
+        });
+        self.background_texture = texture;
+        self.bg_image_size = [width as f32, height as f32];
+        self.background_notice = notice;
+        self.background_source = source;
+    }
+
     pub fn render(
         &mut self,
         font_system: &mut FontSystem,
@@ -433,6 +503,7 @@ impl Renderer {
         foreground_quads: &[QuadVertex],
         text_areas: Vec<TextArea<'_>>,
     ) {
+        self.sync_background();
         self.viewport.update(
             &self.queue,
             glyphon::Resolution {
@@ -509,7 +580,7 @@ impl Renderer {
                 theme::bg().r() as f32 / 255.0,
                 theme::bg().g() as f32 / 255.0,
                 theme::bg().b() as f32 / 255.0,
-                theme::background().dim,
+                theme::background_dim(),
             ],
         };
         self.queue
