@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use glyphon::FontSystem;
@@ -25,6 +26,9 @@ pub struct Editor {
     engine: Arc<Engine>,
     numbers: Buffer,
     numbers_key: Option<NumbersKey>,
+    /// The rows holding a shape and layout cache, so the ones the view left
+    /// behind can be let go without walking the file.
+    shaped: Option<(usize, usize)>,
     cell_width: f32,
     family: &'static str,
     font_size: f32,
@@ -86,6 +90,7 @@ impl Editor {
             engine,
             numbers: Buffer::new_empty(metrics),
             numbers_key: None,
+            shaped: None,
             cell_width: measure_cell(font_system, family, font_size, line_height),
             family,
             font_size,
@@ -93,14 +98,15 @@ impl Editor {
             view_width,
             view_height,
         };
-        force_relayout(&mut editor.buffer);
-        editor.buffer.shape_until_scroll(font_system, true);
+        editor.shape_view(font_system);
         editor
     }
 
     /// Colour the rows the viewport can see with one query pass over that range.
-    /// Only glyph attributes change; the document is never touched.
-    pub fn highlight(&mut self, font_system: &mut FontSystem) {
+    /// Only glyph attributes change; the document is never touched. Returns
+    /// whether the view was redrawn, so the caller knows the rows are already
+    /// shaped and need not walk the document a second time.
+    pub fn highlight(&mut self, font_system: &mut FontSystem) -> bool {
         let revision = self.document.revision();
         let rows = (self.view_height / self.line_height).ceil() as usize + 8;
         let count = self.document.line_count();
@@ -108,7 +114,7 @@ impl Editor {
         let last = (first + rows).min(count);
         let key = (revision, first, last, self.selection.cursor);
         if self.colored == Some(key) {
-            return;
+            return false;
         }
         let runs = match (self.rope.as_ref(), self.tree.as_ref()) {
             (Some(rope), Some(tree)) => {
@@ -143,7 +149,8 @@ impl Editor {
             }
         }
         self.colored = Some(key);
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
+        true
     }
 
     /// The pair the caret sits to the right of, as two runs in the theme's match colour.
@@ -244,7 +251,7 @@ impl Editor {
         self.view_height = height;
         self.buffer.set_size(Some(width), Some(height));
         self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+            .shape_until_cursor(font_system, self.cursor_cosmic(), false);
     }
 
     pub fn set_font_size(&mut self, font_system: &mut FontSystem, font_size: f32) {
@@ -257,7 +264,7 @@ impl Editor {
         self.buffer
             .set_metrics(Metrics::new(font_size, self.line_height));
         self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+            .shape_until_cursor(font_system, self.cursor_cosmic(), false);
     }
 
     pub fn line_height(&self) -> f32 {
@@ -344,17 +351,56 @@ impl Editor {
         let previous = self.buffer.scroll();
         self.rebuild_buffer(font_system);
         self.buffer.set_scroll(previous);
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
         self.numbers_key = None;
     }
 
     pub fn shape(&mut self, font_system: &mut FontSystem) {
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
+    }
+
+    /// Walk the view again.
+    ///
+    /// Rows this code puts into `buffer.lines` are new rather than stale, and
+    /// cosmic-text only re-walks a buffer whose own caches it finds invalidated.
+    /// Left to itself it walks nothing, so the old answer was to resize the
+    /// buffer to nothing and back, which throws away the layout of every line
+    /// in the file. Nudging the scroll says the same thing — the view is
+    /// different now — without touching a line that did not change.
+    fn shape_view(&mut self, font_system: &mut FontSystem) {
+        let scroll = self.buffer.scroll();
+        self.buffer.set_scroll(Scroll {
+            vertical: scroll.vertical + 0.5,
+            ..scroll
+        });
+        self.buffer.set_scroll(scroll);
+        let screen = (self.view_height / self.line_height).ceil() as usize + 8;
+        let rows = self.buffer.lines.len();
+        let window = scroll.line.saturating_sub(screen)..(scroll.line + 2 * screen).min(rows);
+        self.keep_only(window);
+        self.buffer.shape_until_scroll(font_system, false);
+    }
+
+    /// Let go of the rows the view has left. A buffer that keeps every layout
+    /// it ever made holds gigabytes for a big file, and cosmic-text's own way
+    /// of avoiding that walks every line under the screen to do it; this walks
+    /// the one screen it last shaped.
+    fn keep_only(&mut self, window: Range<usize>) {
+        if let Some((lo, hi)) = self.shaped {
+            for index in lo..hi {
+                if !window.contains(&index) {
+                    if let Some(line) = self.buffer.lines.get_mut(index) {
+                        line.reset_shaping();
+                    }
+                }
+            }
+        }
+        self.shaped = (!window.is_empty()).then_some((window.start, window.end));
     }
 
     pub fn ensure_cursor_visible(&mut self, font_system: &mut FontSystem) {
         self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+            .shape_until_cursor(font_system, self.cursor_cosmic(), false);
     }
 
     pub fn insert_text(
@@ -553,7 +599,7 @@ impl Editor {
     }
 
     pub fn move_vertical(&mut self, font_system: &mut FontSystem, down: bool) {
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
         let cursor = self.cursor_cosmic();
         let Some((current_x, _)) = self.buffer.cursor_position(&cursor) else {
             return;
@@ -624,7 +670,7 @@ impl Editor {
         self.selection = Selection::caret(Position::new(target_line, ch));
         self.desired_x = Some(x);
         self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+            .shape_until_cursor(font_system, self.cursor_cosmic(), false);
     }
 
     pub fn scroll_by(&mut self, font_system: &mut FontSystem, delta: f32) {
@@ -637,7 +683,7 @@ impl Editor {
             vertical: scroll.vertical + delta,
             horizontal: scroll.horizontal,
         });
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
     }
 
     pub fn position_at(
@@ -646,7 +692,7 @@ impl Editor {
         x: f32,
         y: f32,
     ) -> Option<Position> {
-        self.buffer.shape_until_scroll(font_system, true);
+        self.shape_view(font_system);
         let cursor = self.buffer.hit(x, y)?;
         Some(self.cosmic_position(cursor))
     }
@@ -720,6 +766,7 @@ impl Editor {
     }
 
     fn after_change(&mut self, font_system: &mut FontSystem) {
+        let mut deeper = false;
         if let Some(change) = self.document.take_change() {
             self.sync(change);
             if change.start_line < self.buffer.scroll().line {
@@ -729,6 +776,7 @@ impl Editor {
                 let scroll = self.buffer.scroll();
                 self.buffer.set_scroll(Scroll { line, ..scroll });
             }
+            deeper = change.new_count > change.old_count;
             let line_attrs = attrs(self.family, theme::text());
             let new_lines = (0..change.new_count)
                 .map(|index| {
@@ -737,16 +785,28 @@ impl Editor {
                 })
                 .collect::<Vec<_>>();
             let range = change.start_line..change.start_line + change.old_count;
-            if range.end <= self.buffer.lines.len() {
-                self.buffer.lines.splice(range, new_lines);
-            } else {
+            if range.end > self.buffer.lines.len() {
                 self.rebuild_buffer(font_system);
                 return;
             }
-            force_relayout(&mut self.buffer);
+            if change.old_count == change.new_count {
+                // The same number of rows: overwrite them where they stand
+                // rather than shift the tail of three hundred thousand lines.
+                for (index, line) in range.zip(new_lines) {
+                    self.buffer.lines[index] = line;
+                }
+            } else {
+                self.buffer.lines.splice(range, new_lines);
+            }
         }
-        self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+        // One pass over the view. The caret cannot leave the screen by typing
+        // into a line that is already on it, so it is only worth chasing when
+        // the edit added lines.
+        if deeper {
+            self.ensure_cursor_visible(font_system);
+        } else {
+            self.shape_view(font_system);
+        }
     }
 
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
@@ -763,7 +823,7 @@ impl Editor {
         self.colored = None;
         force_relayout(&mut self.buffer);
         self.buffer
-            .shape_until_cursor(font_system, self.cursor_cosmic(), true);
+            .shape_until_cursor(font_system, self.cursor_cosmic(), false);
     }
 
     fn set_caret(&mut self, font_system: &mut FontSystem, position: Position) {
@@ -967,6 +1027,101 @@ mod tests {
             .map(|line| line.text().to_string())
             .collect();
         assert_eq!(rows, vec!["1", "2", "3", "4"]);
+    }
+
+    /// The cost of a keystroke is the screen, not the file: a change relays out
+    /// the row it touched and nothing else. Run with `--nocapture` to see the
+    /// numbers; the bound is the one a document-wide relayout breaks.
+    #[test]
+    fn typing_in_a_ten_megabyte_file_costs_by_the_screen_not_by_the_file() {
+        use std::time::{Duration, Instant};
+
+        let line = "line of text that is long enough to wrap\n";
+        let (mut few, mut fonts) = editor(&line.repeat(300));
+        let start = Instant::now();
+        for _ in 0..100 {
+            few.insert_text(&mut fonts.system, "x").unwrap();
+        }
+        let small = start.elapsed();
+
+        let big_text = line.repeat(300_000);
+        assert!(big_text.len() > 10 * 1024 * 1024);
+        let (mut many, _) = editor(&big_text);
+        drop(big_text);
+        let start = Instant::now();
+        for _ in 0..100 {
+            many.insert_text(&mut fonts.system, "x").unwrap();
+        }
+        let big = start.elapsed();
+
+        assert_eq!(
+            many.document
+                .line_text(0)
+                .chars()
+                .take_while(|ch| *ch == 'x')
+                .count(),
+            100,
+            "the keystrokes did not land on one line"
+        );
+        println!("100 keystrokes: {small:?} in 300 lines, {big:?} in 12MB");
+        assert!(
+            big < Duration::from_millis(100),
+            "100 keystrokes in a 12MB file took {big:?}, against the 11ms it \
+             costs once a keystroke lays out the screen rather than the file"
+        );
+    }
+
+    /// The rows behind the view let go of their layout, so walking a whole
+    /// 12MB file costs the same memory as looking at it.
+    #[test]
+    fn scrolling_lets_go_of_the_rows_it_passed() {
+        let (mut editor, mut fonts) =
+            editor(&"line of text that is long enough to wrap\n".repeat(300_000));
+        for _ in 0..12_000 {
+            editor.scroll_by(&mut fonts.system, editor.view_height);
+        }
+        assert!(
+            editor.buffer.scroll().line > 90_000,
+            "the walk stopped at {}",
+            editor.buffer.scroll().line
+        );
+        let shaped = editor
+            .buffer
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        let rows = (editor.view_height / editor.line_height).ceil() as usize;
+        assert!(
+            shaped <= 4 * rows + 16,
+            "{shaped} rows kept their layout for a {rows}-row screen"
+        );
+    }
+
+    /// A row that starts wrapping pushes the rows below it down. Their layouts
+    /// are recomputed as the view walks them, so the change needs no
+    /// document-wide invalidation to land in the right place.
+    #[test]
+    fn a_row_that_starts_wrapping_pushes_the_rows_below_down() {
+        let (mut editor, mut fonts) = editor("ab\ncd\n");
+        let before = tops(&editor, 1);
+        editor
+            .insert_text(&mut fonts.system, &"w".repeat(200))
+            .unwrap();
+        let after = tops(&editor, 1);
+        assert!(
+            editor
+                .buffer
+                .layout_runs()
+                .filter(|run| run.line_i == 0)
+                .count()
+                > 1,
+            "the first line did not wrap"
+        );
+        assert!(
+            after[0] > before[0],
+            "line 1 stayed put while line 0 wrapped: {before:?} -> {after:?}"
+        );
     }
 
     fn place(editor: &mut Editor, fonts: &mut Fonts, line: usize, ch: usize) {

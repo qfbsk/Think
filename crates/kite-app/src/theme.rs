@@ -43,6 +43,14 @@ pub struct Colors {
     pub cursor: Color,
     pub whitespace_dot: Color,
     pub whitespace_mark: Color,
+    /// The miku board's heat levels, emptiest first: a transparent placeholder
+    /// and then five steps of green depth.
+    pub miku_0: Color,
+    pub miku_1: Color,
+    pub miku_2: Color,
+    pub miku_3: Color,
+    pub miku_4: Color,
+    pub miku_5: Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +103,12 @@ impl Default for Colors {
             cursor: Color::rgb(0xf5, 0xe0, 0xdc),
             whitespace_dot: Color::rgba(0x8a, 0x93, 0xb5, 0x72),
             whitespace_mark: Color::rgba(0x7a, 0xa2, 0xf7, 0x8c),
+            miku_0: Color::rgba(0x45, 0x47, 0x5a, 0x80),
+            miku_1: Color::rgb(0x3f, 0x9c, 0x56),
+            miku_2: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_3: Color::rgb(0x71, 0xc4, 0x7f),
+            miku_4: Color::rgb(0x8b, 0xd7, 0x94),
+            miku_5: Color::rgb(0xa6, 0xe3, 0xa1),
         }
     }
 }
@@ -135,6 +149,12 @@ impl Colors {
             cursor: Color::rgb(0xf5, 0xe0, 0xdc),
             whitespace_dot: Color::rgba(0x8a, 0x93, 0xb5, 0x72),
             whitespace_mark: Color::rgba(0x7a, 0xa2, 0xf7, 0x8c),
+            miku_0: Color::rgba(0x45, 0x47, 0x5a, 0x80),
+            miku_1: Color::rgb(0x3f, 0x9c, 0x56),
+            miku_2: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_3: Color::rgb(0x71, 0xc4, 0x7f),
+            miku_4: Color::rgb(0x8b, 0xd7, 0x94),
+            miku_5: Color::rgb(0xa6, 0xe3, 0xa1),
         }
     }
 }
@@ -291,7 +311,25 @@ color_accessors!(
     cursor,
     whitespace_dot,
     whitespace_mark,
+    miku_0,
+    miku_1,
+    miku_2,
+    miku_3,
+    miku_4,
+    miku_5,
 );
+
+/// The heat colour for a day's `level` (0 = nothing saved, 5 = the busiest).
+pub fn miku(level: usize) -> Color {
+    match level {
+        0 => miku_0(),
+        1 => miku_1(),
+        2 => miku_2(),
+        3 => miku_3(),
+        4 => miku_4(),
+        _ => miku_5(),
+    }
+}
 
 impl Theme {
     pub fn from_toml(text: &str, base: &Path) -> Result<Self, String> {
@@ -383,6 +421,12 @@ fn apply_colors(colors: &mut Colors, value: &toml::Value) -> Result<(), String> 
             "cursor" => &mut colors.cursor,
             "whitespace_dot" => &mut colors.whitespace_dot,
             "whitespace_mark" => &mut colors.whitespace_mark,
+            "miku_0" => &mut colors.miku_0,
+            "miku_1" => &mut colors.miku_1,
+            "miku_2" => &mut colors.miku_2,
+            "miku_3" => &mut colors.miku_3,
+            "miku_4" => &mut colors.miku_4,
+            "miku_5" => &mut colors.miku_5,
             other => return Err(format!("colors: unknown key `{other}`")),
         };
         *target = color;

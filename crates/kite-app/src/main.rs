@@ -1,14 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod app;
+mod archive;
 mod banner;
+mod day;
 mod editor;
 mod fonts;
 mod git;
+mod miku;
 mod renderer;
 mod shell;
 mod sidebar;
 mod syntax;
+mod terminal;
 mod text;
 mod theme;
 mod ui;

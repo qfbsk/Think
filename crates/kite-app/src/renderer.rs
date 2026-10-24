@@ -28,6 +28,10 @@ use crate::theme;
 pub struct QuadVertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    /// The rectangle this corner belongs to, so the shader can round it.
+    pub rect: [f32; 4],
+    /// Corner radius in pixels; 0.0 keeps the hard rectangle.
+    pub radius: f32,
 }
 
 #[repr(C)]
@@ -214,6 +218,16 @@ impl Renderer {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 8,
                             shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 40,
+                            shader_location: 3,
                         },
                     ],
                 })],

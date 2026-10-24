@@ -16,8 +16,14 @@ use tree_house::{InjectionLanguageMarker, Language, LanguageConfig, LanguageLoad
 /// left uncoloured rather than parsed.
 pub const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
+/// Keystrokes pay for the parser out of this; a change that cannot be folded
+/// into the tree inside it keeps the colours it has and waits for the next one.
 pub const TIMEOUT: Duration = Duration::from_millis(500);
-const PARSE_TIMEOUT: Duration = TIMEOUT;
+
+/// Opening a file may freeze for a second, which is the price of the whole
+/// first screen arriving coloured — a cold parse that runs out of time hands
+/// back nothing, not a half-painted tree.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct Definition {
     name: &'static str,
@@ -530,6 +536,38 @@ mod tests {
     fn unknown_extensions_stay_uncoloured() {
         assert!(language_for_path(Path::new("x.unknownext")).is_none());
         assert!(language_for_path(Path::new("noextension")).is_none());
+    }
+
+    /// Two megabytes is the largest file the budget keeps, and it is the one
+    /// the budget is for: a cold parse that runs out of time hands back
+    /// nothing, so the whole screen would arrive colourless.
+    #[test]
+    fn the_largest_document_kept_is_coloured_by_the_time_it_is_given() {
+        use std::time::Instant;
+
+        let unit = include_str!("../tests/corpus/compare.c");
+        let text: String = unit.repeat(2 * 1024 * 1024 / unit.len() + 1);
+        assert!(text.len() >= MAX_HIGHLIGHT_BYTES);
+        assert!(enabled(MAX_HIGHLIGHT_BYTES) && !enabled(MAX_HIGHLIGHT_BYTES + 1));
+
+        let engine = Engine::new();
+        let language = language_for_path(Path::new("file.c")).expect("c");
+        let rope = Rope::from_str(&text);
+        let started = Instant::now();
+        // Running out of budget is what this test is watching for: a cold parse
+        // that does is not a half-coloured document, it is no document at all.
+        let syntax = engine
+            .parse(language, &rope)
+            .expect("the largest kept document fits its parse budget");
+        let parsed = started.elapsed();
+        let runs = engine.runs(&syntax, &rope, 0, 64);
+
+        println!("cold parse of {}MB: {parsed:?}", text.len() / 1024 / 1024);
+        assert!(
+            runs.iter()
+                .any(|run| rope.slice(run.start..run.end).to_string() == "int"),
+            "the first screen came back uncoloured"
+        );
     }
 
     #[test]

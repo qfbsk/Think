@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glyphon::cosmic_text::{
@@ -9,11 +9,12 @@ use kite_core::{Document, Position, Selection, file_key};
 use winit::dpi::PhysicalSize;
 
 use crate::editor::Editor;
+use crate::miku::Miku;
 use crate::renderer::QuadVertex;
 use crate::shell::{Shell, ShellEffect};
-use crate::sidebar::{Row, Sidebar, SidebarAction};
+use crate::sidebar::{Sidebar, SidebarAction};
 use crate::syntax::Engine;
-use crate::text::attrs;
+use crate::text::{attrs, make_label, measure};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ impl Rect {
 pub enum TabContent {
     Shell(Shell),
     Editor(Editor),
+    Miku(Miku),
 }
 
 pub struct Tab {
@@ -114,6 +116,8 @@ pub struct Ui {
     logo_width: f32,
     status: Buffer,
     status_key: String,
+    status_right: Buffer,
+    status_right_w: f32,
 
     titlebar_h: f32,
     status_h: f32,
@@ -183,6 +187,8 @@ impl Ui {
         let (logo_width, _) = measure(&logo);
         let status_attrs = attrs(family, theme::text_dim());
         let status = make_label(font_system, &status_attrs, status_font_size, "");
+        let count_attrs = attrs(family, theme::status_text());
+        let status_right = make_label(font_system, &count_attrs, status_font_size, "");
         let engine = Arc::new(Engine::new());
 
         let shell_tab = make_tab(
@@ -214,6 +220,8 @@ impl Ui {
             logo_width,
             status,
             status_key: String::new(),
+            status_right,
+            status_right_w: 0.0,
             titlebar_h,
             status_h,
             tab_pad: 11.0 * scale,
@@ -255,36 +263,90 @@ impl Ui {
     pub fn active_editor(&self) -> Option<&Editor> {
         match &self.tabs[self.active].content {
             TabContent::Editor(editor) => Some(editor),
-            TabContent::Shell(_) => None,
+            _ => None,
         }
     }
 
     pub fn active_editor_mut(&mut self) -> Option<&mut Editor> {
         match &mut self.tabs[self.active].content {
             TabContent::Editor(editor) => Some(editor),
-            TabContent::Shell(_) => None,
+            _ => None,
         }
     }
 
     pub fn active_shell(&self) -> Option<&Shell> {
         match &self.tabs[self.active].content {
             TabContent::Shell(shell) => Some(shell),
-            TabContent::Editor(_) => None,
+            _ => None,
         }
     }
 
     pub fn active_shell_mut(&mut self) -> Option<&mut Shell> {
         match &mut self.tabs[self.active].content {
             TabContent::Shell(shell) => Some(shell),
-            TabContent::Editor(_) => None,
+            _ => None,
         }
     }
 
     pub fn shell_tab_mut(&mut self) -> Option<&mut Shell> {
         self.tabs.iter_mut().find_map(|tab| match &mut tab.content {
             TabContent::Shell(shell) => Some(shell),
-            TabContent::Editor(_) => None,
+            _ => None,
         })
+    }
+
+    pub fn active_miku(&self) -> Option<&Miku> {
+        match &self.tabs[self.active].content {
+            TabContent::Miku(miku) => Some(miku),
+            _ => None,
+        }
+    }
+
+    pub fn active_miku_mut(&mut self) -> Option<&mut Miku> {
+        match &mut self.tabs[self.active].content {
+            TabContent::Miku(miku) => Some(miku),
+            _ => None,
+        }
+    }
+
+    /// The board's index, or `None` when it is not open. There is never a second one.
+    pub fn miku_tab(&self) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| matches!(tab.content, TabContent::Miku(_)))
+    }
+
+    /// Open the board, or move to the one already open. It always sits at index
+    /// one, right after the shell, so the file tabs shift along with it.
+    pub fn open_miku(&mut self, font_system: &mut FontSystem) {
+        if let Some(index) = self.miku_tab() {
+            self.activate_tab(font_system, index);
+            self.focus = Focus::Right;
+            self.mode = Mode::Normal;
+            self.recompute_layout(font_system);
+            return;
+        }
+        let content = self.editor_content_rect();
+        let mut miku = Miku::new(font_system, self.family, self.scale);
+        miku.set_viewport(font_system, content.w, content.h);
+        let tab = make_tab(
+            font_system,
+            self.family,
+            self.tab_font_size,
+            self.tab_pad,
+            self.close_w,
+            4.0 * self.scale,
+            "miku",
+            TabContent::Miku(miku),
+        );
+        self.tabs.insert(1, tab);
+        self.active = 1;
+        self.focus = Focus::Right;
+        self.mode = Mode::Normal;
+        for index in 1..self.tabs.len() {
+            self.refresh_label(font_system, index);
+        }
+        self.recompute_layout(font_system);
     }
 
     pub fn editor_content_rect(&self) -> Rect {
@@ -305,6 +367,7 @@ impl Ui {
                 }
             }
             TabContent::Shell(_) => content,
+            TabContent::Miku(_) => content,
         }
     }
 
@@ -366,6 +429,9 @@ impl Ui {
                 TabContent::Editor(editor) => {
                     editor.set_font_size(font_system, self.body_font_size)
                 }
+                // The board's type comes from its own geometry, which the new
+                // scale reaches through the layout below.
+                TabContent::Miku(_) => {}
             }
         }
         self.recompute_layout(font_system);
@@ -542,18 +608,65 @@ impl Ui {
 
     pub fn save_active(&mut self, font_system: &mut FontSystem) -> Result<(), String> {
         let index = self.active;
-        let title = match &mut self.tabs[index].content {
+        let (title, path) = match &mut self.tabs[index].content {
             TabContent::Editor(editor) => {
                 let title = editor.display_title();
+                let path = editor.document.path().to_path_buf();
                 editor.save()?;
-                title
+                (title, path)
             }
             TabContent::Shell(_) => return Err("the shell has nothing to save".to_string()),
+            TabContent::Miku(_) => return Err("the board has nothing to save".to_string()),
         };
         self.refresh_label(font_system, index);
         self.message = Some(format!("saved {title}"));
         self.sidebar.git_changed(font_system);
+        self.note_save(font_system, &path);
         Ok(())
+    }
+
+    /// The board counts saves, so a save is worth recording even when the board
+    /// is not the page in front.
+    fn note_save(&mut self, font_system: &mut FontSystem, path: &Path) {
+        let text = kite_core::display_path(path);
+        for tab in &mut self.tabs {
+            if let TabContent::Miku(miku) = &mut tab.content {
+                miku.record_save(font_system, &text);
+            }
+        }
+    }
+
+    /// Shift and the wheel turn whole years; the plain arrows move one day.
+    pub fn miku_page(&mut self, font_system: &mut FontSystem, back: bool) {
+        let Some(miku) = self.active_miku_mut() else {
+            return;
+        };
+        miku.page(font_system, if back { 1 } else { -1 });
+    }
+
+    /// A click on the board picks the day under it; anywhere else it is a no-op.
+    pub fn miku_click(&mut self, font_system: &mut FontSystem, x: f32, y: f32) {
+        let content = self.editor_content_rect();
+        let Some(day) = self
+            .active_miku()
+            .and_then(|miku| miku.hit(x - content.x, y - content.y))
+        else {
+            return;
+        };
+        self.focus = Focus::Right;
+        self.mode = Mode::Normal;
+        if let Some(miku) = self.active_miku_mut() {
+            miku.select(font_system, day);
+        }
+    }
+
+    pub fn miku_pending(&self) -> bool {
+        self.active_miku().is_some_and(Miku::pending)
+    }
+
+    pub fn poll_miku(&mut self, font_system: &mut FontSystem) -> bool {
+        self.active_miku_mut()
+            .is_some_and(|miku| miku.poll(font_system))
     }
 
     pub fn adjust_body_font(&mut self, font_system: &mut FontSystem, delta: f32) {
@@ -568,6 +681,9 @@ impl Ui {
             match &mut tab.content {
                 TabContent::Shell(shell) => shell.set_font_size(font_system, size),
                 TabContent::Editor(editor) => editor.set_font_size(font_system, size),
+                // The board sizes its own type from the panel, so Ctrl++/Ctrl+-
+                // does not reach it.
+                TabContent::Miku(_) => {}
             }
         }
         self.message = Some(format!("text size {:.0}px", size / self.scale));
@@ -588,7 +704,7 @@ impl Ui {
     pub fn any_shell_running(&self) -> bool {
         self.tabs.iter().any(|tab| match &tab.content {
             TabContent::Shell(shell) => shell.is_running(),
-            TabContent::Editor(_) => false,
+            _ => false,
         })
     }
 
@@ -600,12 +716,15 @@ impl Ui {
         }
     }
 
-    pub fn sidebar_git_pending(&self) -> bool {
-        self.sidebar.visible && self.sidebar.git_pending()
+    /// Either background worker still owes the sidebar an answer.
+    pub fn sidebar_pending(&self) -> bool {
+        self.sidebar.visible && (self.sidebar.git_pending() || self.sidebar.archive_pending())
     }
 
-    pub fn poll_sidebar_git(&mut self, font_system: &mut FontSystem) -> bool {
-        self.sidebar.poll_git(font_system)
+    pub fn poll_sidebar(&mut self, font_system: &mut FontSystem) -> bool {
+        let git = self.sidebar.poll_git(font_system);
+        let archive = self.sidebar.poll_archive(font_system);
+        git || archive
     }
 
     pub fn sidebar_enter(&mut self, font_system: &mut FontSystem) -> Option<PathBuf> {
@@ -615,19 +734,32 @@ impl Ui {
                 self.message = Some("! deleted in the work tree".to_string());
                 None
             }
+            Some(SidebarAction::ReadOnly) => {
+                self.message = Some("! read-only inside archives".to_string());
+                None
+            }
             None => None,
         }
     }
 
     /// Space hands the selected row to the shell input, without running it.
     pub fn sidebar_space(&mut self, font_system: &mut FontSystem) {
-        if self.sidebar.selected_row().is_some_and(|row| row.missing) {
-            self.message = Some("! deleted in the work tree".to_string());
-            return;
-        }
-        let Some(command) = self.sidebar.selected_row().map(Row::quick_command) else {
+        let Some(row) = self.sidebar.selected_row() else {
             return;
         };
+        // A name inside an archive is not something the shell could open.
+        let message = if row.missing {
+            Some("! deleted in the work tree")
+        } else if row.archive.is_some() {
+            Some("! read-only inside archives")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.message = Some(message.to_string());
+            return;
+        }
+        let command = row.quick_command();
         self.activate_tab(font_system, 0);
         self.focus_right_insert(font_system);
         if let Some(shell) = self.shell_tab_mut() {
@@ -646,6 +778,7 @@ impl Ui {
             }
             ShellEffect::Retheme => self.retheme(font_system),
             ShellEffect::Restart => self.restart_shell(font_system),
+            ShellEffect::Miku => self.open_miku(font_system),
         }
     }
 
@@ -691,6 +824,7 @@ impl Ui {
             match &mut tab.content {
                 TabContent::Shell(shell) => shell.retheme(font_system),
                 TabContent::Editor(editor) => editor.retheme(font_system),
+                TabContent::Miku(miku) => miku.retheme(font_system),
             }
         }
         self.sidebar.retheme(font_system);
@@ -700,8 +834,11 @@ impl Ui {
     pub fn prepare(&mut self, font_system: &mut FontSystem) {
         let delta = match &mut self.tabs[self.active].content {
             TabContent::Editor(editor) => {
-                editor.highlight(font_system);
-                editor.shape(font_system);
+                // Colouring the rows shapes them, so a pass that recoloured
+                // nothing needs no second walk over the document.
+                if !editor.highlight(font_system) {
+                    editor.shape(font_system);
+                }
                 editor.refresh_numbers(font_system);
                 editor.line_delta()
             }
@@ -709,6 +846,7 @@ impl Ui {
                 shell.shape(font_system);
                 (0, 0)
             }
+            TabContent::Miku(_) => (0, 0),
         };
         if delta != self.tabs[self.active].label_delta {
             self.refresh_label(font_system, self.active);
@@ -815,6 +953,21 @@ impl Ui {
                     custom_glyphs: &[],
                 });
             }
+            TabContent::Miku(miku) => {
+                // The board lays itself out in its own page coordinates.
+                let content = self.editor_content_rect();
+                for (buffer, x, y) in miku.areas() {
+                    areas.push(TextArea {
+                        buffer,
+                        left: content.x + x,
+                        top: content.y + y,
+                        scale: 1.0,
+                        bounds: bounds_of(content),
+                        default_color: theme::text(),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
         }
 
         if self.sidebar.visible {
@@ -840,6 +993,17 @@ impl Ui {
             default_color: theme::status_text(),
             custom_glyphs: &[],
         });
+        if self.status_right_w > 0.0 {
+            areas.push(TextArea {
+                buffer: &self.status_right,
+                left: self.status_right_x(),
+                top: self.status_rect.y + (self.status_rect.h - self.status_line_height) / 2.0,
+                scale: 1.0,
+                bounds: status_bounds,
+                default_color: theme::status_text(),
+                custom_glyphs: &[],
+            });
+        }
 
         areas
     }
@@ -991,6 +1155,21 @@ impl Ui {
 
         let content = self.body_text_rect();
         match &self.active_tab().content {
+            TabContent::Miku(miku) => {
+                for (cell, color, radius) in miku.quads() {
+                    push_round_rect(
+                        &mut quads,
+                        Rect {
+                            x: content.x + cell.x,
+                            y: content.y + cell.y,
+                            w: cell.w,
+                            h: cell.h,
+                        },
+                        color,
+                        radius,
+                    );
+                }
+            }
             TabContent::Editor(editor) => {
                 for (x, y, width, height) in editor.selection_spans() {
                     push_rect(
@@ -1043,9 +1222,10 @@ impl Ui {
                     );
                 }
                 TabContent::Shell(shell) => {
-                    let line_count = shell.lines.len();
                     let line_height = shell.line_height();
-                    let breaks = |line: usize| line < line_count;
+                    // A grid row is exactly as wide as the screen, so no row
+                    // continues into another and none needs a wrap marker.
+                    let breaks = |_line: usize| false;
                     push_whitespace_markers(
                         &mut quads,
                         &shell.buffer,
@@ -1055,6 +1235,8 @@ impl Ui {
                         &breaks,
                     );
                 }
+                // The board has no text of its own to mark up.
+                TabContent::Miku(_) => {}
             }
         }
 
@@ -1068,6 +1250,7 @@ impl Ui {
             let cursor = match &self.active_tab().content {
                 TabContent::Editor(editor) => editor.cursor_rect(),
                 TabContent::Shell(shell) => shell.cursor_rect(),
+                TabContent::Miku(_) => None,
             };
             if let Some((x, y, height)) = cursor {
                 push_rect(
@@ -1094,6 +1277,7 @@ impl Ui {
         let cursor = match &self.active_tab().content {
             TabContent::Editor(editor) => editor.cursor_rect(),
             TabContent::Shell(shell) => shell.cursor_rect(),
+            TabContent::Miku(_) => None,
         }?;
         Some(Rect {
             x: content.x + cursor.0,
@@ -1181,13 +1365,21 @@ impl Ui {
         if !self.right.contains(x, y) {
             return;
         }
+        let content = self.editor_content_rect();
         match &mut self.active_tab_mut().content {
             TabContent::Editor(editor) => {
                 editor.scroll_by(font_system, -lines * editor.line_height());
             }
             TabContent::Shell(shell) => {
-                shell.scroll_by(font_system, -lines * shell.line_height());
+                shell.scroll_by(
+                    font_system,
+                    x - content.x,
+                    y - content.y,
+                    -lines * shell.line_height(),
+                );
             }
+            // One notch turns one year over; up the wheel, back in time.
+            TabContent::Miku(miku) => miku.page(font_system, if lines > 0.0 { 1 } else { -1 }),
         }
     }
 
@@ -1196,12 +1388,11 @@ impl Ui {
             TabContent::Editor(editor) => {
                 let cursor = editor.cursor_position();
                 format!(
-                    "{}   {}   Ln {}, Col {}   {} chars",
+                    "{}   {}   Ln {}, Col {}",
                     kite_core::display_path(editor.document.path()),
                     editor.encoding_name(),
                     cursor.line + 1,
                     cursor.ch + 1,
-                    editor.document.char_count()
                 )
             }
             TabContent::Shell(shell) => {
@@ -1215,20 +1406,32 @@ impl Ui {
                     column
                 )
             }
+            TabContent::Miku(miku) => format!("miku   {}", miku.status()),
         };
         if let Some(message) = &self.message {
             text.push_str("   ");
             text.push_str(message);
         }
-        text.push_str(match (self.focus, self.mode) {
-            (Focus::Sidebar, _) => "   [SIDEBAR]",
-            (Focus::Right, Mode::Insert) => "   [INSERT]",
-            (Focus::Right, Mode::Normal) => "   [NORMAL]",
-        });
+        // A character count belongs in the corner, not in the middle of the bar.
+        let count = match &self.active_tab().content {
+            TabContent::Editor(editor) => format!("{} chars", editor.document.char_count()),
+            TabContent::Shell(_) => String::new(),
+            TabContent::Miku(_) => String::new(),
+        };
+        // While a child holds the keyboard, kite's editing mode is not what the
+        // screen means: a terminal does not advertise a modal state either.
+        let child_runs =
+            matches!(&self.active_tab().content, TabContent::Shell(shell) if shell.is_running());
+        if !child_runs {
+            text.push_str(match (self.focus, self.mode) {
+                (Focus::Sidebar, _) | (Focus::Right, Mode::Normal) => "   [NORMAL]",
+                (Focus::Right, Mode::Insert) => "   [INSERT]",
+            });
+        }
         if self.topmost {
             text.push_str("   [TOP]");
         }
-        let key = format!("{text}|{}", self.message.as_deref().unwrap_or(""));
+        let key = format!("{text}|{count}|{}", self.message.as_deref().unwrap_or(""));
         if key == self.status_key {
             return;
         }
@@ -1248,6 +1451,18 @@ impl Ui {
             self.status_font_size,
             &text,
         );
+        self.status_right = make_label(
+            font_system,
+            &attrs(self.family, theme::status_text()),
+            self.status_font_size,
+            &count,
+        );
+        self.status_right_w = measure(&self.status_right).0;
+    }
+
+    /// The count hugs the right edge of the bar, with the same padding as the left text.
+    fn status_right_x(&self) -> f32 {
+        (self.status_rect.right() - 10.0 * self.scale - self.status_right_w).max(self.status_rect.x)
     }
 
     fn refresh_label(&mut self, font_system: &mut FontSystem, index: usize) {
@@ -1264,6 +1479,7 @@ impl Ui {
         let delta = match &mut tab.content {
             TabContent::Editor(editor) => editor.line_delta(),
             TabContent::Shell(_) => (0, 0),
+            TabContent::Miku(_) => (0, 0),
         };
         let title = tab.title.clone();
         tab.label_delta = delta;
@@ -1332,6 +1548,7 @@ impl Ui {
                     editor.set_viewport(font_system, (content.w - gutter).max(1.0), content.h)
                 }
                 TabContent::Shell(shell) => shell.set_viewport(font_system, content.w, content.h),
+                TabContent::Miku(miku) => miku.set_viewport(font_system, content.w, content.h),
             }
         }
         if self.sidebar.visible {
@@ -1479,6 +1696,7 @@ fn make_tab(
     let close_extra = match &content {
         TabContent::Shell(_) => shell_pad,
         TabContent::Editor(_) => close_w + 6.0,
+        TabContent::Miku(_) => close_w + 6.0,
     };
     Tab {
         content,
@@ -1530,28 +1748,6 @@ fn make_counted_label(
     buffer
 }
 
-fn make_label(
-    font_system: &mut FontSystem,
-    attr: &Attrs<'static>,
-    font_size: f32,
-    text: &str,
-) -> Buffer {
-    let line_height = (font_size * 1.35).ceil();
-    let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
-    buffer.set_wrap(Wrap::None);
-    buffer.set_size(None, None);
-    buffer.set_text(text, attr, Shaping::Advanced, None);
-    buffer.shape_until_scroll(font_system, false);
-    buffer
-}
-
-fn measure(buffer: &Buffer) -> (f32, f32) {
-    match buffer.layout_runs().next() {
-        Some(run) => (run.line_w, run.line_height),
-        None => (0.0, 0.0),
-    }
-}
-
 fn bounds_of(rect: Rect) -> TextBounds {
     TextBounds {
         left: rect.x as i32,
@@ -1562,6 +1758,10 @@ fn bounds_of(rect: Rect) -> TextBounds {
 }
 
 fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
+    push_round_rect(quads, rect, color, 0.0);
+}
+
+fn push_round_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color, radius: f32) {
     if rect.w <= 0.0 || rect.h <= 0.0 {
         return;
     }
@@ -1572,14 +1772,16 @@ fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
         b as f32 / 255.0,
         a as f32 / 255.0,
     ];
-    let x0 = rect.x;
-    let y0 = rect.y;
+    let (x0, y0) = (rect.x, rect.y);
+    let (w, h) = (rect.w, rect.h);
     let x1 = rect.right();
     let y1 = rect.bottom();
     for [x, y] in [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]] {
         quads.push(QuadVertex {
             position: [x, y],
             color,
+            rect: [x0, y0, w, h],
+            radius,
         });
     }
 }
@@ -1618,6 +1820,10 @@ fn push_line(
         quads.push(QuadVertex {
             position: corners[index],
             color,
+            // A slanted line has no axis-aligned box to round inside, and the
+            // shader never reads these while the radius stays at zero.
+            rect: [0.0, 0.0, 0.0, 0.0],
+            radius: 0.0,
         });
     }
 }
@@ -1739,16 +1945,28 @@ mod tests {
         ui.open_file(&mut fonts.system, path.clone()).unwrap();
 
         ui.prepare(&mut fonts.system);
-        let text = ui.status.lines[0].text().to_string();
-        assert!(text.contains("11 chars"), "{text}");
+        assert_eq!(ui.status_right.lines[0].text(), "11 chars");
+        assert!(
+            ui.status_right_x() + ui.status_right_w
+                > ui.status_rect.x + ui.status_rect.w - 40.0 * ui.scale,
+            "the count belongs in the corner"
+        );
+        assert!(
+            !ui.status.lines[0].text().contains("chars"),
+            "the left text no longer carries the count"
+        );
+
+        ui.toggle_sidebar(&mut fonts.system);
+        ui.prepare(&mut fonts.system);
+        assert!(
+            ui.status.lines[0].text().ends_with("[NORMAL]"),
+            "the sidebar focus is plain normal: {}",
+            ui.status.lines[0].text()
+        );
 
         ui.activate_tab(&mut fonts.system, 0);
         ui.prepare(&mut fonts.system);
-        let text = ui.status.lines[0].text().to_string();
-        assert!(
-            !text.contains("chars"),
-            "the shell has no character count: {text}"
-        );
+        assert_eq!(ui.status_right_w, 0.0, "the shell has no character count");
 
         std::fs::remove_file(&path).ok();
     }

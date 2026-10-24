@@ -13,14 +13,15 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowButto
 
 use crate::fonts::Fonts;
 use crate::renderer::Renderer;
-use crate::shell::TextPos;
+use crate::shell::{GridPos, TerminalKey};
 use crate::theme;
 use crate::ui::{Focus, Mode, Ui};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(16);
-/// Only used while a `git` query is in flight, so the wait loop can wake for its reply.
-const GIT_POLL_INTERVAL: Duration = Duration::from_millis(60);
+/// Only used while a background worker owes the screen an answer, so the wait
+/// loop wakes for its reply instead of sleeping through it.
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const WHEEL_LINES: f32 = 3.0;
 const VERTICAL_DELAY: Duration = Duration::from_millis(320);
 const VERTICAL_INTERVAL: Duration = Duration::from_millis(90);
@@ -33,13 +34,17 @@ enum Drag {
         cursor: PhysicalPosition<i32>,
     },
     Editor(Position),
-    Shell(TextPos),
+    Shell(GridPos),
 }
 
+/// Which way a held arrow key steps. The name is the one the vertical repeat
+/// grew up with; Left and Right join it because the board is a grid.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VerticalDir {
     Up,
     Down,
+    Left,
+    Right,
 }
 
 impl VerticalDir {
@@ -47,14 +52,22 @@ impl VerticalDir {
         match key {
             Key::Named(NamedKey::ArrowUp) => Some(Self::Up),
             Key::Named(NamedKey::ArrowDown) => Some(Self::Down),
+            Key::Named(NamedKey::ArrowLeft) => Some(Self::Left),
+            Key::Named(NamedKey::ArrowRight) => Some(Self::Right),
             _ => None,
         }
     }
 
+    /// Left and Right belong to the board alone: everywhere else they stay
+    /// ordinary cursor keys, with or without Ctrl.
+    fn is_horizontal(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+
     fn step(self) -> isize {
         match self {
-            Self::Up => -1,
-            Self::Down => 1,
+            Self::Up | Self::Left => -1,
+            Self::Down | Self::Right => 1,
         }
     }
 }
@@ -64,6 +77,7 @@ enum VerticalTarget {
     Sidebar,
     Editor,
     Shell,
+    Miku,
 }
 
 #[derive(Clone, Copy)]
@@ -232,11 +246,19 @@ impl App {
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
 
-        if ui.sidebar_git_pending() {
-            if ui.poll_sidebar_git(&mut fonts.system) {
+        if ui.sidebar_pending() {
+            if ui.poll_sidebar(&mut fonts.system) {
                 window.request_redraw();
             }
-            let poll_at = now + GIT_POLL_INTERVAL;
+            let poll_at = now + WORKER_POLL_INTERVAL;
+            deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
+        }
+
+        if ui.miku_pending() {
+            if ui.poll_miku(&mut fonts.system) {
+                window.request_redraw();
+            }
+            let poll_at = now + WORKER_POLL_INTERVAL;
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
 
@@ -294,6 +316,7 @@ impl App {
             return;
         }
         let ctrl = self.modifiers.control_key() && !self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
         let KeyEvent {
             logical_key: key,
             text,
@@ -301,7 +324,7 @@ impl App {
             ..
         } = event;
 
-        if VerticalDir::from_key(&key).is_none() {
+        if VerticalDir::from_key(&key) != self.vertical.map(|repeat| repeat.direction) {
             self.vertical = None;
         }
 
@@ -361,35 +384,42 @@ impl App {
 
         ui.message = None;
 
+        let board = matches!(vertical_target(ui), Some(VerticalTarget::Miku));
+        // While a child holds the pseudo console the arrows are its to use, so
+        // they must not be spent on kite's own history or scroll.
+        let screen = matches!(ui.active_shell(), Some(shell) if shell.is_running());
         if let Some(direction) = VerticalDir::from_key(&key) {
-            if ctrl {
-                if ui.focus == Focus::Sidebar && !repeat {
-                    ui.sidebar.move_selection(system, direction.step());
-                    if let Some(window) = window.as_ref() {
-                        window.request_redraw();
+            let ours = !screen && (!direction.is_horizontal() || (board && !ctrl));
+            if ours {
+                if direction.is_horizontal() && shift {
+                    // Shift turns a year; holding it down does not scroll years.
+                    ui.miku_page(system, direction == VerticalDir::Left);
+                } else if ctrl {
+                    if ui.focus == Focus::Sidebar && !repeat {
+                        ui.sidebar.move_selection(system, direction.step());
+                        if let Some(window) = window.as_ref() {
+                            window.request_redraw();
+                        }
+                    }
+                } else if !repeat {
+                    if let Some(target) = vertical_target(ui) {
+                        vertical_step(ui, system, target, direction);
+                        let now = Instant::now();
+                        *vertical = Some(VerticalRepeat {
+                            direction,
+                            target,
+                            started: now,
+                            next_at: now + VERTICAL_DELAY,
+                        });
+                        ui.cursor_blink_reset();
+                        *next_blink = now + BLINK_INTERVAL;
+                        if let Some(window) = window.as_ref() {
+                            window.request_redraw();
+                        }
                     }
                 }
                 return;
             }
-            if repeat {
-                return;
-            }
-            if let Some(target) = vertical_target(ui) {
-                vertical_step(ui, system, target, direction);
-                let now = Instant::now();
-                *vertical = Some(VerticalRepeat {
-                    direction,
-                    target,
-                    started: now,
-                    next_at: now + VERTICAL_DELAY,
-                });
-                ui.cursor_blink_reset();
-                *next_blink = now + BLINK_INTERVAL;
-                if let Some(window) = window.as_ref() {
-                    window.request_redraw();
-                }
-            }
-            return;
         }
 
         match (ui.focus, ui.mode) {
@@ -412,6 +442,13 @@ impl App {
                     Key::Character(value) if value.as_str() == "-" => ui.toggle_sidebar(system),
                     Key::Character(value) if value.as_str() == "i" || value.as_str() == "I" => {
                         ui.focus_right_insert(system)
+                    }
+                    Key::Character(value) if value.len() == 1 => {
+                        if let Some(digit) = value.bytes().next() {
+                            if digit.is_ascii_digit() {
+                                ui.activate_digit(system, digit - b'0');
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -498,6 +535,14 @@ impl App {
         }
         if state == ElementState::Released {
             self.drag = None;
+            // A child that asked for the mouse also wants to hear it let go.
+            if let Some(ui) = self.ui.as_mut() {
+                let content = ui.editor_content_rect();
+                let (x, y) = ui.mouse();
+                if let Some(shell) = ui.active_shell_mut() {
+                    shell.mouse_release(x - content.x, y - content.y);
+                }
+            }
             return;
         }
 
@@ -559,6 +604,13 @@ impl App {
         }
 
         if ui.hit_right(x, y) {
+            if ui.active_miku().is_some() {
+                // The board has no caret to place: a click picks the day under it.
+                ui.message = None;
+                ui.miku_click(system, x, y);
+                window.request_redraw();
+                return;
+            }
             ui.focus_right_insert(system);
             ui.message = None;
             if ui.active_editor().is_some() {
@@ -608,9 +660,7 @@ impl App {
                 let cx = x.clamp(content.x, content.right() - 1.0);
                 let cy = y.clamp(content.y, content.bottom() - 1.0);
                 if let Some(shell) = ui.active_shell_mut() {
-                    if let Some(position) =
-                        shell.position_at(system, cx - content.x, cy - content.y)
-                    {
+                    if let Some(position) = shell.position_at(cx - content.x, cy - content.y) {
                         shell.mouse_drag(*anchor, position);
                     }
                 }
@@ -856,6 +906,7 @@ impl App {
 fn vertical_target(ui: &Ui) -> Option<VerticalTarget> {
     match (ui.focus, ui.mode) {
         (Focus::Sidebar, _) => Some(VerticalTarget::Sidebar),
+        (Focus::Right, Mode::Normal) if ui.active_miku().is_some() => Some(VerticalTarget::Miku),
         (Focus::Right, Mode::Insert) => {
             if ui.active_editor().is_some() {
                 Some(VerticalTarget::Editor)
@@ -887,7 +938,18 @@ fn vertical_step(
                 match direction {
                     VerticalDir::Up => shell.history_up(system),
                     VerticalDir::Down => shell.history_down(system),
+                    // The shell has no horizontal step; the caller leaves those
+                    // keys to the ordinary cursor handling.
+                    VerticalDir::Left | VerticalDir::Right => {}
                 }
+            }
+        }
+        VerticalTarget::Miku => {
+            if let Some(miku) = ui.active_miku_mut() {
+                // Rows are days and columns are weeks: up and down step a day,
+                // left and right step a week.
+                let days = if direction.is_horizontal() { 7 } else { 1 };
+                miku.nudge(system, direction.step() as i64 * days);
             }
         }
     }
@@ -897,6 +959,43 @@ fn vertical_interval(elapsed: Duration) -> Duration {
     let ramp = (elapsed.as_secs_f32() / VERTICAL_RAMP_SECS).clamp(0.0, 1.0);
     let speed = 1.0 + (VERTICAL_MAX_SPEED - 1.0) * ramp;
     VERTICAL_INTERVAL.div_f32(speed)
+}
+
+/// A key press as the console would receive it. `None` for keys with no VT
+/// spelling, which then simply do nothing.
+fn terminal_key(key: &Key, text: Option<&str>) -> Option<TerminalKey> {
+    if let Key::Named(named) = key {
+        return match named {
+            NamedKey::Enter => Some(TerminalKey::Enter),
+            NamedKey::Backspace => Some(TerminalKey::Backspace),
+            NamedKey::Delete => Some(TerminalKey::Delete),
+            NamedKey::Tab => Some(TerminalKey::Tab),
+            NamedKey::Escape => Some(TerminalKey::Escape),
+            NamedKey::ArrowUp => Some(TerminalKey::Up),
+            NamedKey::ArrowDown => Some(TerminalKey::Down),
+            NamedKey::ArrowLeft => Some(TerminalKey::Left),
+            NamedKey::ArrowRight => Some(TerminalKey::Right),
+            NamedKey::Home => Some(TerminalKey::Home),
+            NamedKey::End => Some(TerminalKey::End),
+            NamedKey::PageUp => Some(TerminalKey::PageUp),
+            NamedKey::PageDown => Some(TerminalKey::PageDown),
+            NamedKey::F1 => Some(TerminalKey::Function(1)),
+            NamedKey::F2 => Some(TerminalKey::Function(2)),
+            NamedKey::F3 => Some(TerminalKey::Function(3)),
+            NamedKey::F4 => Some(TerminalKey::Function(4)),
+            NamedKey::F5 => Some(TerminalKey::Function(5)),
+            NamedKey::F6 => Some(TerminalKey::Function(6)),
+            NamedKey::F7 => Some(TerminalKey::Function(7)),
+            NamedKey::F8 => Some(TerminalKey::Function(8)),
+            NamedKey::F9 => Some(TerminalKey::Function(9)),
+            NamedKey::F10 => Some(TerminalKey::Function(10)),
+            NamedKey::F11 => Some(TerminalKey::Function(11)),
+            NamedKey::F12 => Some(TerminalKey::Function(12)),
+            _ => None,
+        };
+    }
+    text.filter(|value| !value.is_empty())
+        .map(|value| TerminalKey::Text(value.to_string()))
 }
 
 fn handle_insert_key(
@@ -912,6 +1011,21 @@ fn handle_insert_key(
     ime_recent: &mut Option<(Instant, String)>,
 ) -> bool {
     let mut changed = false;
+
+    // A child that holds the pseudo console takes the keyboard whole: what is
+    // typed goes to it and it echoes back, as in any other terminal. Control
+    // chords stay kite's, which is how Ctrl+C can still interrupt.
+    if !ctrl {
+        if let Some(shell) = ui.active_shell_mut() {
+            if shell.is_running() {
+                match terminal_key(key, text) {
+                    Some(input) => shell.feed_key(input),
+                    None => return false,
+                }
+                return true;
+            }
+        }
+    }
 
     if matches!(key, Key::Named(NamedKey::Escape)) {
         if !repeat {
@@ -959,7 +1073,7 @@ fn handle_insert_key(
                         }
                     } else if let Some(shell) = ui.active_shell_mut() {
                         if shell.is_running() {
-                            shell.interrupt(system);
+                            shell.interrupt();
                             changed = true;
                         }
                     }

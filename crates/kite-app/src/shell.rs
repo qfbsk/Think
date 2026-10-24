@@ -1,25 +1,19 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::process::{Command, Stdio};
 
+use alacritty_terminal::index::{Column, Line, Point};
 use glyphon::FontSystem;
 use glyphon::cosmic_text::{
-    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Scroll, Shaping, Weight, Wrap,
+    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Shaping, Weight, Wrap,
 };
 use kite_core::display_path;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::banner;
-use crate::text::{attrs, byte_to_char, char_to_byte, force_relayout};
+use crate::terminal::{MouseReport, Run, Terminal};
+use crate::text::{attrs, byte_to_char, char_to_byte, make_label, measure};
 use crate::theme;
-
-const SCROLLBACK_LIMIT: usize = 4000;
-const OS_ICON: char = '\u{f17a}';
-const GIT_BRANCH_ICON: char = '\u{f418}';
-#[cfg(windows)]
-pub(crate) const NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -28,13 +22,13 @@ pub enum LineKind {
     Echo,
 }
 
-#[derive(Clone, Debug)]
-pub struct ShellLine {
-    pub text: String,
-    pub kind: LineKind,
-    prompt: Option<Prompt>,
-    spans: Vec<(std::ops::Range<usize>, Color)>,
-}
+/// One character of a screen row: what to draw, in which colour, bold or not.
+type Cell = (char, Color, bool);
+
+const OS_ICON: char = '\u{f17a}';
+const GIT_BRANCH_ICON: char = '\u{f418}';
+#[cfg(windows)]
+pub(crate) const NO_WINDOW: u32 = 0x0800_0000;
 
 /// The prompt of one input line, split into the parts that get their own
 /// colors. Byte ranges are offsets into the line's own text.
@@ -81,33 +75,70 @@ pub enum ShellEffect {
     Open(PathBuf),
     Retheme,
     Restart,
+    Miku,
 }
 
+/// A cell of the terminal grid. `line` counts from the top of the viewport, so
+/// a negative line is scrollback above it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextPos {
-    pub line: usize,
-    pub ch: usize,
+pub struct GridPos {
+    pub line: i32,
+    pub column: usize,
 }
 
-struct Job {
-    child: Child,
-    rx: Receiver<(bool, String)>,
-    stdin: Option<Sender<Vec<u8>>>,
+impl GridPos {
+    fn point(self) -> Point {
+        Point::new(Line(self.line), Column(self.column))
+    }
+
+    fn report(self, press: bool, drag: bool) -> MouseReport {
+        MouseReport {
+            button: 0,
+            press,
+            drag,
+            line: self.line,
+            column: self.column,
+        }
+    }
+}
+
+/// A key press, already stripped of everything kite's own line editor would
+/// have done with it. While a child holds the screen these are the only keys
+/// that mean anything, and they go to it as VT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalKey {
+    Text(String),
+    Enter,
+    Backspace,
+    Delete,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Function(u8),
 }
 
 pub struct Shell {
     pub cwd: PathBuf,
-    pub lines: Vec<ShellLine>,
     pub input: String,
     pub input_cursor: usize,
     pub input_selection: Option<(usize, usize)>,
     pub buffer: Buffer,
-    view_selection: Option<(TextPos, TextPos)>,
-    follow: bool,
+    /// Which row of the view holds the input line. It is the bottom row while
+    /// the session runs normally, but a full screen program can hand the
+    /// cursor back somewhere higher up.
+    input_row: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
-    running: Option<Job>,
+    /// The child's screen. While it runs, this is what the tab shows.
+    terminal: Terminal,
     family: &'static str,
     font_size: f32,
     line_height: f32,
@@ -116,9 +147,6 @@ pub struct Shell {
     prompt: Prompt,
     branch: Option<String>,
     identity: String,
-    /// Set once the running child writes something: a child that speaks is the
-    /// one holding the console, so kite keeps out of its way.
-    child_spoke: bool,
 }
 
 /// Kills the whole process tree. The helper is a console program, so without
@@ -152,20 +180,22 @@ impl Shell {
         let identity = identity_label();
         let prompt = build_prompt(&cwd, branch.as_deref(), &identity);
         let line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
+        let cell = cell_width(font_system, family, font_size);
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
         let mut shell = Self {
             cwd,
-            lines: Vec::new(),
             input: String::new(),
             input_cursor: 0,
             input_selection: None,
             buffer,
-            view_selection: None,
-            follow: true,
+            input_row: 0,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
-            running: None,
+            terminal: Terminal::new(
+                (view_width.max(1.0), view_height.max(1.0)),
+                (cell, line_height),
+            ),
             family,
             font_size,
             line_height,
@@ -174,16 +204,12 @@ impl Shell {
             prompt,
             branch,
             identity,
-            child_spoke: false,
         };
         for line in banner::lines() {
-            shell.lines.push(ShellLine {
-                text: line.text,
-                kind: LineKind::Output,
-                prompt: None,
-                spans: line.spans,
-            });
+            let cells = colored(&line.text, &line.spans);
+            shell.write_cells(&cells, true);
         }
+        shell.emit_input();
         shell.rebuild_buffer(font_system);
         shell
     }
@@ -196,6 +222,9 @@ impl Shell {
         }
         self.view_width = width;
         self.view_height = height;
+        let cell = self.terminal.cell().0;
+        self.terminal
+            .resize((width, height), (cell, self.line_height));
         self.rebuild_buffer(font_system);
     }
 
@@ -205,6 +234,11 @@ impl Shell {
         }
         self.font_size = font_size;
         self.line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
+        let cell = cell_width(font_system, self.family, font_size);
+        self.terminal.resize(
+            (self.view_width, self.view_height),
+            (cell, self.line_height),
+        );
         self.rebuild_buffer(font_system);
     }
 
@@ -221,7 +255,7 @@ impl Shell {
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.is_some()
+        self.terminal.running()
     }
 
     fn set_cwd(&mut self, cwd: PathBuf) {
@@ -335,44 +369,22 @@ impl Shell {
         self.refresh_prompt(font_system);
     }
 
+    /// Everything on the grid, scrollback included.
     pub fn select_all(&mut self, font_system: &mut FontSystem) {
-        self.input_selection = Some((0, self.input.chars().count()));
-        self.input_cursor = self.input.chars().count();
+        self.input_selection = None;
         self.refresh_prompt(font_system);
+        let rows = self.terminal.rows() as i32;
+        let last_column = self.terminal.columns().saturating_sub(1);
+        let top = Line(self.terminal.top_line() - self.terminal.history());
+        self.terminal.select(
+            Point::new(top, Column(0)),
+            Point::new(Line(rows - 1), Column(last_column)),
+        );
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        if let Some((first, second)) = self.view_selection {
-            let (start, end) = if (first.line, first.ch) <= (second.line, second.ch) {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            if start == end {
-                return None;
-            }
-            let last = self.buffer.lines.len().saturating_sub(1);
-            let mut out = String::new();
-            for line in start.line..=end.line.min(last) {
-                let chars: Vec<char> = self
-                    .buffer
-                    .lines
-                    .get(line)
-                    .map(|value| value.text().chars().collect())
-                    .unwrap_or_default();
-                let from = if line == start.line { start.ch } else { 0 }.min(chars.len());
-                let to = if line == end.line {
-                    end.ch
-                } else {
-                    chars.len()
-                }
-                .max(from);
-                out.extend(chars[from..to.min(chars.len())].iter());
-                if line != end.line {
-                    out.push('\n');
-                }
-            }
-            return Some(out);
+        if let Some(text) = self.terminal.selected_text() {
+            return Some(text);
         }
         let (start, end) = self.input_selection?;
         let (start, end) = if start <= end {
@@ -386,52 +398,66 @@ impl Shell {
         Some(chars[start..end].iter().collect())
     }
 
-    pub fn position_at(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<TextPos> {
-        self.buffer.shape_until_scroll(font_system, true);
-        let cursor = self.buffer.hit(x, y)?;
-        let line = cursor.line.min(self.buffer.lines.len().saturating_sub(1));
-        let text = self
-            .buffer
-            .lines
-            .get(line)
-            .map(|value| value.text())
-            .unwrap_or("");
-        Some(TextPos {
-            line,
-            ch: byte_to_char(text, cursor.index),
+    /// The grid cell under a point of the shell's panel. Rows above the
+    /// viewport are scrollback, so the line can be negative.
+    pub fn position_at(&self, x: f32, y: f32) -> Option<GridPos> {
+        let (cell, height) = self.terminal.cell();
+        let row = (y / height.max(f32::EPSILON)).floor() as i32;
+        if row < 0 || row >= self.terminal.rows() as i32 {
+            return None;
+        }
+        let column = (x / cell.max(f32::EPSILON)).floor() as usize;
+        Some(GridPos {
+            line: self.terminal.top_line() + row,
+            column: column.min(self.terminal.columns().saturating_sub(1)),
         })
     }
 
-    pub fn mouse_press(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<TextPos> {
-        let position = self.position_at(font_system, x, y)?;
-        self.view_selection = Some((position, position));
-        if position.line == self.buffer.lines.len().saturating_sub(1) {
-            self.input_cursor = position
-                .ch
-                .saturating_sub(self.input_line_chars())
-                .min(self.input.chars().count());
+    /// Which character of the input line a point sits on, if it sits on it.
+    fn input_position(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<usize> {
+        if self.owns_screen() {
+            return None;
+        }
+        self.buffer.shape_until_scroll(font_system, true);
+        let row = self.input_row;
+        let cursor = self.buffer.hit(x, y)?;
+        if cursor.line != row {
+            return None;
+        }
+        let text = self.buffer.lines.get(row)?.text();
+        Some(byte_to_char(text, cursor.index).saturating_sub(self.input_line_chars()))
+    }
+
+    pub fn mouse_press(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<GridPos> {
+        let position = self.position_at(x, y)?;
+        if self.terminal.mouse_reporting() {
+            self.terminal.send_mouse(position.report(false, false));
+            return None;
+        }
+        if let Some(ch) = self.input_position(font_system, x, y) {
+            self.input_cursor = ch.min(self.input.chars().count());
             self.input_selection = None;
             self.refresh_prompt(font_system);
         }
+        self.terminal.select(position.point(), position.point());
         Some(position)
     }
 
-    pub fn mouse_drag(&mut self, anchor: TextPos, cursor: TextPos) {
-        self.view_selection = Some((anchor, cursor));
-        let last = self.buffer.lines.len().saturating_sub(1);
-        if anchor.line != last || cursor.line != last {
-            self.input_selection = None;
+    pub fn mouse_drag(&mut self, anchor: GridPos, cursor: GridPos) {
+        if self.terminal.mouse_reporting() {
+            self.terminal.send_mouse(cursor.report(true, true));
             return;
         }
-        let len = self.input.chars().count();
-        let anchor = anchor.ch.saturating_sub(self.input_line_chars()).min(len);
-        let cursor = cursor.ch.saturating_sub(self.input_line_chars()).min(len);
-        self.input_cursor = cursor;
-        self.input_selection = if anchor == cursor {
-            None
-        } else {
-            Some((anchor, cursor))
-        };
+        self.input_selection = None;
+        self.terminal.select(anchor.point(), cursor.point());
+    }
+
+    /// Letting go of the mouse is a report like any other: a child that asked
+    /// for the mouse wants to hear the button come up.
+    pub fn mouse_release(&mut self, x: f32, y: f32) {
+        if let Some(position) = self.position_at(x, y) {
+            self.terminal.send_mouse(position.report(false, false));
+        }
     }
 
     pub fn cut_selection(&mut self, font_system: &mut FontSystem) -> Option<String> {
@@ -496,18 +522,12 @@ impl Shell {
 
     pub fn submit(&mut self, font_system: &mut FontSystem) -> Option<ShellEffect> {
         self.input_selection = None;
-        self.view_selection = None;
-        self.follow = true;
+        self.terminal.clear_selection();
+        self.terminal.scroll_to_bottom();
         let command = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.history_index = None;
         self.history_draft.clear();
-
-        if self.running.is_some() {
-            self.send_input(&command);
-            self.rebuild_buffer(font_system);
-            return None;
-        }
 
         let prompt = self.prompt.clone();
         self.push_echo(prompt, &command);
@@ -534,93 +554,54 @@ impl Shell {
         effect
     }
 
+    /// Take what the child wrote. While it runs the tab *is* its screen; once
+    /// it is gone that screen becomes history, the way a terminal window's
+    /// scrollback does.
     pub fn poll(&mut self, font_system: &mut FontSystem) -> bool {
-        let mut pending = Vec::new();
-        let mut finished = None;
-        if let Some(job) = &mut self.running {
-            while let Ok(message) = job.rx.try_recv() {
-                pending.push(message);
-            }
-            match job.child.try_wait() {
-                Ok(Some(status)) => finished = Some(Some(status)),
-                Ok(None) => {}
-                Err(_) => finished = Some(None),
-            }
-        }
-        let changed = !pending.is_empty() || finished.is_some();
-        if !pending.is_empty() {
-            self.child_spoke = true;
-        }
-        for (is_error, text) in pending {
-            self.push_line(
-                text,
-                if is_error {
-                    LineKind::Error
-                } else {
-                    LineKind::Output
-                },
-            );
-        }
-        if finished.is_some() {
-            let mut remaining = Vec::new();
-            if let Some(job) = &mut self.running {
-                while let Ok((is_error, text)) = job.rx.try_recv() {
-                    remaining.push((is_error, text));
-                }
-            }
-            for (is_error, text) in remaining {
-                self.push_line(
-                    text,
-                    if is_error {
-                        LineKind::Error
-                    } else {
-                        LineKind::Output
-                    },
-                );
-            }
-            self.running = None;
-            self.child_spoke = false;
-            self.refresh_branch();
-            if let Some(Some(status)) = finished {
-                if !status.success() {
-                    let code = status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    self.push_line(format!("[exit {code}]"), LineKind::Error);
-                }
-            }
-        }
-        if changed {
-            self.rebuild_buffer(font_system);
-        }
-        changed
-    }
-
-    pub fn interrupt(&mut self, font_system: &mut FontSystem) -> bool {
-        let Some(job) = &mut self.running else {
+        if !self.terminal.running() {
             return false;
-        };
-        let killed = kill_tree(job.child.id());
-        if !killed {
-            let _ = job.child.kill();
         }
-        let _ = job.child.try_wait();
-        self.running = None;
-        self.child_spoke = false;
-        self.push_line("^C".to_string(), LineKind::Error);
+        let changed = self.terminal.poll();
+        let finished = self.terminal.take_exit();
+        if self.terminal.running() {
+            if changed {
+                self.rebuild_buffer(font_system);
+            }
+            return changed;
+        }
+        // The child's screen is already part of the grid; all that is left is
+        // to take back a row of our own below it.
+        self.terminal.feed(b"\r\n");
+        self.refresh_branch();
+        if let Some(Some(status)) = finished {
+            if !status.success() {
+                let code = status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                self.push_line(format!("[exit {code}]"), LineKind::Error);
+            }
+        }
+        self.emit_input();
         self.rebuild_buffer(font_system);
         true
     }
 
-    pub fn kill_job(&mut self) {
-        if let Some(job) = &mut self.running {
-            kill_tree(job.child.id());
-            let _ = job.child.kill();
-            let _ = job.child.try_wait();
-            self.running = None;
-            self.child_spoke = false;
+    /// Ctrl+C belongs to the console, not to kite: the byte goes into the pty
+    /// and the child's own line discipline answers for it.
+    pub fn interrupt(&mut self) -> bool {
+        if !self.terminal.running() {
+            return false;
         }
+        self.terminal.send(&[0x03]);
+        true
+    }
+
+    pub fn kill_job(&mut self) {
+        if let Some(pid) = self.terminal.pid() {
+            kill_tree(pid);
+        }
+        self.terminal.kill();
     }
 
     pub fn print_error(&mut self, font_system: &mut FontSystem, message: String) {
@@ -628,31 +609,43 @@ impl Shell {
         self.rebuild_buffer(font_system);
     }
 
-    pub fn scroll_by(&mut self, font_system: &mut FontSystem, delta: f32) {
+    /// One wheel notch. `x`/`y` are where the notch happened, because a child
+    /// that asked for the mouse wants to hear about it rather than be scrolled.
+    pub fn scroll_by(&mut self, font_system: &mut FontSystem, x: f32, y: f32, delta: f32) {
         if delta.abs() < f32::EPSILON {
             return;
         }
-        let scroll = self.buffer.scroll();
-        self.buffer.set_scroll(Scroll {
-            line: scroll.line,
-            vertical: scroll.vertical + delta,
-            horizontal: 0.0,
-        });
-        self.buffer.shape_until_scroll(font_system, true);
-        self.follow = self.at_bottom();
-    }
-
-    fn at_bottom(&self) -> bool {
-        let last = self.buffer.lines.len().saturating_sub(1);
-        let mut lowest = None;
-        for run in self.buffer.layout_runs() {
-            lowest = Some(run.line_i);
+        let lines = (delta / self.line_height).round() as i32;
+        if self.terminal.mouse_reporting() {
+            if let Some(position) = self.position_at(x, y) {
+                let button = if lines > 0 { 65 } else { 64 };
+                for press in [true, false] {
+                    self.terminal.send_mouse(MouseReport {
+                        button,
+                        press,
+                        drag: false,
+                        line: position.line,
+                        column: position.column,
+                    });
+                }
+            }
+            return;
         }
-        lowest.is_none_or(|line| line >= last)
+        self.terminal.scroll_by(lines);
+        self.rebuild_buffer(font_system);
     }
 
     pub fn cursor_rect(&self) -> Option<(f32, f32, f32)> {
-        let line = self.buffer.lines.len().checked_sub(1)?;
+        if self.owns_screen() {
+            let (column, line) = self.terminal.cursor()?;
+            let row = line - self.terminal.top_line();
+            if row < 0 || row >= self.terminal.rows() as i32 {
+                return None;
+            }
+            let (cell, height) = self.terminal.cell();
+            return Some((column as f32 * cell, row as f32 * height, height));
+        }
+        let line = self.input_row;
         let byte = self.input_line_bytes() + char_to_byte(&self.input, self.input_cursor);
         let cursor = Cursor::new(line, byte);
         for run in self.buffer.layout_runs() {
@@ -666,33 +659,36 @@ impl Shell {
         None
     }
 
+    /// Highlighted rectangles, in panel coordinates. The grid is a fixed cell
+    /// matrix, so a selection needs no text layout to be drawn.
     pub fn selection_spans(&self) -> Vec<(f32, f32, f32, f32)> {
-        if let Some((first, second)) = self.view_selection {
-            let (start, end) = if (first.line, first.ch) <= (second.line, second.ch) {
-                (first, second)
-            } else {
-                (second, first)
-            };
+        let (cell, height) = self.terminal.cell();
+        if let Some((start, end)) = self.terminal.selection() {
             if start == end {
                 return Vec::new();
             }
-            let last = self.buffer.lines.len().saturating_sub(1);
-            let end = TextPos {
-                line: end.line.min(last),
-                ch: end.ch,
-            };
-            let start_cursor = self.text_cursor(start);
-            let end_cursor = self.text_cursor(end);
+            let top = self.terminal.top_line();
+            let bottom = top + self.terminal.rows() as i32 - 1;
+            let last_column = self.terminal.columns();
             let mut spans = Vec::new();
-            for run in self.buffer.layout_runs() {
-                if run.line_i < start.line || run.line_i > end.line {
-                    continue;
-                }
-                for (x, width) in run.highlight(start_cursor, end_cursor) {
-                    spans.push((x, run.line_top, width, run.line_height));
-                }
-                if run.glyphs.is_empty() && run.line_i > start.line && run.line_i < end.line {
-                    spans.push((0.0, run.line_top, self.font_size * 0.5, run.line_height));
+            for row in start.line.0.max(top)..=end.line.0.min(bottom) {
+                let from = if row == start.line.0 {
+                    start.column.0
+                } else {
+                    0
+                };
+                let to = if row == end.line.0 {
+                    end.column.0 + 1
+                } else {
+                    last_column
+                };
+                if to > from {
+                    spans.push((
+                        from as f32 * cell,
+                        (row - top) as f32 * height,
+                        (to - from) as f32 * cell,
+                        height,
+                    ));
                 }
             }
             return spans;
@@ -701,7 +697,7 @@ impl Shell {
         let Some((start, end)) = self.input_selection else {
             return Vec::new();
         };
-        let line = self.buffer.lines.len().saturating_sub(1);
+        let line = self.input_row;
         let (start, end) = if start <= end {
             (start, end)
         } else {
@@ -723,122 +719,78 @@ impl Shell {
         spans
     }
 
-    fn text_cursor(&self, pos: TextPos) -> Cursor {
-        let text = self
-            .buffer
-            .lines
-            .get(pos.line)
-            .map(|value| value.text())
-            .unwrap_or("");
-        Cursor::new(pos.line, char_to_byte(text, pos.ch))
-    }
-
+    /// Where the caret is on the screen, in rows and columns.
     pub fn cursor_line_column(&self) -> (usize, usize) {
-        (
-            self.lines.len() + 1,
-            self.input_line_chars() + self.input_cursor + 1,
-        )
+        let (column, row) = self.terminal.cursor_point();
+        (row + 1, column + 1)
     }
 
     fn refresh_prompt(&mut self, font_system: &mut FontSystem) {
-        self.follow = true;
-        self.view_selection = None;
-        self.rebuild_last_line(font_system);
-        self.buffer
-            .shape_until_cursor(font_system, self.prompt_cursor(), true);
-    }
-
-    fn prompt_cursor(&self) -> Cursor {
-        let line = self.buffer.lines.len().saturating_sub(1);
-        Cursor::new(
-            line,
-            self.input_line_bytes() + char_to_byte(&self.input, self.input_cursor),
-        )
-    }
-
-    fn rebuild_last_line(&mut self, font_system: &mut FontSystem) {
-        let (text, list) = self.prompt_line();
-        let Some(line) = self.buffer.lines.last_mut() else {
-            self.rebuild_buffer(font_system);
+        if self.owns_screen() {
             return;
-        };
-        line.set_text(text, glyphon::cosmic_text::LineEnding::Lf, list);
-        force_relayout(&mut self.buffer);
+        }
+        self.terminal.scroll_to_bottom();
+        self.terminal.clear_selection();
+        self.emit_input();
+        self.rebuild_buffer(font_system);
     }
 
+    /// The grid is the only surface: kite writes its prompt into it and the
+    /// child writes its screen into it, so one rebuild covers both. Whatever
+    /// the view is looking at, live or scrollback, comes from the grid.
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
-        let previous = self.buffer.scroll();
-        let metrics = Metrics::new(self.font_size, self.line_height);
-        let mut buffer = Buffer::new_empty(metrics);
-        buffer.set_wrap(Wrap::WordOrGlyph);
+        let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
+        buffer.set_wrap(Wrap::None);
         buffer.set_tab_width(4);
         buffer.set_size(Some(self.view_width), Some(self.view_height));
-
-        for line in &self.lines {
-            let list = match &line.prompt {
-                Some(prompt) => {
-                    let base = attrs(
-                        self.family,
-                        theme::prompt().map_or(theme::text(), |input| input.input),
-                    );
-                    let mut list = AttrsList::new(&base);
-                    prompt.paint(&mut list, self.family);
-                    add_syntax_spans(
-                        &mut list,
-                        self.family,
-                        &line.text[prompt.len()..],
-                        prompt.len(),
-                    );
-                    list
-                }
-                None => {
-                    let color = match line.kind {
-                        LineKind::Error => theme::red(),
-                        LineKind::Echo => theme::text_dim(),
-                        LineKind::Output => theme::text(),
-                    };
-                    let base = attrs(self.family, color);
-                    let mut list = AttrsList::new(&base);
-                    for (range, span_color) in &line.spans {
-                        list.add_span(range.clone(), &attrs(self.family, *span_color));
-                    }
-                    list
-                }
-            };
+        let base = attrs(self.family, theme::text());
+        let top = self.terminal.top_line();
+        for row in 0..self.terminal.rows() as i32 {
+            let mut text = String::new();
+            let mut list = AttrsList::new(&base);
+            for Run {
+                text: run,
+                color,
+                bold,
+            } in self.terminal.runs(top + row)
+            {
+                let start = char_to_byte(&text, text.chars().count());
+                text.push_str(&run);
+                let end = char_to_byte(&text, text.chars().count());
+                let attrs = match color {
+                    Some(color) => attrs(self.family, color),
+                    None => attrs(self.family, theme::text()),
+                };
+                let styled;
+                list.add_span(
+                    start..end,
+                    if bold {
+                        styled = attrs.weight(Weight::BOLD);
+                        &styled
+                    } else {
+                        &attrs
+                    },
+                );
+            }
             buffer.lines.push(BufferLine::new(
-                line.text.clone(),
+                text,
                 glyphon::cosmic_text::LineEnding::Lf,
                 list,
                 Shaping::Advanced,
             ));
         }
-
-        let (prompt, list) = self.prompt_line();
-        buffer.lines.push(BufferLine::new(
-            prompt,
-            glyphon::cosmic_text::LineEnding::Lf,
-            list,
-            Shaping::Advanced,
-        ));
-
         self.buffer = buffer;
-        if self.follow {
-            self.buffer
-                .shape_until_cursor(font_system, self.prompt_cursor(), true);
-        } else {
-            self.buffer.set_scroll(previous);
-            self.buffer.shape_until_scroll(font_system, true);
-        }
+        self.buffer.shape_until_scroll(font_system, true);
     }
 
-    /// A child that owns the session prints its own prompt, so kite adds
-    /// nothing in front of the line and highlights none of what is typed.
-    fn owns_session(&self) -> bool {
-        self.running.is_some() && self.child_spoke
+    /// While a child holds the pseudo console the viewport is its screen: kite
+    /// draws no prompt line and edits no input line underneath it.
+    fn owns_screen(&self) -> bool {
+        self.terminal.running()
     }
 
     fn input_line_bytes(&self) -> usize {
-        if self.owns_session() {
+        if self.owns_screen() {
             0
         } else {
             self.prompt.len()
@@ -846,7 +798,7 @@ impl Shell {
     }
 
     fn input_line_chars(&self) -> usize {
-        if self.owns_session() {
+        if self.owns_screen() {
             0
         } else {
             self.prompt.chars()
@@ -855,7 +807,7 @@ impl Shell {
 
     fn prompt_line(&self) -> (String, AttrsList) {
         let prompt_bytes = self.input_line_bytes();
-        let text = if self.owns_session() {
+        let text = if self.owns_screen() {
             self.input.clone()
         } else {
             format!("{}{}", self.prompt.text, self.input)
@@ -865,42 +817,80 @@ impl Shell {
             theme::prompt().map_or(theme::text(), |prompt| prompt.input),
         );
         let mut list = AttrsList::new(&base);
-        if !self.owns_session() {
+        if !self.owns_screen() {
             self.prompt.paint(&mut list, self.family);
             add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes);
         }
         (text, list)
     }
 
+    /// One row of output, with the input line put back underneath it. The grid
+    /// holds the colours, so there is no second copy of the history to keep in
+    /// step.
     fn push_line(&mut self, text: String, kind: LineKind) {
-        self.lines.push(ShellLine {
-            text,
-            kind,
-            prompt: None,
-            spans: Vec::new(),
-        });
-        self.trim_lines();
+        let color = match kind {
+            LineKind::Error => theme::red(),
+            LineKind::Echo => theme::text_dim(),
+            LineKind::Output => theme::text(),
+        };
+        self.erase_input();
+        let cells: Vec<Cell> = text.chars().map(|ch| (ch, color, false)).collect();
+        self.write_cells(&cells, true);
+        self.emit_input();
     }
 
-    fn push_echo(&mut self, prompt: Prompt, command: &str) {
-        let mut text = String::with_capacity(prompt.text.len() + command.len());
-        text.push_str(&prompt.text);
-        text.push_str(command);
-        self.lines.push(ShellLine {
-            text,
-            kind: LineKind::Echo,
-            prompt: Some(prompt),
-            spans: Vec::new(),
-        });
-        self.trim_lines();
+    /// Enter closes the input row. What the user typed is already on screen,
+    /// prompt and syntax colours and all, so the echo needs no second copy.
+    fn push_echo(&mut self, _prompt: Prompt, _command: &str) {
+        self.terminal.feed(b"\x1b[999C\r\n");
     }
 
-    fn trim_lines(&mut self) {
-        if self.lines.len() > SCROLLBACK_LIMIT {
-            let overflow = self.lines.len() - SCROLLBACK_LIMIT;
-            self.lines.drain(0..overflow);
-            self.view_selection = None;
+    /// Take the input line off the screen. Only its own row: whatever sits
+    /// below belongs to the session, and a full screen program can hand the
+    /// cursor back with the session still underneath it.
+    fn erase_input(&mut self) {
+        self.terminal.feed(b"\r\x1b[K");
+    }
+
+    /// The prompt and what has been typed, on the current row, with the caret
+    /// left where the line editor says it is. A command longer than the row
+    /// scrolls to the left instead of wrapping, so the row stays one row.
+    fn emit_input(&mut self) {
+        let (text, list) = self.prompt_line();
+        let mut cells = cells_of(&text, &list);
+        let columns = self.terminal.columns().max(2);
+        let caret = (self.input_line_chars() + self.input_cursor).min(cells.len());
+        let hidden = caret.saturating_sub(columns - 2);
+        let shown: Vec<Cell> = cells.drain(hidden..).take(columns - 1).collect();
+        let tail = shown.len().saturating_sub(caret - hidden);
+        self.terminal.feed(b"\r\x1b[K");
+        self.write_cells(&shown, false);
+        if tail > 0 {
+            self.terminal.feed(format!("\x1b[{tail}D").as_bytes());
         }
+        self.input_row = (self.terminal.cursor_line() - self.terminal.top_line()).max(0) as usize;
+    }
+
+    /// Cells out as SGR runs. `newline` ends the row, which is what makes the
+    /// grid scroll once the viewport is full.
+    fn write_cells(&mut self, cells: &[Cell], newline: bool) {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut index = 0;
+        while index < cells.len() {
+            let (_, color, bold) = cells[index];
+            let mut run = String::new();
+            while index < cells.len() && cells[index].1 == color && cells[index].2 == bold {
+                run.push(cells[index].0);
+                index += 1;
+            }
+            bytes.extend(sgr(color, bold));
+            bytes.extend(run.as_bytes());
+        }
+        bytes.extend(b"\x1b[0m");
+        if newline {
+            bytes.extend(b"\r\n");
+        }
+        self.terminal.feed(&bytes);
     }
 
     fn run_builtin(&mut self, args: &[String], effect: &mut Option<ShellEffect>) -> bool {
@@ -912,12 +902,13 @@ impl Shell {
                     "kite built-ins:",
                     "  cd [dir]        change directory",
                     "  pwd             print working directory",
-                    "  ls [dir]        list a directory",
-                    "  cp <src> <dst>  copy a file",
-                    "  mv <src> <dst>  move or rename",
+                    "  ls [dir]        list a directory      (dir)",
+                    "  cp <src> <dst>  copy a file           (copy)",
+                    "  mv <src> <dst>  move or rename        (move, ren)",
                     "  rm <path...>    move to the Recycle Bin",
-                    "  mkdir <dir>     create directories",
-                    "  touch <file>    create an empty file",
+                    "                    (del, erase, rd, rmdir)",
+                    "  mkdir <dir>     create directories    (md)",
+                    "  touch <file>    create an empty file  (ni)",
                     "  echo <text>     print text",
                     "  kkk <file>      open a file in a new tab",
                     "  theme <name>    switch theme (index, neo)",
@@ -931,7 +922,14 @@ impl Shell {
                 true
             }
             "clear" | "cls" => {
-                self.lines.clear();
+                // The same two sequences a shell's Clear-Host sends: wipe the
+                // view, then the scrollback it scrolled into.
+                self.terminal.feed(b"\x1b[2J\x1b[3J\x1b[H");
+                self.emit_input();
+                true
+            }
+            "miku" => {
+                *effect = Some(ShellEffect::Miku);
                 true
             }
             "restart" => {
@@ -972,7 +970,7 @@ impl Shell {
                 }
                 true
             }
-            "ls" => {
+            "ls" | "dir" => {
                 let target = rest
                     .first()
                     .map_or_else(|| self.cwd.clone(), |arg| resolve_path(&self.cwd, arg));
@@ -985,13 +983,13 @@ impl Shell {
                             self.push_line(entry, LineKind::Output);
                         }
                     }
-                    Err(error) => self.push_line(format!("ls: {error}"), LineKind::Error),
+                    Err(error) => self.push_line(format!("{name}: {error}"), LineKind::Error),
                 }
                 true
             }
-            "cp" => {
+            "cp" | "copy" => {
                 if rest.len() != 2 {
-                    self.push_line("cp: expected <src> <dst>".to_string(), LineKind::Error);
+                    self.push_line(format!("{name}: expected <src> <dst>"), LineKind::Error);
                     return true;
                 }
                 let src = resolve_path(&self.cwd, &rest[0]);
@@ -1003,13 +1001,13 @@ impl Shell {
                 };
                 match fs::copy(&src, &dst) {
                     Ok(_) => {}
-                    Err(error) => self.push_line(format!("cp: {error}"), LineKind::Error),
+                    Err(error) => self.push_line(format!("{name}: {error}"), LineKind::Error),
                 }
                 true
             }
-            "mv" => {
+            "mv" | "move" | "ren" => {
                 if rest.len() != 2 {
-                    self.push_line("mv: expected <src> <dst>".to_string(), LineKind::Error);
+                    self.push_line(format!("{name}: expected <src> <dst>"), LineKind::Error);
                     return true;
                 }
                 let src = resolve_path(&self.cwd, &rest[0]);
@@ -1021,14 +1019,14 @@ impl Shell {
                 };
                 match fs::rename(&src, &dst) {
                     Ok(()) => {}
-                    Err(error) => self.push_line(format!("mv: {error}"), LineKind::Error),
+                    Err(error) => self.push_line(format!("{name}: {error}"), LineKind::Error),
                 }
                 true
             }
-            "rm" => {
+            "rm" | "del" | "erase" | "rd" | "rmdir" => {
                 if rest.is_empty() {
                     self.push_line(
-                        "rm: expected at least one path".to_string(),
+                        format!("{name}: expected at least one path"),
                         LineKind::Error,
                     );
                     return true;
@@ -1037,30 +1035,35 @@ impl Shell {
                     let path = resolve_path(&self.cwd, arg);
                     match trash::delete(&path) {
                         Ok(()) => {}
-                        Err(error) => self
-                            .push_line(format!("rm: {}: {error}", path.display()), LineKind::Error),
+                        Err(error) => self.push_line(
+                            format!("{name}: {}: {error}", path.display()),
+                            LineKind::Error,
+                        ),
                     }
                 }
                 true
             }
-            "mkdir" => {
+            "mkdir" | "md" => {
                 if rest.is_empty() {
-                    self.push_line("mkdir: expected a directory".to_string(), LineKind::Error);
+                    self.push_line(format!("{name}: expected a directory"), LineKind::Error);
                 }
                 for arg in rest {
                     let path = resolve_path(&self.cwd, arg);
                     if let Err(error) = fs::create_dir_all(&path) {
-                        self.push_line(format!("mkdir: {error}"), LineKind::Error);
+                        self.push_line(format!("{name}: {error}"), LineKind::Error);
                     }
                 }
                 true
             }
-            "touch" => {
+            "touch" | "ni" => {
+                if rest.is_empty() {
+                    self.push_line(format!("{name}: expected a file"), LineKind::Error);
+                }
                 for arg in rest {
                     let path = resolve_path(&self.cwd, arg);
                     if let Err(error) = fs::OpenOptions::new().create(true).append(true).open(&path)
                     {
-                        self.push_line(format!("touch: {error}"), LineKind::Error);
+                        self.push_line(format!("{name}: {error}"), LineKind::Error);
                     }
                 }
                 true
@@ -1089,206 +1092,97 @@ impl Shell {
         }
     }
 
+    /// Hand the command a pseudo console: it gets a screen, a cursor of its
+    /// own, and the line discipline that echoes what it asks for.
     fn spawn_external(&mut self, args: &[String]) {
-        let mut command = Command::new(&args[0]);
-        command
-            .args(&args[1..])
-            .current_dir(&self.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(NO_WINDOW);
-        }
-        match command.spawn() {
-            Ok(mut child) => {
-                let (tx, rx) = mpsc::channel();
-                if let Some(stdout) = child.stdout.take() {
-                    spawn_reader(stdout, false, tx.clone());
-                }
-                if let Some(stderr) = child.stderr.take() {
-                    spawn_reader(stderr, true, tx);
-                }
-                let stdin = child.stdin.take().map(spawn_writer);
-                self.child_spoke = false;
-                self.running = Some(Job { child, rx, stdin });
-            }
-            Err(error) => {
-                self.push_line(format!("{}: {error}", args[0]), LineKind::Error);
-            }
+        let program = command_path(&self.cwd, &args[0]);
+        if let Err(error) = self.terminal.start(&program, &args[1..], &self.cwd) {
+            self.push_line(format!("{}: {error}", args[0]), LineKind::Error);
         }
     }
 
-    /// Enter while a job runs feeds its stdin instead of starting a command.
-    fn send_input(&mut self, line: &str) {
-        let mut bytes = encode_console(line);
-        bytes.push(b'\n');
-        self.push_line(line.to_string(), LineKind::Output);
-        if let Some(stdin) = self.running.as_ref().and_then(|job| job.stdin.as_ref()) {
-            let _ = stdin.send(bytes);
+    /// Keys while the child holds the screen. None of them reach kite's line
+    /// editor: the child echoes itself, as it does in every other terminal.
+    pub fn feed_key(&mut self, key: TerminalKey) {
+        let bytes = match key {
+            TerminalKey::Text(text) => text.into_bytes(),
+            TerminalKey::Enter => b"\r".to_vec(),
+            TerminalKey::Backspace => vec![0x7f],
+            TerminalKey::Delete => b"\x1b[3~".to_vec(),
+            TerminalKey::Tab => b"\t".to_vec(),
+            TerminalKey::Escape => vec![0x1b],
+            TerminalKey::Up => b"\x1b[A".to_vec(),
+            TerminalKey::Down => b"\x1b[B".to_vec(),
+            TerminalKey::Right => b"\x1b[C".to_vec(),
+            TerminalKey::Left => b"\x1b[D".to_vec(),
+            TerminalKey::Home => b"\x1b[H".to_vec(),
+            TerminalKey::End => b"\x1b[F".to_vec(),
+            TerminalKey::PageUp => b"\x1b[5~".to_vec(),
+            TerminalKey::PageDown => b"\x1b[6~".to_vec(),
+            TerminalKey::Function(number) => function_key(number),
+        };
+        self.terminal.send(&bytes);
+    }
+}
+
+/// F1-F4 are SS3, F5-F12 are the CSI codes the xterm table assigns them.
+fn function_key(number: u8) -> Vec<u8> {
+    const CSI: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+    match number {
+        1..=4 => vec![0x1b, b'O', b'P' + number - 1],
+        5..=12 => format!("\x1b[{}~", CSI[(number - 5) as usize]).into_bytes(),
+        _ => Vec::new(),
+    }
+}
+
+/// A cell's colour as SGR. Truecolour keeps the exact values from `theme.toml`
+/// instead of rounding them to the sixteen ANSI slots.
+fn sgr(color: Color, bold: bool) -> Vec<u8> {
+    let (r, g, b, _) = color.as_rgba_tuple();
+    if bold {
+        format!("\x1b[1;38;2;{r};{g};{b}m").into_bytes()
+    } else {
+        format!("\x1b[38;2;{r};{g};{b}m").into_bytes()
+    }
+}
+
+/// Flatten a styled line into one entry per character, so the row can be
+/// clipped to the grid without splitting a span's bookkeeping.
+fn cells_of(text: &str, list: &AttrsList) -> Vec<Cell> {
+    text.char_indices()
+        .map(|(byte, ch)| {
+            let attrs = list.get_span(byte);
+            let color = attrs.color_opt.unwrap_or_else(theme::text);
+            (ch, color, attrs.weight == Weight::BOLD)
+        })
+        .collect()
+}
+
+/// The same, from plain byte-range colour spans.
+fn colored(text: &str, spans: &[(std::ops::Range<usize>, Color)]) -> Vec<Cell> {
+    let mut cells: Vec<Cell> = text.chars().map(|ch| (ch, theme::text(), false)).collect();
+    for (range, color) in spans {
+        let start = byte_to_char(text, range.start);
+        let end = byte_to_char(text, range.end.min(text.len()));
+        for cell in &mut cells[start..end] {
+            cell.1 = *color;
         }
     }
+    cells
 }
 
-fn decode_output(bytes: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
-    }
-    #[cfg(windows)]
-    if let Some(text) = decode_oem(bytes) {
-        return text;
-    }
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-#[cfg(windows)]
-fn decode_oem(bytes: &[u8]) -> Option<String> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetOEMCP() -> u32;
-        fn MultiByteToWideChar(
-            code_page: u32,
-            flags: u32,
-            input: *const u8,
-            input_len: i32,
-            output: *mut u16,
-            output_len: i32,
-        ) -> i32;
-    }
-    let input_len = i32::try_from(bytes.len()).ok()?;
-    let code_page = unsafe { GetOEMCP() };
-    let needed = unsafe {
-        MultiByteToWideChar(
-            code_page,
-            0,
-            bytes.as_ptr(),
-            input_len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if needed <= 0 {
-        return None;
-    }
-    let mut wide = vec![0u16; needed as usize];
-    let written = unsafe {
-        MultiByteToWideChar(
-            code_page,
-            0,
-            bytes.as_ptr(),
-            input_len,
-            wide.as_mut_ptr(),
-            needed,
-        )
-    };
-    if written <= 0 {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&wide[..written as usize]))
-}
-
-fn spawn_writer(mut writer: ChildStdin) -> Sender<Vec<u8>> {
-    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
-    std::thread::spawn(move || {
-        for bytes in rx {
-            if writer
-                .write_all(&bytes)
-                .and_then(|_| writer.flush())
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    tx
-}
-
-/// Bytes a console program expects on its pipe, mirroring `decode_oem`.
-#[cfg(windows)]
-fn encode_console(text: &str) -> Vec<u8> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetOEMCP() -> u32;
-        fn WideCharToMultiByte(
-            code_page: u32,
-            flags: u32,
-            wide: *const u16,
-            wide_len: i32,
-            multi: *mut u8,
-            multi_len: i32,
-            default_char: *const u8,
-            used_default: *mut bool,
-        ) -> i32;
-    }
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    let wide_len = i32::try_from(wide.len()).unwrap_or(i32::MAX);
-    let code_page = unsafe { GetOEMCP() };
-    let needed = unsafe {
-        WideCharToMultiByte(
-            code_page,
-            0,
-            wide.as_ptr(),
-            wide_len,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        )
-    };
-    if needed <= 0 {
-        return text.as_bytes().to_vec();
-    }
-    let mut bytes = vec![0u8; needed as usize];
-    let written = unsafe {
-        WideCharToMultiByte(
-            code_page,
-            0,
-            wide.as_ptr(),
-            wide_len,
-            bytes.as_mut_ptr(),
-            needed,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        )
-    };
-    if written <= 0 {
-        return text.as_bytes().to_vec();
-    }
-    bytes.truncate(written as usize);
-    bytes
-}
-
-#[cfg(not(windows))]
-fn encode_console(text: &str) -> Vec<u8> {
-    text.as_bytes().to_vec()
-}
-
-fn spawn_reader<R: Read + Send + 'static>(
-    reader: R,
-    is_error: bool,
-    tx: mpsc::Sender<(bool, String)>,
-) {
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut buffer = Vec::new();
-        loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let text = decode_output(&buffer)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_string();
-                    if tx.send((is_error, text)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+/// One terminal cell is one glyph of the body font, measured rather than
+/// guessed so the grid and the pixels agree at any size.
+fn cell_width(font_system: &mut FontSystem, family: &'static str, font_size: f32) -> f32 {
+    const SAMPLES: usize = 32;
+    let probe = make_label(
+        font_system,
+        &attrs(family, theme::text()),
+        font_size,
+        &"0".repeat(SAMPLES),
+    );
+    let (width, _) = measure(&probe);
+    (width / SAMPLES as f32).max(1.0)
 }
 
 fn list_directory(path: &Path) -> std::io::Result<Vec<String>> {
@@ -1311,6 +1205,18 @@ fn list_directory(path: &Path) -> std::io::Result<Vec<String>> {
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     Ok(entries.into_iter().map(|(_, _, name)| name).collect())
+}
+
+/// `CreateProcess` looks a relative program name up in the directory of the
+/// *calling* process, which is where kite was launched from, not this tab's
+/// `cwd`. So a token that spells a path is made absolute here first; a bare
+/// name is left alone and keeps the system PATH search.
+fn command_path(cwd: &Path, token: &str) -> PathBuf {
+    if token.contains('/') || token.contains('\\') {
+        resolve_path(cwd, token)
+    } else {
+        PathBuf::from(token)
+    }
 }
 
 pub fn resolve_path(cwd: &Path, value: &str) -> PathBuf {
@@ -1571,18 +1477,114 @@ mod tests {
         shell.rebuild_buffer(&mut fonts.system);
 
         let prompt = shell.buffer.lines.len() - 1;
+        // Grid endpoints name cells, so the last column is the last cell that
+        // belongs to the selection.
         shell.mouse_drag(
-            TextPos {
-                line: prompt - 2,
-                ch: 6,
+            GridPos {
+                line: prompt as i32 - 2,
+                column: 6,
             },
-            TextPos {
-                line: prompt - 1,
-                ch: 6,
+            GridPos {
+                line: prompt as i32 - 1,
+                column: 5,
             },
         );
         assert_eq!(shell.selected_text().as_deref(), Some("line\nsecond"));
         assert_eq!(shell.selection_spans().len(), 2);
+    }
+
+    #[test]
+    fn the_caret_follows_the_row_the_prompt_lives_on() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        assert!(
+            shell.input_row < shell.terminal.rows() - 1,
+            "the prompt sits under the banner, not at the bottom of the screen"
+        );
+        let caret = shell.cursor_rect().expect("a caret to draw");
+        assert_eq!(
+            (caret.1 / shell.line_height()).round() as usize,
+            shell.input_row,
+            "the caret belongs on the prompt row"
+        );
+
+        // A program that hands the cursor back somewhere else takes the prompt
+        // with it, because the prompt is written wherever the cursor stands.
+        shell.terminal.feed(b"\x1b[3;1H");
+        shell.refresh_prompt(&mut fonts.system);
+        assert_eq!(shell.input_row, 2);
+        let moved = shell.cursor_rect().expect("a caret to draw");
+        assert_eq!((moved.1 / shell.line_height()).round() as usize, 2);
+    }
+
+    #[test]
+    fn redrawing_the_input_line_leaves_the_rows_below_alone() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        // Two rows of session below the prompt, then the cursor back above
+        // them: that is what leaving the alternate screen hands back.
+        shell.terminal.feed(b"\r\nrow one\r\nrow two\r\n\x1b[4A");
+        shell.refresh_prompt(&mut fonts.system);
+        let shown = shell.terminal.screen_text();
+        assert!(
+            shown.contains("row one") && shown.contains("row two"),
+            "the session below the prompt survived its redraw:\n{shown}"
+        );
+        assert!(
+            shown.contains(shell.prompt.text.trim_end()),
+            "the prompt is there too:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_shows_history_and_takes_the_prompt_away() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        for row in 1..=40 {
+            shell.push_line(format!("row {row}"), LineKind::Output);
+        }
+        shell.rebuild_buffer(&mut fonts.system);
+        let rows = shell.terminal.rows();
+        assert_eq!(
+            shell.buffer.lines.len(),
+            rows,
+            "the view is always one screen"
+        );
+        let bottom = shell.buffer.lines[rows - 1].text().to_string();
+        assert!(
+            bottom.contains(&shell.prompt.text),
+            "the prompt sits at the bottom: {bottom}"
+        );
+
+        let shown = |shell: &Shell| {
+            shell
+                .buffer
+                .lines
+                .iter()
+                .map(|line| line.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let page = rows as f32 * shell.line_height();
+        shell.scroll_by(&mut fonts.system, 0.0, 0.0, -page);
+        assert!(shell.terminal.scrolled());
+        let back = shown(&shell);
+        assert!(back.contains("row 26"), "history came into view: {back}");
+        assert!(
+            !back.contains("row 40"),
+            "the newest line moved away: {back}"
+        );
+        assert!(
+            !back.contains(&shell.prompt.text),
+            "the prompt stayed behind: {back}"
+        );
+
+        shell.scroll_by(&mut fonts.system, 0.0, 0.0, page);
+        assert!(!shell.terminal.scrolled());
+        assert!(
+            shown(&shell).contains(&shell.prompt.text),
+            "the prompt came back with the bottom"
+        );
     }
 
     #[test]
@@ -1594,6 +1596,54 @@ mod tests {
         assert_eq!(spans[3], (14..27, TokenKind::String));
         assert_eq!(spans[4], (28..30, TokenKind::Number));
         assert_eq!(spans[5], (31..39, TokenKind::Argument));
+    }
+
+    #[test]
+    fn the_pwsh_aliases_reach_the_same_builtins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.set_cwd(fs::canonicalize(dir.path()).unwrap());
+        for command in ["ni y.c", "md sub", "dir"] {
+            shell.input = command.to_string();
+            shell.submit(&mut fonts.system);
+        }
+        assert!(dir.path().join("y.c").is_file(), "ni is touch");
+        assert!(dir.path().join("sub").is_dir(), "md is mkdir");
+        let listed = shell.terminal.screen_text();
+        assert!(listed.contains("y.c"), "dir is ls: {listed}");
+        assert!(listed.contains("sub/"), "dir lists folders: {listed}");
+        shell.input = "del y.c".to_string();
+        shell.submit(&mut fonts.system);
+        assert!(!dir.path().join("y.c").exists(), "del is rm");
+        let after = shell.terminal.screen_text();
+        assert!(
+            !after.contains("del:"),
+            "del must not report a missing builtin: {after}"
+        );
+    }
+
+    #[test]
+    fn a_path_named_command_resolves_against_the_shells_directory() {
+        let cwd = Path::new("X:\\c");
+        assert_eq!(
+            command_path(cwd, "003/main.exe"),
+            PathBuf::from("X:\\c\\003/main.exe")
+        );
+        assert_eq!(
+            command_path(cwd, r"..\004\main.exe"),
+            PathBuf::from(r"X:\c\..\004\main.exe")
+        );
+        assert_eq!(
+            command_path(cwd, "x:/c/003/main.exe"),
+            PathBuf::from("x:/c/003/main.exe"),
+            "an absolute token stays exactly as typed"
+        );
+        assert_eq!(
+            command_path(cwd, "main.exe"),
+            PathBuf::from("main.exe"),
+            "a bare name keeps the system PATH search"
+        );
     }
 
     #[test]
@@ -1701,8 +1751,9 @@ mod tests {
         shell.push_line("output".to_string(), LineKind::Output);
         shell.input = "cls".to_string();
         assert!(shell.submit(&mut fonts.system).is_none());
-        assert!(shell.lines.is_empty());
-        assert_eq!(shell.buffer.lines.len(), 1, "only the prompt is left");
+        let screen = shell.terminal.screen_text();
+        assert!(!screen.contains("output"), "cls wipes the screen: {screen}");
+        assert!(screen.contains('>'), "the prompt is still there: {screen}");
     }
 
     #[test]
@@ -1717,28 +1768,129 @@ mod tests {
     }
 
     #[test]
-    fn a_talking_child_takes_the_prompt_away() {
+    fn a_keystroke_reaches_the_waiting_child() {
         let mut fonts = Fonts::load();
         let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
-        let prompt_bytes = shell.prompt.len();
-        shell.input = "cmd /c \"echo spoken && pause\"".to_string();
+        // `findstr` with no files copies stdin to stdout, so the only way its
+        // text can reach the grid is through the child's keyboard. The command
+        // line itself never contains the word, so it cannot echo the match.
+        shell.insert_text(&mut fonts.system, "cmd /c findstr .");
         assert!(shell.submit(&mut fonts.system).is_none());
+
+        shell.feed_key(TerminalKey::Text("hello".to_string()));
+        shell.feed_key(TerminalKey::Enter);
+        let waited = std::time::Instant::now();
+        while !shell.terminal.screen_text().contains("hello") && waited.elapsed().as_secs() < 5 {
+            shell.poll(&mut fonts.system);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        shell.kill_job();
+        assert!(
+            shell.terminal.screen_text().contains("hello"),
+            "the keystroke never reached the child:\n{}",
+            shell.terminal.screen_text()
+        );
+    }
+
+    #[test]
+    fn a_running_child_owns_the_screen() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        assert_ne!(
+            shell.prompt.len(),
+            0,
+            "the prompt is what the child replaces"
+        );
+        // `pause` waits for a keystroke, which is what a real program does when
+        // it asks for input. The child's own line is the word on its own row, so
+        // it is not confused with the echoed command line above it.
+        shell.insert_text(&mut fonts.system, "cmd /c \"echo spoken && pause\"");
+        assert!(shell.submit(&mut fonts.system).is_none());
+
+        let child_row = |shell: &Shell| {
+            shell
+                .terminal
+                .screen_text()
+                .lines()
+                .position(|row| row.trim() == "spoken")
+        };
+        let mut spoken = false;
         for _ in 0..200 {
             shell.poll(&mut fonts.system);
-            if shell.child_spoke {
+            if child_row(&shell).is_some() {
+                spoken = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        assert!(shell.child_spoke, "the child never wrote to the pipe");
-        assert!(shell.owns_session());
-        shell.input = "still typing".to_string();
-        shell.refresh_prompt(&mut fonts.system);
-        let line = shell.buffer.lines.last().unwrap();
-        assert_eq!(line.text(), "still typing", "kite stays out of the way");
-        assert_eq!(shell.input_line_bytes(), 0);
-        assert_ne!(prompt_bytes, 0);
+        assert!(spoken, "the child's output never reached the grid");
+        assert!(shell.owns_screen());
+        assert_eq!(
+            shell.buffer.lines.len(),
+            shell.terminal.rows(),
+            "kite draws no prompt line under the child"
+        );
+
+        // `pause` waits for a key: the keyboard belongs to the child now.
+        shell.feed_key(TerminalKey::Text("x".to_string()));
+        for _ in 200..400 {
+            shell.poll(&mut fonts.system);
+            if !shell.owns_screen() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         shell.kill_job();
-        assert!(!shell.owns_session());
+        assert!(!shell.owns_screen(), "the child never finished");
+
+        let screen = shell.terminal.screen_text();
+        let rows: Vec<&str> = screen
+            .lines()
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        let said = rows
+            .iter()
+            .position(|row| row.trim() == "spoken")
+            .expect("the child's text stayed");
+        let prompt = rows
+            .iter()
+            .rposition(|row| row.contains('>'))
+            .expect("kite's prompt came back");
+        assert!(
+            prompt > said,
+            "the prompt must sit below the child's screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_child_writes_below_the_prompt_it_inherited() {
+        // One grid, one cursor: the child continues where the prompt left off,
+        // the way it does in a terminal, instead of replacing the screen.
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 600.0);
+        shell.insert_text(&mut fonts.system, "cmd /c echo spoken");
+        shell.submit(&mut fonts.system);
+        for _ in 0..200 {
+            shell.poll(&mut fonts.system);
+            if !shell.owns_screen() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let screen = shell.terminal.screen_text();
+        let rows: Vec<&str> = screen
+            .lines()
+            .map(|row| row.trim_end())
+            .filter(|row| !row.is_empty())
+            .collect();
+        let echo = rows
+            .iter()
+            .position(|row| row.contains("cmd /c echo spoken"))
+            .unwrap_or_else(|| panic!("the command vanished: {screen}"));
+        let said = rows
+            .iter()
+            .position(|row| row.trim() == "spoken")
+            .unwrap_or_else(|| panic!("the child wrote nothing below the prompt: {screen}"));
+        assert!(said > echo, "output must land below the prompt:\n{screen}");
     }
 }

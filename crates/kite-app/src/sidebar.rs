@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -10,9 +10,9 @@ use glyphon::cosmic_text::{
 use kite_core::display_path;
 
 use crate::editor::measure_cell;
-use crate::git;
 use crate::text::{attrs, buffer_line, force_relayout};
 use crate::theme;
+use crate::{archive, git};
 
 const FOLDER_ICON: char = '󰉋';
 const EMPTY_FOLDER_ICON: char = '';
@@ -34,6 +34,12 @@ const ICON_GREY: Color = Color::rgb(0xcd, 0xd6, 0xf4);
 pub enum Root {
     Drives,
     Dir(PathBuf),
+    /// A folder inside an archive file, listed as if it sat on disk. An empty
+    /// prefix is the archive's own top level.
+    Archive {
+        file: PathBuf,
+        prefix: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +50,9 @@ pub struct Row {
     pub is_drive: bool,
     /// Tracked by git but gone from the work tree: listed, never opened.
     pub missing: bool,
+    /// The archive holding this row, for the rows that live inside one. Their
+    /// `path` is a name in that listing, not something the disk can answer for.
+    pub archive: Option<PathBuf>,
     icon: Range<usize>,
     icon_color: Color,
     /// git's own letter for the state, in the leftmost column.
@@ -54,6 +63,8 @@ pub struct Row {
 pub enum SidebarAction {
     Open(PathBuf),
     Missing,
+    /// A name inside an archive: the structure is all we show.
+    ReadOnly,
 }
 
 impl Row {
@@ -86,6 +97,7 @@ pub struct Sidebar {
     pub buffer: Buffer,
     expanded: HashSet<PathBuf>,
     git: git::Probe,
+    archive: archive::Probe,
     family: &'static str,
     font_size: f32,
     line_height: f32,
@@ -114,6 +126,7 @@ impl Sidebar {
             buffer,
             expanded: HashSet::new(),
             git: git::Probe::new(),
+            archive: archive::Probe::new(),
             family,
             font_size,
             line_height,
@@ -171,6 +184,18 @@ impl Sidebar {
         self.rebuild(font_system);
     }
 
+    pub fn poll_archive(&mut self, font_system: &mut FontSystem) -> bool {
+        if !self.archive.poll() {
+            return false;
+        }
+        self.rebuild(font_system);
+        true
+    }
+
+    pub fn archive_pending(&self) -> bool {
+        self.archive.pending()
+    }
+
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.selected)
     }
@@ -195,27 +220,35 @@ impl Sidebar {
 
     pub fn enter(&mut self, font_system: &mut FontSystem) -> Option<SidebarAction> {
         let row = self.rows.get(self.selected)?.clone();
+        if matches!(self.root, Root::Drives) {
+            self.set_root(font_system, Root::Dir(row.path));
+            return None;
+        }
+        if row.missing {
+            return Some(SidebarAction::Missing);
+        }
+        // An archive opens like any folder, whether it is on disk or the root.
+        if row.is_dir || archive::is_archive(&row.path) {
+            let path = row.path.clone();
+            if !self.expanded.remove(&path) {
+                self.expanded.insert(path);
+            }
+            self.rebuild(font_system);
+            self.select_path(font_system, &row.path);
+            None
+        } else if row.archive.is_some() {
+            Some(SidebarAction::ReadOnly)
+        } else {
+            Some(SidebarAction::Open(row.path))
+        }
+    }
+
+    /// The folder the root is showing, virtual paths included.
+    fn floor(&self) -> Option<PathBuf> {
         match &self.root {
-            Root::Drives => {
-                self.set_root(font_system, Root::Dir(row.path));
-                None
-            }
-            Root::Dir(_) => {
-                if row.missing {
-                    return Some(SidebarAction::Missing);
-                }
-                if row.is_dir {
-                    let path = row.path.clone();
-                    if !self.expanded.remove(&path) {
-                        self.expanded.insert(path);
-                    }
-                    self.rebuild(font_system);
-                    self.select_path(font_system, &row.path);
-                    None
-                } else {
-                    Some(SidebarAction::Open(row.path))
-                }
-            }
+            Root::Drives => None,
+            Root::Dir(path) => Some(path.clone()),
+            Root::Archive { file, prefix } => Some(virtual_path(file, prefix, "")),
         }
     }
 
@@ -223,10 +256,10 @@ impl Sidebar {
         let Some(row) = self.rows.get(self.selected).cloned() else {
             return;
         };
-        let Root::Dir(root) = &self.root else {
+        let Some(floor) = self.floor() else {
             return;
         };
-        if row.is_dir {
+        if row.is_dir || archive::is_archive(&row.path) {
             if self.expanded.remove(&row.path) {
                 self.rebuild(font_system);
                 self.select_path(font_system, &row.path);
@@ -236,7 +269,7 @@ impl Sidebar {
         let Some(parent) = row.path.parent() else {
             return;
         };
-        if parent == root {
+        if parent == floor {
             return;
         }
         let parent = parent.to_path_buf();
@@ -247,25 +280,42 @@ impl Sidebar {
     }
 
     pub fn left(&mut self, font_system: &mut FontSystem) {
-        let Root::Dir(root) = &self.root else {
-            return;
-        };
-        let old_root = root.clone();
-        let drive = old_root.ancestors().last().map(Path::to_path_buf);
-        if drive.as_deref() == Some(old_root.as_path()) {
-            let drive_path = old_root.clone();
-            self.set_root(font_system, Root::Drives);
-            self.select_path(font_system, &drive_path);
-            return;
+        match self.root.clone() {
+            Root::Drives => {}
+            Root::Archive { file, prefix } => {
+                let from = virtual_path(&file, &prefix, "");
+                self.root = match prefix.split_last() {
+                    Some((_, parent)) => Root::Archive {
+                        file,
+                        prefix: parent.to_vec(),
+                    },
+                    None => match file.parent() {
+                        Some(dir) => Root::Dir(dir.to_path_buf()),
+                        None => Root::Drives,
+                    },
+                };
+                self.rebuild(font_system);
+                self.select_path(font_system, &from);
+            }
+            Root::Dir(root) => {
+                let old_root = root.clone();
+                let drive = old_root.ancestors().last().map(Path::to_path_buf);
+                if drive.as_deref() == Some(old_root.as_path()) {
+                    let drive_path = old_root.clone();
+                    self.set_root(font_system, Root::Drives);
+                    self.select_path(font_system, &drive_path);
+                    return;
+                }
+                let Some(parent) = old_root.parent() else {
+                    self.set_root(font_system, Root::Drives);
+                    return;
+                };
+                let parent = parent.to_path_buf();
+                self.root = Root::Dir(parent);
+                self.rebuild(font_system);
+                self.select_path(font_system, &old_root);
+            }
         }
-        let Some(parent) = old_root.parent() else {
-            self.set_root(font_system, Root::Drives);
-            return;
-        };
-        let parent = parent.to_path_buf();
-        self.root = Root::Dir(parent);
-        self.rebuild(font_system);
-        self.select_path(font_system, &old_root);
     }
 
     pub fn right(&mut self, font_system: &mut FontSystem) {
@@ -274,9 +324,24 @@ impl Sidebar {
         };
         match &self.root {
             Root::Drives => self.set_root(font_system, Root::Dir(row.path)),
-            Root::Dir(_) => {
+            Root::Dir(_) | Root::Archive { .. } => {
                 if row.is_dir {
-                    self.set_root(font_system, Root::Dir(row.path));
+                    let root = match &row.archive {
+                        None => Root::Dir(row.path.clone()),
+                        Some(file) => Root::Archive {
+                            file: file.clone(),
+                            prefix: virtual_prefix(file, &row.path),
+                        },
+                    };
+                    self.set_root(font_system, root);
+                } else if archive::is_archive(&row.path) {
+                    self.set_root(
+                        font_system,
+                        Root::Archive {
+                            file: row.path.clone(),
+                            prefix: Vec::new(),
+                        },
+                    );
                 }
             }
         }
@@ -367,6 +432,7 @@ impl Sidebar {
                         label,
                         is_drive: true,
                         missing: false,
+                        archive: None,
                         icon,
                         icon_color: ICON_GREEN,
                         mark: None,
@@ -379,12 +445,31 @@ impl Sidebar {
                 let expanded = self.expanded.clone();
                 // Ask for every directory the walk is about to open, so one rebuild
                 // covers them all; the listing itself only ever reads the cache.
+                let archives: Vec<PathBuf> = expanded
+                    .iter()
+                    .filter(|path| archive::is_archive(path))
+                    .cloned()
+                    .collect();
                 self.git.want(&root);
                 for dir in &expanded {
-                    self.git.want(dir);
+                    if archive::is_archive(dir) {
+                        self.archive.want(dir);
+                    // Under an open archive the paths are names in a listing, so git
+                    // has nothing to say about them.
+                    } else if !archives.iter().any(|file| dir.starts_with(file)) {
+                        self.git.want(dir);
+                    }
                 }
                 let mut rows = Vec::new();
                 self.append_directory(&mut rows, &root, 0, &expanded, columns);
+                rows
+            }
+            Root::Archive { file, prefix } => {
+                let (file, prefix, expanded) =
+                    (file.clone(), prefix.clone(), self.expanded.clone());
+                self.archive.want(&file);
+                let mut rows = Vec::new();
+                self.append_archive(&mut rows, &file, &prefix, 0, &expanded, columns);
                 rows
             }
         };
@@ -528,23 +613,118 @@ impl Sidebar {
                 delta,
                 columns,
             );
-            let expanded_here = is_dir && expanded.contains(&path);
+            let open = (is_dir || archive::is_archive(&path)) && expanded.contains(&path);
             rows.push(Row {
                 path: path.clone(),
                 is_dir,
                 label,
                 is_drive: false,
                 missing,
+                archive: None,
                 icon: icon_range,
                 icon_color,
                 mark,
                 delta,
             });
-            if expanded_here {
-                self.append_directory(rows, &path, depth + 1, expanded, columns);
+            if open {
+                if is_dir {
+                    self.append_directory(rows, &path, depth + 1, expanded, columns);
+                } else {
+                    self.append_archive(rows, &path, &[], depth + 1, expanded, columns);
+                }
             }
         }
     }
+
+    /// One folder inside an archive. The listing is a flat set of entry names, so
+    /// the tree is read out of them; nothing here touches the disk.
+    fn append_archive(
+        &self,
+        rows: &mut Vec<Row>,
+        file: &Path,
+        prefix: &[String],
+        depth: usize,
+        expanded: &HashSet<PathBuf>,
+        columns: usize,
+    ) {
+        if depth > 64 {
+            return;
+        }
+        let Some(listing) = self.archive.listing(file) else {
+            return;
+        };
+        // name -> whether something lives below it at this level
+        let mut children: HashMap<String, bool> = HashMap::new();
+        for entry in listing.entries() {
+            let segments: Vec<&str> = entry.split('/').collect();
+            if segments.len() <= prefix.len()
+                || !prefix
+                    .iter()
+                    .zip(&segments)
+                    .all(|(want, have)| want == have)
+            {
+                continue;
+            }
+            let name = segments[prefix.len()].to_string();
+            *children.entry(name).or_default() |= segments.len() > prefix.len() + 1;
+        }
+        let mut children: Vec<(bool, String, String, bool)> = children
+            .into_iter()
+            .map(|(name, is_dir)| (!is_dir, name.to_lowercase(), name, is_dir))
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        for (_, _, name, is_dir) in children {
+            let path = virtual_path(file, prefix, &name);
+            let (icon, icon_color) = if is_dir {
+                (FOLDER_ICON, ICON_SAPPHIRE)
+            } else {
+                file_icon(&name)
+            };
+            let (label, icon_range, delta) = row_text(None, depth, icon, &name, None, columns);
+            rows.push(Row {
+                path: path.clone(),
+                is_dir,
+                label,
+                is_drive: false,
+                missing: false,
+                archive: Some(file.to_path_buf()),
+                icon: icon_range,
+                icon_color,
+                mark: None,
+                delta,
+            });
+            if is_dir && expanded.contains(&path) {
+                let mut deeper = prefix.to_vec();
+                deeper.push(name);
+                self.append_archive(rows, file, &deeper, depth + 1, expanded, columns);
+            }
+        }
+    }
+}
+
+/// Where an entry of `file`'s listing lives in the tree. These paths are names,
+/// not disk paths: only the sidebar and the listing itself ever read them.
+fn virtual_path(file: &Path, prefix: &[String], name: &str) -> PathBuf {
+    let mut path = file.to_path_buf();
+    for segment in prefix {
+        path.push(segment);
+    }
+    if !name.is_empty() {
+        path.push(name);
+    }
+    path
+}
+
+/// The folder a virtual path names, as entry segments below the archive.
+fn virtual_prefix(file: &Path, path: &Path) -> Vec<String> {
+    path.strip_prefix(file)
+        .map(|rest| {
+            rest.components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// git's own letters, so the column reads like `git status` rather than a private icon set.
@@ -847,6 +1027,90 @@ mod tests {
         assert!(long.chars().count() > 40);
     }
 
+    #[test]
+    fn an_archive_lists_its_tree_like_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("box.zip");
+        std::fs::write(&archive, b"never mind the bytes").unwrap();
+
+        let mut fonts = Fonts::load();
+        let mut sidebar = Sidebar::new(&mut fonts.system, fonts.mono, 13.5, 280.0, 400.0);
+        sidebar.archive.seed(
+            &archive,
+            vec!["one.txt".into(), "deep/two.txt".into(), "deep/".into()],
+        );
+        sidebar.root = Root::Dir(dir.path().to_path_buf());
+        sidebar.expanded.insert(archive.clone());
+        sidebar.rebuild(&mut fonts.system);
+
+        let names = |sidebar: &Sidebar| -> Vec<String> {
+            sidebar
+                .rows
+                .iter()
+                .map(|row| display_path(&row.path))
+                .collect()
+        };
+        let inside = archive.join("deep");
+        assert!(
+            names(&sidebar).contains(&display_path(&inside)),
+            "the folder below the archive is its own row: {:?}",
+            names(&sidebar)
+        );
+        assert!(
+            !names(&sidebar).iter().any(|name| name.ends_with("two.txt")),
+            "one level at a time: {:?}",
+            names(&sidebar)
+        );
+        let folder = sidebar.rows.iter().find(|row| row.path == inside).unwrap();
+        assert!(folder.is_dir);
+        assert_eq!(folder.archive.as_deref(), Some(archive.as_path()));
+
+        sidebar.expanded.insert(inside.clone());
+        sidebar.rebuild(&mut fonts.system);
+        let file = sidebar
+            .rows
+            .iter()
+            .find(|row| row.path == inside.join("two.txt"))
+            .unwrap();
+        assert!(!file.is_dir);
+        assert_eq!(file.archive.as_deref(), Some(archive.as_path()));
+        assert!(
+            file.mark.is_none() && file.delta.is_none(),
+            "git has nothing to say about a name in a listing"
+        );
+    }
+
+    #[test]
+    fn an_archive_as_root_shows_its_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("box.zip");
+        std::fs::write(&archive, b"never mind the bytes").unwrap();
+
+        let mut fonts = Fonts::load();
+        let mut sidebar = Sidebar::new(&mut fonts.system, fonts.mono, 13.5, 280.0, 400.0);
+        sidebar
+            .archive
+            .seed(&archive, vec!["one.txt".into(), "deep/two.txt".into()]);
+        sidebar.root = Root::Archive {
+            file: archive.clone(),
+            prefix: Vec::new(),
+        };
+        sidebar.rebuild(&mut fonts.system);
+        let names: Vec<String> = sidebar
+            .rows
+            .iter()
+            .map(|row| display_path(&row.path))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                display_path(&archive.join("deep")),
+                display_path(&archive.join("one.txt"))
+            ],
+            "folders first, then files"
+        );
+    }
+
     const GLYPH: char = '󰙱';
 
     #[test]
@@ -857,6 +1121,7 @@ mod tests {
             label: String::new(),
             is_drive: false,
             missing: false,
+            archive: None,
             icon: 0..0,
             icon_color: ICON_SAPPHIRE,
             mark: None,

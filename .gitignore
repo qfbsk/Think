@@ -1,1 +1,5 @@
 /target/
+
+# The helix source the query and theme corpus was copied from, kept on disk as
+# the reference for refreshing crates/kite-app/runtime.
+/helix-master/
