@@ -1,9 +1,21 @@
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{Attrs, Buffer, Color, Family, LineEnding, Metrics, Shaping, Wrap};
+use glyphon::cosmic_text::{
+    Attrs, Buffer, Color, Family, LineEnding, Metrics, Shaping, Weight, Wrap,
+};
 use glyphon::cosmic_text::{AttrsList, BufferLine};
 
 pub fn attrs(family: &'static str, color: Color) -> Attrs<'static> {
     Attrs::new().family(Family::Name(family)).color(color)
+}
+
+/// The same, heavy. The sidebar is set in bold so its rows read as a panel rather
+/// than body text; the Mono Nerd Font keeps every advance width across weights, so
+/// this cannot shift the grid.
+pub fn bold_attrs(family: &'static str, color: Color) -> Attrs<'static> {
+    Attrs::new()
+        .family(Family::Name(family))
+        .color(color)
+        .weight(Weight::BOLD)
 }
 
 /// A label that is shaped the moment it is built: one line, no wrapping, no bounds.

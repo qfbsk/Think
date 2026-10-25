@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{AttrsList, Buffer, Cursor, Metrics, Scroll, Wrap};
+use glyphon::cosmic_text::{AttrsList, Buffer, Color, Cursor, Metrics, Scroll, Wrap};
 use kite_core::{Change, Document, Position, Selection, Unencodable};
 use ropey::Rope;
 use tree_house::tree_sitter::{InputEdit, Point};
@@ -10,7 +10,7 @@ use tree_house::{Language, Syntax};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::syntax::{self, Engine, Run};
-use crate::text::{attrs, buffer_line, byte_to_char, char_to_byte, force_relayout};
+use crate::text::{bold_attrs, buffer_line, byte_to_char, char_to_byte, force_relayout};
 use crate::theme;
 
 pub struct Editor {
@@ -23,6 +23,10 @@ pub struct Editor {
     language: Option<Language>,
     tree: Option<Syntax>,
     colored: Option<(u64, usize, usize, Position)>,
+    /// What the last colouring pass painted on either side of the caret, which
+    /// is where the typing powder takes its ink from.
+    ink_before_caret: Option<Color>,
+    ink_after_caret: Option<Color>,
     engine: Arc<Engine>,
     numbers: Buffer,
     numbers_key: Option<NumbersKey>,
@@ -63,7 +67,7 @@ impl Editor {
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);
         buffer.set_size(Some(view_width.max(1.0)), Some(view_height.max(1.0)));
-        let line_attrs = attrs(family, theme::text());
+        let line_attrs = bold_attrs(family, theme::text());
         for index in 0..document.line_count() {
             let text = document.line_text(index);
             buffer.lines.push(buffer_line(&text, &line_attrs));
@@ -87,6 +91,8 @@ impl Editor {
             language,
             tree,
             colored: None,
+            ink_before_caret: None,
+            ink_after_caret: None,
             engine,
             numbers: Buffer::new_empty(metrics),
             numbers_key: None,
@@ -127,7 +133,29 @@ impl Editor {
             }
             _ => Vec::new(),
         };
-        let base = attrs(self.family, theme::text());
+        let caret = self.selection.cursor;
+        let ink = |index: usize| -> Option<Color> {
+            let rope = self.rope.as_ref()?;
+            if caret.line >= rope.len_lines() {
+                return None;
+            }
+            let text = self.document.line_text(caret.line);
+            if index >= text.chars().count() {
+                return None;
+            }
+            let byte = rope.line_to_byte(caret.line) + byte_of_char(&text, index);
+            Some(
+                runs.iter()
+                    .find(|run| run.start <= byte && byte < run.end)
+                    .map(|run| run.color)
+                    .unwrap_or_else(theme::text),
+            )
+        };
+        let before = caret.ch.checked_sub(1).and_then(|index| ink(index));
+        let after = ink(caret.ch);
+        self.ink_before_caret = before;
+        self.ink_after_caret = after;
+        let base = bold_attrs(self.family, theme::text());
         for index in first..last {
             let text = self.document.line_text(index);
             let start = self
@@ -141,7 +169,7 @@ impl Editor {
                 let from = run.start.saturating_sub(start).min(text.len());
                 let to = run.end.saturating_sub(start).min(text.len());
                 if from < to {
-                    list.add_span(from..to, &attrs(self.family, run.color));
+                    list.add_span(from..to, &bold_attrs(self.family, run.color));
                 }
             }
             if let Some(line) = self.buffer.lines.get_mut(index) {
@@ -320,12 +348,13 @@ impl Editor {
         for (text, color) in rows {
             buffer
                 .lines
-                .push(buffer_line(&text, &attrs(self.family, color)));
+                .push(buffer_line(&text, &bold_attrs(self.family, color)));
         }
         if buffer.lines.is_empty() {
-            buffer
-                .lines
-                .push(buffer_line(" ", &attrs(self.family, theme::text_dim())));
+            buffer.lines.push(buffer_line(
+                " ",
+                &bold_attrs(self.family, theme::text_dim()),
+            ));
         }
         buffer.set_scroll(Scroll {
             line: 0,
@@ -730,6 +759,17 @@ impl Editor {
         spans
     }
 
+    /// The ink of the glyph beside the caret: `left` picks the one the caret
+    /// stands to the right of, which is what typing just wrote and what
+    /// Backspace is about to eat. Nothing when there is no glyph there.
+    pub fn glyph_ink(&self, left: bool) -> Option<Color> {
+        if left {
+            self.ink_before_caret
+        } else {
+            self.ink_after_caret
+        }
+    }
+
     pub fn cursor_rect(&self) -> Option<(f32, f32, f32)> {
         let cursor = self.cursor_cosmic();
         let mut found = None;
@@ -777,7 +817,7 @@ impl Editor {
                 self.buffer.set_scroll(Scroll { line, ..scroll });
             }
             deeper = change.new_count > change.old_count;
-            let line_attrs = attrs(self.family, theme::text());
+            let line_attrs = bold_attrs(self.family, theme::text());
             let new_lines = (0..change.new_count)
                 .map(|index| {
                     let text = self.document.line_text(change.start_line + index);
@@ -810,7 +850,7 @@ impl Editor {
     }
 
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
-        let line_attrs = attrs(self.family, theme::text());
+        let line_attrs = bold_attrs(self.family, theme::text());
         let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);
@@ -974,6 +1014,23 @@ mod tests {
         (editor, fonts)
     }
 
+    /// A Rust buffer, so the highlighter has real roles to colour.
+    fn rust_editor(text: &str) -> (Editor, Fonts) {
+        let mut fonts = Fonts::load();
+        let document = Document::from_bytes("kite-editor-test.rs", text.as_bytes().to_vec())
+            .expect("a document");
+        let editor = Editor::new(
+            document,
+            &mut fonts.system,
+            fonts.mono,
+            400.0,
+            200.0,
+            16.0,
+            Arc::new(Engine::new()),
+        );
+        (editor, fonts)
+    }
+
     fn tops(editor: &Editor, line: usize) -> Vec<f32> {
         editor
             .buffer
@@ -981,6 +1038,51 @@ mod tests {
             .filter(|run| run.line_i == line)
             .map(|run| run.line_top)
             .collect()
+    }
+
+    /// The typing powder takes its ink from the glyph beside the caret: the one
+    /// to its left is what typing just wrote, the one to its right is what a
+    /// forward delete is about to eat.
+    #[test]
+    fn the_caret_reports_the_ink_on_either_side() {
+        let (mut editor, mut fonts) = rust_editor("fn main() { let s = \"hi\"; }\n");
+        let at = |ch: usize| Selection::new(Position::new(0, ch), Position::new(0, ch));
+        let mauve = Some(Color::rgb(0xcb, 0xa6, 0xf7));
+        let green = Some(Color::rgb(0xa6, 0xe3, 0xa1));
+
+        editor.set_selection(&mut fonts.system, at(0));
+        editor.highlight(&mut fonts.system);
+        assert_eq!(
+            editor.glyph_ink(true),
+            None,
+            "nothing sits left of column 0"
+        );
+        assert_eq!(
+            editor.glyph_ink(false),
+            mauve,
+            "`f` of `fn` sits at the caret"
+        );
+
+        editor.set_selection(&mut fonts.system, at(2));
+        editor.highlight(&mut fonts.system);
+        assert_eq!(
+            editor.glyph_ink(true),
+            mauve,
+            "`fn` is the theme's keyword mauve"
+        );
+        assert_eq!(
+            editor.glyph_ink(false),
+            Some(theme::text()),
+            "the space past it is plain text"
+        );
+
+        editor.set_selection(&mut fonts.system, at(22));
+        editor.highlight(&mut fonts.system);
+        assert_eq!(
+            editor.glyph_ink(true),
+            green,
+            "the same caret inside the literal takes the string green"
+        );
     }
 
     #[test]
@@ -1217,7 +1319,7 @@ pub(crate) fn measure_cell(
     buffer.set_size(None, None);
     buffer
         .lines
-        .push(buffer_line(SAMPLE, &attrs(family, theme::text())));
+        .push(buffer_line(SAMPLE, &bold_attrs(family, theme::text())));
     buffer.shape_until_scroll(font_system, false);
     match buffer.layout_runs().next() {
         Some(run) => run.line_w / SAMPLE.chars().count() as f32,

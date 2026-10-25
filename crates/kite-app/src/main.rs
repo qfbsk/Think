@@ -12,11 +12,13 @@ mod miku;
 mod renderer;
 mod shell;
 mod sidebar;
+mod sparks;
 mod syntax;
 mod terminal;
 mod text;
 mod theme;
 mod ui;
+mod visualizer;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

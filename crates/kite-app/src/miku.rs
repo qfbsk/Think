@@ -9,7 +9,7 @@ use glyphon::cosmic_text::{Buffer, Color, Metrics, Wrap};
 
 use crate::activity;
 use crate::day::Day;
-use crate::text::{attrs, make_label, measure};
+use crate::text::{bold_attrs, make_label, measure};
 use crate::theme;
 use crate::ui::Rect;
 
@@ -344,7 +344,7 @@ impl Miku {
                     };
                     let label = make_label(
                         font_system,
-                        &attrs(self.family, theme::text_dim()),
+                        &bold_attrs(self.family, theme::text_dim()),
                         text * 0.85,
                         &name,
                     );
@@ -368,7 +368,7 @@ impl Miku {
         for (row, name) in [(1, "Mon"), (3, "Wed"), (5, "Fri")] {
             let label = make_label(
                 font_system,
-                &attrs(self.family, theme::text_dim()),
+                &bold_attrs(self.family, theme::text_dim()),
                 text * 0.85,
                 name,
             );
@@ -386,7 +386,7 @@ impl Miku {
         let right = self.origin.0 + (self.columns as f32 - 1.0) * step + self.cell;
         let more = make_label(
             font_system,
-            &attrs(self.family, theme::text_dim()),
+            &bold_attrs(self.family, theme::text_dim()),
             text * 0.85,
             "More",
         );
@@ -395,7 +395,7 @@ impl Miku {
         let less_x = squares_right - LEVELS as f32 * step - 8.0 * self.scale;
         let less = make_label(
             font_system,
-            &attrs(self.family, theme::text_dim()),
+            &bold_attrs(self.family, theme::text_dim()),
             text * 0.85,
             "Less",
         );
@@ -414,7 +414,7 @@ impl Miku {
         self.body = Buffer::new_empty(Metrics::new(text, (text * 1.4).ceil()));
         self.body.set_wrap(Wrap::None);
         self.body.set_size(None, None);
-        let style = attrs(self.family, theme::text());
+        let style = bold_attrs(self.family, theme::text());
         for line in lines {
             self.body
                 .lines

@@ -30,6 +30,13 @@ const PTY_KEY: usize = 0;
 /// The short timeout is only there so a keystroke cannot sit in the command
 /// queue until the next read.
 const TICK: Duration = Duration::from_millis(4);
+/// How quiet the output pipe of an exited child has to be before its last
+/// frame is taken as complete, and how long to wait for that in total.
+const EXIT_TAIL: Duration = Duration::from_millis(20);
+const EXIT_LIMIT: Duration = Duration::from_millis(200);
+/// A child that is given a screen of its own gets at least this many rows,
+/// which is what `cmd` needs to print its banner and a prompt.
+const MIN_SCREEN: usize = 4;
 
 /// The sixteen ANSI slots in Catppuccin Mocha, the palette the rest of kite
 /// already speaks. Bright slots reuse their hue; the theme has one green.
@@ -184,40 +191,22 @@ pub struct MouseReport {
     pub column: usize,
 }
 
-/// What ConPTY is claiming about the screen, if anything: a description of the
-/// buffer it holds, which is never the session the grid already has.
-#[derive(Clone, Copy)]
-enum Claim {
-    /// The child has not written yet, so the screen it announced is the empty
-    /// one it was just handed.
-    Opening,
-    /// The child gave the alternate screen back, and ConPTY is repainting the
-    /// buffer it swapped to — the same empty one, now walked row by row.
-    GivenBack,
-}
-
-impl Claim {
-    /// How many bytes at the front of the stream say nothing the grid has to
-    /// forget, or `None` at the first byte of real output.
-    fn reads(self, bytes: &[u8]) -> Option<usize> {
-        match self {
-            Claim::Opening => announcement(bytes),
-            Claim::GivenBack => repaint(bytes),
-        }
-    }
-}
-
 pub struct Terminal {
     term: Term<Proxy>,
     parser: Processor,
     size: Size,
+    /// The size the grid is currently at: the whole tab while kite types, the
+    /// rows below the prompt while a child writes text, and the whole tab again
+    /// while a child holds the alternate screen.
+    screen: Size,
+    /// Where the child's screen begins: the row the prompt left behind.
+    job_origin: usize,
     cell: (f32, f32),
     job: Option<Job>,
     exit: Option<Option<ExitStatus>>,
     events: Receiver<TermEvent>,
     /// Where the drag started and where it stands, in grid cells.
     selection: Option<(Point, Point)>,
-    claim: Option<Claim>,
 }
 
 impl Terminal {
@@ -233,13 +222,14 @@ impl Terminal {
         Terminal {
             term,
             parser: Processor::default(),
+            screen: size,
+            job_origin: 0,
             size,
             cell,
             job: None,
             exit: None,
             events,
             selection: None,
-            claim: None,
         }
     }
 
@@ -258,11 +248,15 @@ impl Terminal {
         self.cells(line).into_iter().map(|(ch, _, _)| ch).collect()
     }
 
-    /// The whole viewport joined, trailing blanks trimmed.
+    /// The whole tab joined, trailing blanks trimmed.
     #[cfg(test)]
     pub fn screen_text(&self) -> String {
         (0..self.size.screen_lines as i32)
-            .map(|row| self.row_text(self.top_line() + row).trim_end().to_string())
+            .map(|row| {
+                self.row_text(self.first_line() + row)
+                    .trim_end()
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -273,9 +267,31 @@ impl Terminal {
         -(self.term.grid().display_offset() as i32)
     }
 
+    /// Tab rows that belong to the session rather than to the screen the grid
+    /// is showing: the history the child's own screen was placed under.
+    pub fn origin(&self) -> usize {
+        self.size.screen_lines - self.screen.screen_lines
+    }
+
+    /// The grid line at the top row of the tab, history included. Every row the
+    /// tab shows is this line plus its distance from the top.
+    pub fn first_line(&self) -> i32 {
+        self.top_line() - self.origin() as i32
+    }
+
     /// Whether the view is looking at history rather than the live bottom.
     pub fn scrolled(&self) -> bool {
         self.term.grid().display_offset() != 0
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// The first grid line there is. The tab's top row cannot ask for anything
+    /// above it without drawing a blank.
+    pub fn topmost_line(&self) -> i32 {
+        self.term.grid().topmost_line().0
     }
 
     /// Rows of scrollback above the viewport.
@@ -284,9 +300,21 @@ impl Terminal {
     }
 
     /// Move the view. Positive `lines` goes down towards the present.
+    ///
+    /// The tab draws `origin` rows above the grid's own viewport, so the history
+    /// runs out that many lines before alacritty's own clamp says it does. Going
+    /// past there asks the grid for lines it never had, and every one of them
+    /// comes back blank: the top of the tab empties out while the view is
+    /// already sitting on the first line there is.
     pub fn scroll_by(&mut self, lines: i32) {
-        if lines != 0 {
-            self.term.scroll_display(Scroll::Delta(-lines));
+        if lines == 0 {
+            return;
+        }
+        let limit = (-self.topmost_line() - self.origin() as i32).max(0);
+        let wanted = (self.display_offset() as i32 - lines).clamp(0, limit);
+        let delta = wanted - self.display_offset() as i32;
+        if delta != 0 {
+            self.term.scroll_display(Scroll::Delta(delta));
         }
     }
 
@@ -307,7 +335,11 @@ impl Terminal {
     }
 
     pub fn select(&mut self, anchor: Point, cursor: Point) {
-        self.selection = Some((anchor, cursor));
+        // A drag that starts on a row above the top of the grid has no line to
+        // name, so it begins at the first one there is.
+        let top = self.term.grid().topmost_line();
+        let clamp = |point: Point| Point::new(point.line.max(top), point.column);
+        self.selection = Some((clamp(anchor), clamp(cursor)));
     }
 
     pub fn clear_selection(&mut self) {
@@ -322,7 +354,6 @@ impl Terminal {
     }
 
     /// Whether the child asked for the mouse. While it has, kite's own
-    /// Whether the child asked for the mouse. While it has, kite's own
     /// selection and scrolling have to stand aside — but only while it is
     /// still there to hear about it, or the mode it left behind would swallow
     /// every wheel notch in the session.
@@ -336,7 +367,7 @@ impl Terminal {
             return;
         }
         let mode = *self.term.mode();
-        let bytes = mouse_bytes(mode, self.top_line(), self.size.screen_lines, report);
+        let bytes = mouse_bytes(mode, self.top_line(), self.screen.screen_lines, report);
         if !bytes.is_empty() {
             self.send(&bytes);
         }
@@ -344,9 +375,17 @@ impl Terminal {
 
     /// One visible row, cell by cell. A wide glyph is one entry and its
     /// trailing spacer is dropped, so the count can be under `columns`.
+    ///
+    /// A row the grid has no line for comes back empty. The tab's rows above a
+    /// child's screen are the session's history, and a program that took the
+    /// alternate screen leaves that history behind empty, so those rows have
+    /// nothing of their own to show until it gives the screen back.
     pub fn cells(&self, line: i32) -> Vec<(char, Option<Color>, bool)> {
         let grid = self.term.grid();
         let row = Line(line);
+        if row < grid.topmost_line() {
+            return Vec::new();
+        }
         let mut cells = Vec::with_capacity(self.size.columns);
         let mut column = 0;
         while column < self.size.columns {
@@ -358,6 +397,28 @@ impl Terminal {
             column += if wide { 2 } else { 1 };
         }
         cells
+    }
+
+    /// Whether one cell holds a glyph at all. A blank, and the tail half of a
+    /// wide character, hold none.
+    pub fn glyph_at(&self, line: i32, column: usize) -> bool {
+        let grid = self.term.grid();
+        let row = Line(line);
+        if row < grid.topmost_line() || column >= self.size.columns {
+            return false;
+        }
+        let cell = &grid[Point::new(row, Column(column))];
+        cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+    }
+
+    /// The colour the grid gave one cell, and nothing for a blank or default
+    /// one. The typing powder borrows the colour of the cell left of the caret.
+    pub fn cell_color(&self, line: i32, column: usize) -> Option<Color> {
+        if !self.glyph_at(line, column) {
+            return None;
+        }
+        let grid = self.term.grid();
+        resolve(grid[Point::new(Line(line), Column(column))].fg)
     }
 
     pub fn runs(&self, line: i32) -> Vec<Run> {
@@ -375,13 +436,10 @@ impl Terminal {
         runs
     }
 
-    /// Where the caret is, whether or not the child is showing one.
-    pub fn cursor_point(&self) -> (usize, usize) {
-        let content = self.term.renderable_content();
-        (
-            content.cursor.point.column.0,
-            content.cursor.point.line.0.max(0) as usize,
-        )
+    /// Which column of the grid the caret stands on, whether or not the child
+    /// is showing one.
+    pub fn cursor_column(&self) -> usize {
+        self.term.renderable_content().cursor.point.column.0
     }
 
     /// Where the child put its own cursor: column, and grid line (which is
@@ -401,6 +459,12 @@ impl Terminal {
     /// it, which need not be the bottom row.
     pub fn cursor_line(&self) -> i32 {
         self.term.renderable_content().cursor.point.line.0
+    }
+
+    /// Which row of the tab the cursor is standing on. Scrolling moves the
+    /// view, not the caret, so this ignores where the view happens to be.
+    pub fn cursor_row(&self) -> usize {
+        (self.cursor_line() + self.origin() as i32).max(0) as usize
     }
 
     pub fn columns(&self) -> usize {
@@ -433,9 +497,74 @@ impl Terminal {
         }
     }
 
-    /// Attach a pseudo console to `program`, so it gets a real screen.
+    /// The size the grid should be: the rows below the prompt while a child
+    /// holds its own screen, and the whole tab otherwise. A program that
+    /// believes it has been handed a fresh terminal — `cmd` prints its banner
+    /// three rows down — is only ever right about its own screen, so that is
+    /// what it gets.
+    ///
+    /// The alternate screen is no exception, because giving a program the whole
+    /// tab while it holds the alternate screen makes its hand-back repaint
+    /// erase the session above: the program's own main buffer is empty (each
+    /// command starts a fresh pseudo console), so the frame it paints on the
+    /// way out overwrites the prompt and history that share the grid with it.
+    /// Keeping the program inside the rows below the prompt means its repaints
+    /// can only reach its own rows.
+    fn want(&self) -> Size {
+        let rows = if self.job_origin > 0 {
+            self.size.screen_lines - self.job_origin
+        } else {
+            self.size.screen_lines
+        };
+        Size::new(self.size.columns, rows)
+    }
+
+    /// Put the grid at the size its owner needs and tell the child about the
+    /// screen it just got. Rows the grid loses go to history, and come back
+    /// when the child is done with them.
+    fn fit(&mut self) {
+        let want = self.want();
+        if want == self.screen {
+            return;
+        }
+        self.screen = want;
+        self.term.resize(want.with_history());
+        if let Some(job) = self.job.as_ref() {
+            let _ = job.writer.send(Msg::Resize(self.window_size()));
+        }
+    }
+
+    /// Give a child the rows below the cursor as its own screen.
+    ///
+    /// The screen has to be the child's alone, which means the rows it takes
+    /// over have to be empty and the session's rows have to be above it. Only
+    /// scrolling does that — a shrink that has to scroll keeps what it loses,
+    /// and one that does not simply drops it — so the cursor is walked to the
+    /// bottom of the tab and the screen is scrolled into being, one row at a
+    /// time, before the grid is taken down to its size.
+    fn give_screen_below_cursor(&mut self) {
+        let rows = self.size.screen_lines;
+        let row = (self.cursor_line() - self.first_line()).max(0) as usize;
+        let least = (rows / 2).max(MIN_SCREEN);
+        let screen = (rows - row).max(least).min(rows);
+        self.job_origin = rows - screen;
+        if screen > 1 {
+            self.feed(&b"\r\n".repeat(screen - 1));
+        }
+        self.fit();
+        // The padding left the cursor at the bottom of the rows just carved
+        // out. A program that waits for input without painting first (a bare
+        // `scanf`) would then show its caret there, far below its command. Home
+        // it to the top of the child's screen so the caret sits on the line
+        // directly under the command, the way any terminal leaves it.
+        self.feed(b"\x1b[H");
+    }
+
+    /// Attach a pseudo console to `program`, so it gets a real screen: the rows
+    /// of the tab below whatever the prompt left behind.
     pub fn start(&mut self, program: &Path, args: &[String], cwd: &Path) -> io::Result<()> {
         self.close_job();
+        self.give_screen_below_cursor();
         let mut options = Options::default();
         options.shell = Some(Shell::new(
             program.display().to_string(),
@@ -451,7 +580,6 @@ impl Terminal {
             .name("kite-pty".to_string())
             .spawn(move || pump(pty, news_tx, cmds_rx))
             .map_err(io::Error::other)?;
-        self.claim = Some(Claim::Opening);
         self.selection = None;
         self.job = Some(Job {
             news: news_rx,
@@ -472,7 +600,8 @@ impl Terminal {
     }
 
     /// Re-fit the grid to the panel. The child is told as well, so a listing
-    /// that wrapped at the old width re-wraps at the new one.
+    /// that wrapped at the old width re-wraps at the new one, and a child that
+    /// is on a screen of its own gets the rows the taller tab left behind.
     pub fn resize(&mut self, panel: (f32, f32), cell: (f32, f32)) {
         let size = cells(panel, cell);
         if size == self.size && cell == self.cell {
@@ -480,10 +609,9 @@ impl Terminal {
         }
         self.cell = cell;
         self.size = size;
-        self.term.resize(size.with_history());
-        if let Some(job) = self.job.as_ref() {
-            let _ = job.writer.send(Msg::Resize(self.window_size()));
-        }
+        let least = (size.screen_lines / 2).max(MIN_SCREEN);
+        self.job_origin = self.job_origin.min(size.screen_lines.saturating_sub(least));
+        self.fit();
     }
 
     /// Take whatever the child wrote since last time. Returns true when the
@@ -503,7 +631,7 @@ impl Terminal {
         for message in news {
             match message {
                 News::Bytes(bytes) => {
-                    self.feed_pty(&bytes);
+                    self.feed(&bytes);
                     changed = true;
                 }
                 News::Exited(status) => {
@@ -532,54 +660,10 @@ impl Terminal {
         self.close_job();
     }
 
-    /// Bytes from the pseudo console. ConPTY opens by announcing an empty
-    /// screen — `ESC[2J` then `ESC[H` — which is true of the buffer it just
-    /// made and false of the grid it is being attached to, which already holds
-    /// the session. That part is dropped. The modes it sets on the way there
-    /// are the child's own requests, alternate screen included, and are fed
-    /// through: swallowing `ESC[?1049h` would cost the session its history.
-    ///
-    /// A child that hands the alternate screen back announces the same empty
-    /// buffer a second time, because the buffer it swapped to is the one it was
-    /// handed. It gets the same answer, walked row by row.
-    fn feed_pty(&mut self, bytes: &[u8]) {
-        let mut start = 0;
-        if self.claim.is_none() {
-            // A child hands the screen back in the middle of a chunk as often
-            // as at its edge, and everything after that is ConPTY painting the
-            // buffer it swapped to. Split before that paint begins.
-            if let Some(end) = handback(bytes) {
-                self.feed(&bytes[..end]);
-                start = end;
-                self.claim = Some(Claim::GivenBack);
-            }
-        }
-        if let Some(claim) = self.claim {
-            while start < bytes.len() {
-                let Some(len) = claim.reads(&bytes[start..]) else {
-                    break;
-                };
-                let piece = &bytes[start..start + len];
-                if piece.starts_with(b"\x1b[?") {
-                    self.parser.advance(&mut self.term, piece);
-                }
-                start += len;
-            }
-            if start < bytes.len() {
-                self.claim = None;
-            }
-        }
-        let held_screen = self.term.mode().contains(TermMode::ALT_SCREEN);
-        self.feed(&bytes[start..]);
-        if held_screen && !self.term.mode().contains(TermMode::ALT_SCREEN) {
-            self.claim = Some(Claim::GivenBack);
-        }
-    }
-
     fn window_size(&self) -> WindowSize {
         WindowSize {
-            num_lines: self.size.screen_lines as u16,
-            num_cols: self.size.columns as u16,
+            num_lines: self.screen.screen_lines as u16,
+            num_cols: self.screen.columns as u16,
             cell_width: self.cell.0.max(1.0) as u16,
             cell_height: self.cell.1.max(1.0) as u16,
         }
@@ -592,11 +676,14 @@ impl Terminal {
                 let _ = worker.join();
             }
         }
-        // A child that dies inside the alternate screen would take the session
-        // down with it. Once it is gone the screen belongs to the session.
+        // A child that dies inside the alternate screen leaves its own screen
+        // standing where the session's rows are. Once it is gone the rows belong
+        // to the session again.
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.parser.advance(&mut self.term, b"\x1b[?1049l");
         }
+        self.job_origin = 0;
+        self.fit();
     }
 }
 
@@ -630,66 +717,6 @@ fn mouse_bytes(mode: TermMode, top: i32, screen_lines: usize, report: MouseRepor
     } else {
         // X10 has no release event to send.
         Vec::new()
-    }
-}
-
-/// The length of a leading screen-reset announcement, when there is one.
-fn announcement(bytes: &[u8]) -> Option<usize> {
-    let rest = bytes.strip_prefix(b"\x1b[" as &[u8])?;
-    if rest.first() == Some(&b'?') {
-        let digits = rest[1..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        return match rest.get(1 + digits)? {
-            b'h' | b'l' if digits > 0 => Some(4 + digits),
-            _ => None,
-        };
-    }
-    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
-    match (digits, rest.get(digits)?) {
-        (0, b'm') | (0, b'H') | (0, b'f') => Some(3),
-        (1, b'J') if rest[0] == b'2' => Some(4),
-        _ => None,
-    }
-}
-
-/// Just past the point where a child asks for the main screen again, if it does
-/// so inside these bytes.
-fn handback(bytes: &[u8]) -> Option<usize> {
-    [b"\x1b[?1049l".as_slice(), b"\x1b[?1047l", b"\x1b[?47l"]
-        .into_iter()
-        .filter_map(|needle| {
-            bytes
-                .windows(needle.len())
-                .position(|window| window == needle)
-                .map(|at| at + needle.len())
-        })
-        .min()
-}
-
-/// The whole of a buffer repaint: erasing, moving about and retitling, which is
-/// how ConPTY walks a screen row by row on its way to whatever it holds. An
-/// empty buffer amounts to nothing but this, so the session can let it pass and
-/// keep its own rows. The first character of real output ends the run.
-fn repaint(bytes: &[u8]) -> Option<usize> {
-    if matches!(bytes.first(), Some(b'\r') | Some(b'\n')) {
-        return Some(1);
-    }
-    if let Some(len) = announcement(bytes) {
-        return Some(len);
-    }
-    if let Some(body) = bytes.strip_prefix(b"\x1b]" as &[u8]) {
-        return body.iter().position(|byte| *byte == 7).map(|end| end + 3);
-    }
-    let params = bytes
-        .strip_prefix(b"\x1b[" as &[u8])?
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
-        .count();
-    match *bytes.get(2 + params)? {
-        b'H' | b'f' | b'K' | b'J' | b'C' | b't' => Some(3 + params),
-        _ => None,
     }
 }
 
@@ -768,6 +795,32 @@ fn pump(mut pty: tty::Pty, news: Sender<News>, cmds: Receiver<Msg>) {
             }
         }
         if let Some(ChildEvent::Exited(status)) = pty.next_child_event() {
+            // The console host batches, so the last frame of a program that
+            // writes and quits tends to arrive a few milliseconds after the
+            // process is already gone. Chase it: read until the pipe has been
+            // quiet for a moment, with a limit for a host that never settles.
+            // `read` answers `Ok(0)` for both empty and closed, so the pipe
+            // itself cannot say when it is finished.
+            let limit = Instant::now() + EXIT_LIMIT;
+            let mut quiet = Instant::now();
+            loop {
+                let mut arrived = false;
+                while let Ok(read) = pty.reader().read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    arrived = true;
+                    if news.send(News::Bytes(buffer[..read].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                if arrived {
+                    quiet = Instant::now();
+                } else if quiet.elapsed() >= EXIT_TAIL || Instant::now() >= limit {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let _ = news.send(News::Exited(status));
             return;
         }
@@ -794,6 +847,13 @@ mod tests {
         (0..terminal.size.columns)
             .map(|column| cell(terminal, line, column))
             .collect::<String>()
+    }
+
+    /// Which tab row a line of text is sitting on, or -1 when it is on none.
+    fn row_of(terminal: &Terminal, text: &str) -> i32 {
+        (0..terminal.size.screen_lines as i32)
+            .find(|row| terminal.row_text(terminal.first_line() + row).trim_end() == text)
+            .unwrap_or(-1)
     }
 
     #[test]
@@ -837,6 +897,41 @@ mod tests {
         assert_eq!(row(&narrow, 0).trim_end().len(), 50);
     }
 
+    /// The interrupt is a byte, and the child's own line discipline answers
+    /// for it: a program waiting at a keyboard takes `^C` as its cue, which is
+    /// all a pseudo console lets a terminal do from the outside.
+    #[test]
+    fn an_interrupt_ends_a_child_that_is_waiting_for_input() {
+        let mut terminal = Terminal::new((800.0, 480.0), (8.0, 16.0));
+        let args = vec!["/c".to_string(), "pause".to_string()];
+        terminal
+            .start(
+                Path::new("cmd.exe"),
+                &args,
+                &std::env::current_dir().unwrap(),
+            )
+            .expect("the pseudo console should start");
+        let mut waiting = false;
+        for _ in 0..160 {
+            terminal.poll();
+            if terminal.screen_text().contains("pause") || terminal.screen_text().contains('键') {
+                waiting = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(waiting, "the child never reached its prompt");
+        terminal.send(&[0x03]);
+        for _ in 0..160 {
+            terminal.poll();
+            if !terminal.running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("the child ignored the interrupt");
+    }
+
     #[test]
     fn a_real_console_program_gets_a_real_screen() {
         let mut terminal = Terminal::new((800.0, 480.0), (8.0, 16.0));
@@ -861,111 +956,210 @@ mod tests {
         assert!(screen.contains("hello-pty"), "the grid held: {screen:?}");
         assert!(
             screen.contains("the session so far"),
-            "ConPTY's opening reset wiped the session: {screen:?}"
+            "the screen the child was given took the session with it: {screen:?}"
         );
     }
 
+    /// A program that writes and leaves has written all of it: the exit is not
+    /// reported until its output stops arriving, so the tail of a build log is
+    /// not lost to the race between the process and its console host.
     #[test]
-    fn the_opening_keeps_the_alternate_screen_the_child_asked_for() {
-        let mut terminal = screen(b"the listing\r\n");
-        terminal.claim = Some(Claim::Opening);
-        terminal.feed_pty(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
+    fn a_child_that_leaves_quickly_has_still_finished_writing() {
+        let mut terminal = Terminal::new((800.0, 480.0), (8.0, 16.0));
+        let args = vec![
+            "/c".to_string(),
+            "for /L %i in (1,1,200) do @echo line %i".to_string(),
+        ];
+        terminal
+            .start(
+                Path::new("cmd.exe"),
+                &args,
+                &std::env::current_dir().unwrap(),
+            )
+            .expect("the pseudo console should start");
+        let mut screen = String::new();
+        for _ in 0..400 {
+            terminal.poll();
+            if !terminal.running() {
+                screen = terminal.screen_text();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
         assert!(
-            terminal.term.mode().contains(TermMode::ALT_SCREEN),
-            "the mode the child set is not an announcement"
-        );
-        let screen = terminal.screen_text();
-        assert!(screen.contains("full screen"), "{screen}");
-        assert!(!screen.contains("the listing"), "it has its own screen");
-
-        terminal.claim = Some(Claim::Opening);
-        terminal.feed_pty(b"\x1b[?1049l");
-        assert!(
-            terminal.screen_text().contains("the listing"),
-            "the session comes back when the program leaves"
+            screen.contains("line 199") && screen.contains("line 200"),
+            "the last lines never arrived:\n{screen}"
         );
     }
 
+    /// A child is given the rows below the prompt, which is the only screen
+    /// whose first row it can be right about: `cmd` prints its banner three
+    /// rows down because it believes the terminal it was handed is fresh.
     #[test]
-    fn the_screen_a_child_gives_back_is_not_a_blank_one() {
-        let mut terminal = screen(b"the listing\r\n");
-        terminal.feed_pty(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
-        assert!(terminal.screen_text().contains("full screen"));
-
-        // What ConPTY really sends when vim hands the screen back: the swap, a
-        // title pop, then its own empty buffer painted row by row. Feeding
-        // that to the grid erases the session and homes the cursor.
-        terminal.feed_pty(b"\r\x1b[K\x1b[?25l\x1b[140C\x1b[?1049l");
-        terminal.feed_pty(b"\x1b[23;0;0t");
-        terminal.feed_pty(b"\x1b[H\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[H\x1b[?25h");
-        let screen = terminal.screen_text();
-        assert!(
-            screen.contains("the listing"),
-            "the repaint of the child's buffer wiped the session:\n{screen}"
+    fn a_child_is_given_the_rows_below_the_prompt() {
+        let mut terminal = screen(b"the session so far\r\n");
+        terminal.give_screen_below_cursor();
+        assert_eq!(terminal.origin(), 1);
+        assert_eq!(terminal.screen.screen_lines, 29);
+        // What ConPTY opens with: the buffer it just made, cleared and homed.
+        terminal.feed(b"\x1b[2J\x1b[HMicrosoft Windows [Version]\r\nX:\\>");
+        let shown = terminal.screen_text();
+        assert!(shown.contains("X:\\"), "{shown}");
+        assert_eq!(
+            terminal.row_text(terminal.first_line()).trim_end(),
+            "the session so far",
+            "the session keeps the row above the child's screen"
         );
         assert_eq!(
-            terminal.cursor_line(),
+            terminal.row_text(terminal.first_line() + 1).trim_end(),
+            "Microsoft Windows [Version]",
+            "the child's first row is the one below it"
+        );
+    }
+
+    /// The full round trip with a program that takes the screen and gives it
+    /// back, byte for byte the way ConPTY sends it: the session it covered is
+    /// still there, in order, above the rows the child was given.
+    #[test]
+    fn a_full_screen_program_leaves_the_session_where_it_was() {
+        let mut terminal = Terminal::new((800.0, 496.0), (8.0, 16.0));
+        for row in 1..=28 {
+            terminal.feed(format!("row {row}\r\n").as_bytes());
+        }
+        terminal.feed(b"the prompt\r\n");
+        assert_eq!(terminal.cursor_line(), 29, "the tab is nearly full");
+        terminal.give_screen_below_cursor();
+        assert_eq!(terminal.screen.screen_lines, 15);
+        assert_eq!(terminal.origin(), 16);
+        assert_eq!(
+            row_of(&terminal, "the prompt"),
+            15,
+            "the prompt keeps the row above the child's screen"
+        );
+
+        terminal.feed(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen painting");
+        assert_eq!(
+            terminal.origin(),
+            16,
+            "the alternate screen is the same strip"
+        );
+        assert_eq!(
+            row_of(&terminal, "full screen painting"),
+            16,
+            "the child paints the rows it was given"
+        );
+        assert_eq!(
+            row_of(&terminal, "the prompt"),
+            -1,
+            "the session is on the other buffer while the child paints"
+        );
+
+        // What ConPTY really sends on the way out: the swap inside a chunk, a
+        // window report, then the buffer it swapped to walked row by row.
+        terminal.feed(b"\r\x1b[K\x1b[?25l\x1b[140C\x1b[?1049l");
+        terminal.feed(b"\x1b[23;0;0t");
+        let mut repaint = b"\x1b[H".to_vec();
+        for _ in 0..terminal.screen.screen_lines {
+            repaint.extend(b"\x1b[K\r\n");
+        }
+        repaint.extend(b"\x1b[H\x1b[?25h");
+        terminal.feed(&repaint);
+        assert_eq!(terminal.origin(), 16, "the strip is the child's still");
+
+        terminal.close_job();
+        let shown = terminal.screen_text();
+        for row in 15..=28 {
+            assert!(
+                shown.contains(&format!("row {row}")),
+                "the session lost row {row}:\n{shown}"
+            );
+        }
+        assert!(shown.contains("the prompt"), "no prompt:\n{shown}");
+    }
+
+    /// A session that already fills the tab gives its child a screen of at least
+    /// half the tab and finds the rows by scrolling, so the prompt ends up on
+    /// the row above the child's screen rather than underneath it.
+    #[test]
+    fn a_full_tab_rolls_up_to_make_room_for_a_child() {
+        let mut terminal = Terminal::new((800.0, 480.0), (8.0, 16.0));
+        for row in 1..=29 {
+            terminal.feed(format!("row {row}\r\n").as_bytes());
+        }
+        terminal.feed(b"the prompt\r\n");
+        assert_eq!(terminal.cursor_line(), 29, "the tab is full to the bottom");
+        terminal.give_screen_below_cursor();
+        assert_eq!(terminal.screen.screen_lines, 15);
+        assert_eq!(terminal.origin(), 15);
+        terminal.feed(b"\x1b[2J\x1b[Hchild speaks");
+        let shown = terminal.screen_text();
+        let lines: Vec<&str> = shown.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines.iter().position(|line| *line == "the prompt"),
+            Some(14),
+            "the prompt keeps the row above the child's screen:\n{shown}"
+        );
+        assert_eq!(
+            lines.iter().position(|line| *line == "child speaks"),
+            Some(15),
+            "the child's first row is the one below it:\n{shown}"
+        );
+    }
+
+    /// A program that asks for the alternate screen is given the same rows as
+    /// any other child. Clearing and repainting them on the way in and on the
+    /// way out is exactly what it may do to a screen of its own, and the
+    /// session above them is on rows it was never given.
+    #[test]
+    fn a_full_screen_program_is_given_the_rows_below_the_prompt_too() {
+        let mut terminal = screen(b"the session so far\r\n");
+        terminal.give_screen_below_cursor();
+        terminal.feed(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
+        assert_eq!(
+            terminal.origin(),
             1,
-            "the cursor stays where the session left it"
+            "the alternate screen is the same strip"
+        );
+        assert_eq!(row_of(&terminal, "full screen"), 1);
+
+        // What ConPTY really sends on the way back: the swap, a title pop, then
+        // the buffer it swapped to painted row by row.
+        terminal.feed(b"\r\x1b[K\x1b[?25l\x1b[140C\x1b[?1049l");
+        terminal.feed(b"\x1b[23;0;0t");
+        terminal.feed(b"\x1b[H\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[H\x1b[?25h");
+        assert_eq!(terminal.origin(), 1, "the strip is the child's still");
+        let shown = terminal.screen_text();
+        assert!(
+            shown.contains("the session so far"),
+            "the repaint of the child's buffer wiped the session:\n{shown}"
         );
     }
 
     #[test]
     fn a_child_that_writes_after_giving_the_screen_back_is_heard() {
-        let mut terminal = screen(b"the listing\r\n");
-        terminal.feed_pty(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
-        terminal.feed_pty(b"\x1b[?1049l\x1b[H\x1b[K\r\n");
-        terminal.feed_pty(b"the choice\r\n");
-        let screen = terminal.screen_text();
+        let mut terminal = screen(b"the session so far\r\n");
+        terminal.give_screen_below_cursor();
+        terminal.feed(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
+        terminal.feed(b"\x1b[?1049l\x1b[H\x1b[K\r\n");
+        terminal.feed(b"the choice\r\n");
+        let shown = terminal.screen_text();
         assert!(
-            screen.contains("the choice") && screen.contains("the listing"),
-            "{screen}"
+            shown.contains("the choice") && shown.contains("the session so far"),
+            "{shown}"
         );
     }
 
     #[test]
     fn a_child_that_dies_in_the_alternate_screen_leaves_it_with_the_session() {
-        let mut terminal = screen(b"the listing\r\n");
-        terminal.feed_pty(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
+        let mut terminal = screen(b"the session so far\r\n");
+        terminal.give_screen_below_cursor();
+        terminal.feed(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen");
         terminal.close_job();
+        assert_eq!(terminal.origin(), 0, "the tab is the session's again");
         assert!(
-            terminal.screen_text().contains("the listing"),
+            terminal.screen_text().contains("the session so far"),
             "the session was still behind the screen the child never left"
         );
-    }
-
-    #[test]
-    fn only_the_opening_announcement_reads_as_a_reset() {
-        assert_eq!(announcement(b"\x1b[?9001h\x1b[2J"), Some(8));
-        assert_eq!(announcement(b"\x1b[?25l\x1b[m"), Some(6));
-        assert_eq!(announcement(b"\x1b[H\x1b[2J"), Some(3));
-        assert_eq!(
-            announcement(b"\x1b[1;31mred"),
-            None,
-            "a colour is not a reset"
-        );
-        assert_eq!(
-            announcement(b"\r\nthe child speaks"),
-            None,
-            "a blank line is the child's own"
-        );
-        assert_eq!(announcement(b"spoken"), None);
-        assert_eq!(announcement(b""), None);
-    }
-
-    #[test]
-    fn a_repaint_is_all_the_empty_buffer_ever_adds_up_to() {
-        assert_eq!(repaint(b"\x1b[23;0;0t"), Some(9));
-        assert_eq!(repaint(b"\x1b[H\x1b[K\r\n"), Some(3));
-        assert_eq!(repaint(b"\x1b[31;130H"), Some(9));
-        assert_eq!(repaint(b"\x1b]0;C:\\vim.exe\x07"), Some(15));
-        assert_eq!(repaint(b"\x1b[?1049l"), Some(8));
-        assert_eq!(
-            repaint(b"\x1b[34mcolour"),
-            None,
-            "a colour belongs to the text that follows"
-        );
-        assert_eq!(repaint(b"the choice"), None);
     }
 
     #[test]
@@ -1112,5 +1306,48 @@ mod tests {
             !screen.contains("full screen"),
             "the program stayed: {screen}"
         );
+    }
+    /// The tab is taller than the grid it reads: the rows above a child's
+    /// screen belong to the session. So the view has to stop `origin` lines
+    /// before alacritty's own clamp, or the top of the tab starts asking the
+    /// grid for lines that never existed and draws blanks over real content.
+    #[test]
+    fn scrolling_up_stops_where_the_history_runs_out() {
+        let mut terminal = Terminal::new((800.0, 496.0), (8.0, 16.0));
+        for row in 1..=28 {
+            terminal.feed(format!("row {row}\r\n").as_bytes());
+        }
+        terminal.feed(b"the prompt\r\n");
+        terminal.give_screen_below_cursor();
+        assert_eq!(
+            terminal.origin(),
+            16,
+            "the tab shows 16 rows above the child"
+        );
+        terminal.feed(b"child painting\r\n");
+
+        let top = terminal.topmost_line();
+        assert!(top < 0, "the rows the band pushed out are history");
+
+        for _ in 0..40 {
+            terminal.scroll_by(-3);
+        }
+        assert_eq!(
+            terminal.first_line(),
+            top,
+            "the tab's top row sits on the first line the grid has"
+        );
+        assert!(
+            !terminal.row_text(terminal.first_line()).trim().is_empty(),
+            "and that row is content, not a blank: {:?}",
+            terminal.row_text(terminal.first_line())
+        );
+
+        // Coming back down has to reach the live bottom, clamp or no clamp.
+        for _ in 0..40 {
+            terminal.scroll_by(3);
+        }
+        assert_eq!(terminal.display_offset(), 0);
+        assert!(!terminal.scrolled());
     }
 }

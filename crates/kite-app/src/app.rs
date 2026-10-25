@@ -8,7 +8,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowButtons, WindowLevel};
 
 use crate::fonts::Fonts;
@@ -19,6 +19,8 @@ use crate::ui::{Focus, Mode, Ui};
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Only used while the band under the status bar still has motion to draw.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// Only used while a background worker owes the screen an answer, so the wait
 /// loop wakes for its reply instead of sleeping through it.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -262,6 +264,14 @@ impl App {
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
 
+        if ui.visualizer_live() || ui.sparks_live() {
+            ui.visualizer_tick();
+            ui.sparks_tick();
+            window.request_redraw();
+            let at = now + FRAME_INTERVAL;
+            deadline = Some(deadline.map_or(at, |value| value.min(at)));
+        }
+
         match deadline {
             Some(deadline) => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -422,7 +432,12 @@ impl App {
             }
         }
 
-        match (ui.focus, ui.mode) {
+        // A child that holds the pseudo console owns the keyboard, mode
+        // included: while it runs there is no Normal mode to fall back into, or
+        // the keys it is waiting for — Ctrl+C above all — would be kite's to
+        // ignore instead of the child's to answer.
+        let owned = matches!(ui.active_shell(), Some(shell) if shell.is_running());
+        match (ui.focus, if owned { Mode::Insert } else { ui.mode }) {
             (Focus::Sidebar, _) => {
                 if repeat {
                     return;
@@ -834,8 +849,46 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let is_command = event.state == ElementState::Pressed;
+                // A delete eats the glyph beside the caret, so its ink has to be
+                // read before the key lands; the powder then leaves from where
+                // the caret comes to rest.
+                let eaten = if is_command {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Backspace) => Some(true),
+                        Key::Named(NamedKey::Delete) => Some(false),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                // The band reads every keystroke, a held one included. The powder
+                // reads only the keys that move text on or off the line, and an
+                // auto-repeat arrives with its `text` still attached, so one
+                // check covers a fresh press and a held one alike.
+                let typed = eaten.is_none()
+                    && event
+                        .text
+                        .as_ref()
+                        .and_then(|text| text.chars().next())
+                        .is_some_and(|ch| !ch.is_control());
+                if is_command {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        if let Some(ui) = self.ui.as_mut() {
+                            ui.visualizer_beat(code);
+                        }
+                    }
+                }
+                let ink = eaten.and_then(|left| self.ui.as_ref().and_then(|ui| ui.caret_ink(left)));
                 self.handle_key(event_loop, event);
                 if is_command {
+                    if typed {
+                        if let Some(ui) = self.ui.as_mut() {
+                            ui.spark_at_caret();
+                        }
+                    }
+                    if let (Some(ink), Some(ui)) = (ink, self.ui.as_mut()) {
+                        ui.spark_delete(ink);
+                    }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
@@ -844,6 +897,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.handle_ime_commit(text);
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.spark_at_caret();
+                }
                 return;
             }
             WindowEvent::Ime(_) => return,
@@ -970,6 +1026,9 @@ fn terminal_key(key: &Key, text: Option<&str>) -> Option<TerminalKey> {
             NamedKey::Backspace => Some(TerminalKey::Backspace),
             NamedKey::Delete => Some(TerminalKey::Delete),
             NamedKey::Tab => Some(TerminalKey::Tab),
+            // The spacebar is a named key with a " " as its text; without this
+            // it would fall through to `None` and never reach the child.
+            NamedKey::Space => Some(TerminalKey::Text(" ".to_string())),
             NamedKey::Escape => Some(TerminalKey::Escape),
             NamedKey::ArrowUp => Some(TerminalKey::Up),
             NamedKey::ArrowDown => Some(TerminalKey::Down),
@@ -1065,16 +1124,20 @@ fn handle_insert_key(
                     changed = true;
                 }
                 "c" | "C" => {
-                    if let Some(text) = selection_text(ui) {
+                    // While a child holds the screen, Ctrl+C is its key rather
+                    // than a copy chord: a leftover selection must never be able
+                    // to swallow the one way out of a running program.
+                    let running = matches!(ui.active_shell(), Some(shell) if shell.is_running());
+                    if running {
+                        if let Some(shell) = ui.active_shell_mut() {
+                            shell.interrupt();
+                            changed = true;
+                        }
+                    } else if let Some(text) = selection_text(ui) {
                         if clipboard_copy(clipboard, text) {
                             ui.message = Some("copied".to_string());
                         } else {
                             ui.message = Some("!clipboard unavailable".to_string());
-                        }
-                    } else if let Some(shell) = ui.active_shell_mut() {
-                        if shell.is_running() {
-                            shell.interrupt();
-                            changed = true;
                         }
                     }
                 }

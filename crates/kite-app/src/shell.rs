@@ -4,15 +4,14 @@ use std::process::{Command, Stdio};
 
 use alacritty_terminal::index::{Column, Line, Point};
 use glyphon::FontSystem;
-use glyphon::cosmic_text::{
-    AttrsList, Buffer, BufferLine, Color, Cursor, Metrics, Shaping, Weight, Wrap,
-};
+use glyphon::cosmic_text::{AttrsList, Buffer, BufferLine, Color, Metrics, Shaping, Weight, Wrap};
 use kite_core::display_path;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 use crate::banner;
 use crate::terminal::{MouseReport, Run, Terminal};
-use crate::text::{attrs, byte_to_char, char_to_byte, make_label, measure};
+use crate::text::{bold_attrs, byte_to_char, char_to_byte, make_label, measure};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,21 +52,21 @@ impl Prompt {
 
     fn paint(&self, list: &mut AttrsList, family: &'static str) {
         let Some(prompt) = theme::prompt() else {
-            list.add_span(0..self.len(), &attrs(family, theme::text_dim()));
+            list.add_span(0..self.len(), &bold_attrs(family, theme::text_dim()));
             return;
         };
         if !self.identity.is_empty() {
-            list.add_span(self.identity.clone(), &attrs(family, theme::accent()));
+            list.add_span(self.identity.clone(), &bold_attrs(family, theme::accent()));
         }
-        list.add_span(self.path.clone(), &attrs(family, prompt.path));
+        list.add_span(self.path.clone(), &bold_attrs(family, prompt.path));
         if !self.git.is_empty() {
-            list.add_span(self.git.clone(), &attrs(family, theme::accent()));
+            list.add_span(self.git.clone(), &bold_attrs(family, theme::accent()));
             list.add_span(
                 self.branch.clone(),
-                &attrs(family, theme::text()).weight(Weight::BOLD),
+                &bold_attrs(family, theme::text()).weight(Weight::BOLD),
             );
         }
-        list.add_span(self.arrow.clone(), &attrs(family, prompt.arrow));
+        list.add_span(self.arrow.clone(), &bold_attrs(family, prompt.arrow));
     }
 }
 
@@ -130,10 +129,21 @@ pub struct Shell {
     pub input_cursor: usize,
     pub input_selection: Option<(usize, usize)>,
     pub buffer: Buffer,
-    /// Which row of the view holds the input line. It is the bottom row while
-    /// the session runs normally, but a full screen program can hand the
-    /// cursor back somewhere higher up.
+    /// Which row of the view holds the first row of the input line. It is the
+    /// bottom row while the session runs normally, but a full screen program can
+    /// hand the cursor back somewhere higher up.
     input_row: usize,
+    /// How the grid broke the input line over its rows: `input_rows[i]` is how
+    /// many characters of the line sit on row `i`. One entry means the line
+    /// fits on a row; more means it wrapped.
+    input_rows: Vec<usize>,
+    /// Which of those rows the caret is standing on.
+    input_caret_row: usize,
+    /// How many grid rows the startup banner took — more than its own line
+    /// count once a narrow window wraps it. It is furniture, not session text,
+    /// so no selection may cover it, and the grid is a ring, so the rows are
+    /// counted from the first one ever written rather than by grid line.
+    banner_rows: i32,
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -142,6 +152,9 @@ pub struct Shell {
     family: &'static str,
     font_size: f32,
     line_height: f32,
+    /// Tracking, in em, that stretches a wide glyph from its own advance to the
+    /// two cells the grid gave it.
+    wide_tracking: f32,
     view_width: f32,
     view_height: f32,
     prompt: Prompt,
@@ -181,6 +194,7 @@ impl Shell {
         let prompt = build_prompt(&cwd, branch.as_deref(), &identity);
         let line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
         let cell = cell_width(font_system, family, font_size);
+        let wide_tracking = wide_tracking(font_system, family, font_size, cell);
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
         let mut shell = Self {
             cwd,
@@ -189,6 +203,9 @@ impl Shell {
             input_selection: None,
             buffer,
             input_row: 0,
+            input_rows: vec![0],
+            input_caret_row: 0,
+            banner_rows: 0,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -199,16 +216,21 @@ impl Shell {
             family,
             font_size,
             line_height,
+            wide_tracking,
             view_width: view_width.max(1.0),
             view_height: view_height.max(1.0),
             prompt,
             branch,
             identity,
         };
-        for line in banner::lines() {
+        let lines = banner::lines();
+        for line in &lines {
             let cells = colored(&line.text, &line.spans);
             shell.write_cells(&cells, true);
         }
+        // Where the banner left the cursor: everything above it, plus the rows
+        // already pushed into history, is banner.
+        shell.banner_rows = shell.terminal.history() + shell.terminal.cursor_row() as i32;
         shell.emit_input();
         shell.rebuild_buffer(font_system);
         shell
@@ -235,6 +257,7 @@ impl Shell {
         self.font_size = font_size;
         self.line_height = (font_size * theme::LINE_HEIGHT_RATIO).ceil();
         let cell = cell_width(font_system, self.family, font_size);
+        self.wide_tracking = wide_tracking(font_system, self.family, font_size, cell);
         self.terminal.resize(
             (self.view_width, self.view_height),
             (cell, self.line_height),
@@ -375,10 +398,13 @@ impl Shell {
         self.refresh_prompt(font_system);
         let rows = self.terminal.rows() as i32;
         let last_column = self.terminal.columns().saturating_sub(1);
-        let top = Line(self.terminal.top_line() - self.terminal.history());
+        let first = self.terminal.first_line();
+        // Everything above the banner's last line is the banner, so the whole
+        // session starts below it.
+        let oldest = first.max(self.banner_rows - self.terminal.history());
         self.terminal.select(
-            Point::new(top, Column(0)),
-            Point::new(Line(rows - 1), Column(last_column)),
+            Point::new(Line(oldest), Column(0)),
+            Point::new(Line(first + rows - 1), Column(last_column)),
         );
     }
 
@@ -398,34 +424,105 @@ impl Shell {
         Some(chars[start..end].iter().collect())
     }
 
-    /// The grid cell under a point of the shell's panel. Rows above the
-    /// viewport are scrollback, so the line can be negative.
-    pub fn position_at(&self, x: f32, y: f32) -> Option<GridPos> {
+    /// The characters of the input line a grid selection stands on. The rows
+    /// above the line are text a command printed: they can be copied, but there
+    /// is nothing in them to change, so a selection that reaches them still
+    /// names the part of the line it covers.
+    fn input_part_of_grid_selection(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.terminal.selection()?;
+        if start == end {
+            return None;
+        }
+        let top = self.input_row as i32;
+        let bottom = top + self.input_rows.len() as i32 - 1;
+        if end.line.0 < top || start.line.0 > bottom {
+            return None;
+        }
+        let prompt = self.input_line_chars();
+        let chars: Vec<char> = self.prompt_line().0.chars().collect();
+        let last = self.input.chars().count();
+        let index = |point: Point| {
+            let row = (point.line.0 - top).clamp(0, self.input_rows.len() as i32 - 1) as usize;
+            locate(&self.input_rows, &chars, row, point.column.0)
+                .saturating_sub(prompt)
+                .min(last)
+        };
+        let from = if start.line.0 < top { 0 } else { index(start) };
+        let to = if end.line.0 > bottom { last } else { index(end) };
+        (from < to).then_some((from, to))
+    }
+
+    /// What an edit has to remove: the caret's own selection, or the part of a
+    /// grid selection that stands on the input line.
+    fn editable_selection(&self) -> Option<(usize, usize)> {
+        if let Some((start, end)) = self.input_selection {
+            return Some(if start <= end { (start, end) } else { (end, start) });
+        }
+        self.input_part_of_grid_selection()
+    }
+
+    /// The grid line and column under a point of the shell's panel. The column
+    /// runs past the last one when the point sits on the cell a line would wrap
+    /// after, which is where the caret of a full row stands.
+    fn point_at(&self, x: f32, y: f32) -> Option<(i32, usize)> {
         let (cell, height) = self.terminal.cell();
         let row = (y / height.max(f32::EPSILON)).floor() as i32;
         if row < 0 || row >= self.terminal.rows() as i32 {
             return None;
         }
-        let column = (x / cell.max(f32::EPSILON)).floor() as usize;
+        let column = (x / cell.max(f32::EPSILON)).floor().max(0.0) as usize;
+        Some((self.terminal.first_line() + row, column))
+    }
+
+    /// The grid cell under a point of the shell's panel. Rows above the
+    /// viewport are scrollback, so the line can be negative.
+    pub fn position_at(&self, x: f32, y: f32) -> Option<GridPos> {
+        let (line, column) = self.point_at(x, y)?;
         Some(GridPos {
-            line: self.terminal.top_line() + row,
+            line,
             column: column.min(self.terminal.columns().saturating_sub(1)),
         })
     }
 
-    /// Which character of the input line a point sits on, if it sits on it.
-    fn input_position(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<usize> {
+    /// Which character of the input line a point sits on, if it sits on it. The
+    /// line is rows of the grid like any other text, so the cell under the
+    /// point is the whole answer: the row picks the slice of the line and the
+    /// column counts across it. Nothing here goes near the font, because the
+    /// grid draws a cell at its own width whether or not that is what the
+    /// shaped glyph actually measured.
+    fn input_position(&self, x: f32, y: f32) -> Option<usize> {
         if self.owns_screen() {
             return None;
         }
-        self.buffer.shape_until_scroll(font_system, true);
-        let row = self.input_row;
-        let cursor = self.buffer.hit(x, y)?;
-        if cursor.line != row {
+        let (line, column) = self.point_at(x, y)?;
+        let row = usize::try_from(line - self.input_row as i32).ok()?;
+        if row >= self.input_rows.len() {
             return None;
         }
-        let text = self.buffer.lines.get(row)?.text();
-        Some(byte_to_char(text, cursor.index).saturating_sub(self.input_line_chars()))
+        let chars: Vec<char> = self.prompt_line().0.chars().collect();
+        let prompt = self.input_line_chars();
+        Some(locate(&self.input_rows, &chars, row, column).saturating_sub(prompt))
+    }
+
+    /// Whether a grid line is still the banner: the grid is a ring, so a line
+    /// only knows where it sits in the session once the scrolled-off rows are
+    /// added back.
+    fn is_banner(&self, line: i32) -> bool {
+        line + self.terminal.history() < self.banner_rows
+    }
+
+    /// A point pulled out of the banner. The banner is furniture, so a drag
+    /// that reaches it stops at the first line of session text below rather than
+    /// selecting the art.
+    fn selectable(&self, point: GridPos) -> GridPos {
+        if self.is_banner(point.line) {
+            GridPos {
+                line: self.banner_rows - self.terminal.history(),
+                column: 0,
+            }
+        } else {
+            point
+        }
     }
 
     pub fn mouse_press(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<GridPos> {
@@ -434,10 +531,14 @@ impl Shell {
             self.terminal.send_mouse(position.report(false, false));
             return None;
         }
-        if let Some(ch) = self.input_position(font_system, x, y) {
+        if let Some(ch) = self.input_position(x, y) {
             self.input_cursor = ch.min(self.input.chars().count());
             self.input_selection = None;
             self.refresh_prompt(font_system);
+        }
+        if self.is_banner(position.line) {
+            self.terminal.clear_selection();
+            return None;
         }
         self.terminal.select(position.point(), position.point());
         Some(position)
@@ -449,6 +550,7 @@ impl Shell {
             return;
         }
         self.input_selection = None;
+        let cursor = self.selectable(cursor);
         self.terminal.select(anchor.point(), cursor.point());
     }
 
@@ -469,19 +571,18 @@ impl Shell {
     }
 
     pub fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.input_selection else {
+        // An edit ends the highlight whether or not it named anything editable:
+        // a selection left standing over text that just changed would be a lie.
+        let selection = self.editable_selection();
+        self.input_selection = None;
+        self.terminal.clear_selection();
+        let Some((start, end)) = selection else {
             return false;
-        };
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
         };
         let from = char_to_byte(&self.input, start);
         let to = char_to_byte(&self.input, end);
         self.input.replace_range(from..to, "");
         self.input_cursor = start;
-        self.input_selection = None;
         true
     }
 
@@ -534,6 +635,7 @@ impl Shell {
 
         let trimmed = command.trim();
         if trimmed.is_empty() {
+            self.take_back_the_row();
             self.rebuild_buffer(font_system);
             return None;
         }
@@ -543,6 +645,7 @@ impl Shell {
 
         let args = split_args(trimmed);
         if args.is_empty() {
+            self.take_back_the_row();
             self.rebuild_buffer(font_system);
             return None;
         }
@@ -550,6 +653,7 @@ impl Shell {
         if !self.run_builtin(&args, &mut effect) {
             self.spawn_external(&args);
         }
+        self.take_back_the_row();
         self.rebuild_buffer(font_system);
         effect
     }
@@ -588,7 +692,11 @@ impl Shell {
     }
 
     /// Ctrl+C belongs to the console, not to kite: the byte goes into the pty
-    /// and the child's own line discipline answers for it.
+    /// and the child's own line discipline answers for it. That is all a pseudo
+    /// console lets a terminal do from outside — `^C` reaches a program waiting
+    /// at a keyboard, and a program that never reads input sits out the byte in
+    /// its input queue. ConPTY turns neither the byte nor an attached
+    /// `GenerateConsoleCtrlEvent` into the signal a real console would send.
     pub fn interrupt(&mut self) -> bool {
         if !self.terminal.running() {
             return false;
@@ -635,28 +743,41 @@ impl Shell {
         self.rebuild_buffer(font_system);
     }
 
+    /// Which row of the buffer the input line is drawn on. The input line is a
+    /// grid line like any other, so scrolling down into the session pushes it
+    /// off the bottom of the tab: past the last row there is no caret to draw,
+    /// no selection to paint, and no row for a click to land on.
+    fn input_row_in_view(&self) -> usize {
+        self.input_row + self.terminal.display_offset() as usize
+    }
+
+    /// Where the caret is on the screen. The grid's own cursor is the caret
+    /// whether a child holds the screen or the line editor does, because
+    /// `emit_input` walks it to the caret as it writes the line.
     pub fn cursor_rect(&self) -> Option<(f32, f32, f32)> {
-        if self.owns_screen() {
-            let (column, line) = self.terminal.cursor()?;
-            let row = line - self.terminal.top_line();
-            if row < 0 || row >= self.terminal.rows() as i32 {
-                return None;
-            }
-            let (cell, height) = self.terminal.cell();
-            return Some((column as f32 * cell, row as f32 * height, height));
+        let (column, line) = self.terminal.cursor()?;
+        let row = line - self.terminal.first_line();
+        if row < 0 || row >= self.terminal.rows() as i32 {
+            return None;
         }
-        let line = self.input_row;
-        let byte = self.input_line_bytes() + char_to_byte(&self.input, self.input_cursor);
-        let cursor = Cursor::new(line, byte);
-        for run in self.buffer.layout_runs() {
-            if run.line_i != line {
-                continue;
-            }
-            if let Some(x) = run.cursor_position(&cursor) {
-                return Some((x, run.line_top, run.line_height));
-            }
+        let (cell, height) = self.terminal.cell();
+        Some((column as f32 * cell, row as f32 * height, height))
+    }
+
+    /// The ink of the glyph beside the caret: `left` picks the one the caret
+    /// stands to the right of, which is what typing just wrote and what
+    /// Backspace is about to eat. Nothing when that cell holds no glyph.
+    pub fn glyph_ink(&self, left: bool) -> Option<Color> {
+        let (column, line) = self.terminal.cursor()?;
+        let column = if left { column.checked_sub(1)? } else { column };
+        if !self.terminal.glyph_at(line, column) {
+            return None;
         }
-        None
+        Some(
+            self.terminal
+                .cell_color(line, column)
+                .unwrap_or(theme::text()),
+        )
     }
 
     /// Highlighted rectangles, in panel coordinates. The grid is a fixed cell
@@ -667,7 +788,7 @@ impl Shell {
             if start == end {
                 return Vec::new();
             }
-            let top = self.terminal.top_line();
+            let top = self.terminal.first_line();
             let bottom = top + self.terminal.rows() as i32 - 1;
             let last_column = self.terminal.columns();
             let mut spans = Vec::new();
@@ -694,35 +815,42 @@ impl Shell {
             return spans;
         }
 
-        let Some((start, end)) = self.input_selection else {
+        let Some((from, to)) = self.input_selection else {
             return Vec::new();
         };
-        let line = self.input_row;
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let start_byte = self.input_line_bytes() + char_to_byte(&self.input, start);
-        let end_byte = self.input_line_bytes() + char_to_byte(&self.input, end);
-        let start_cursor = Cursor::new(line, start_byte);
-        let end_cursor = Cursor::new(line, end_byte);
+        let (from, to) = if from <= to { (from, to) } else { (to, from) };
+        // The selection is counted in characters of the input, but the line it
+        // highlights may lie over several rows and every row of it is its own
+        // grid row, so both ends have to be placed on the line first.
+        let prompt = self.input_line_chars();
+        let chars: Vec<char> = self.prompt_line().0.chars().collect();
+        let columns = self.terminal.columns();
+        let (row_from, col_from) = place(&self.input_rows, &chars, columns, prompt + from);
+        let (row_to, col_to) = place(&self.input_rows, &chars, columns, prompt + to);
+        let top = self.input_row_in_view();
         let mut spans = Vec::new();
-        for run in self.buffer.layout_runs() {
-            if run.line_i != line {
-                continue;
-            }
-            for (x, width) in run.highlight(start_cursor, end_cursor) {
-                spans.push((x, run.line_top, width, run.line_height));
+        for row in row_from..=row_to {
+            let start = if row == row_from { col_from } else { 0 };
+            let end = if row == row_to { col_to } else { columns };
+            if end > start {
+                spans.push((
+                    start as f32 * cell,
+                    (top + row) as f32 * height,
+                    (end - start) as f32 * cell,
+                    height,
+                ));
             }
         }
         spans
     }
 
-    /// Where the caret is on the screen, in rows and columns.
+    /// Where the caret is on the screen, in rows and columns. Scrolled back
+    /// into the session, the caret is still on its own row.
     pub fn cursor_line_column(&self) -> (usize, usize) {
-        let (column, row) = self.terminal.cursor_point();
-        (row + 1, column + 1)
+        (
+            self.terminal.cursor_row() + 1,
+            self.terminal.cursor_column() + 1,
+        )
     }
 
     fn refresh_prompt(&mut self, font_system: &mut FontSystem) {
@@ -743,8 +871,8 @@ impl Shell {
         buffer.set_wrap(Wrap::None);
         buffer.set_tab_width(4);
         buffer.set_size(Some(self.view_width), Some(self.view_height));
-        let base = attrs(self.family, theme::text());
-        let top = self.terminal.top_line();
+        let base = bold_attrs(self.family, theme::text());
+        let top = self.terminal.first_line();
         for row in 0..self.terminal.rows() as i32 {
             let mut text = String::new();
             let mut list = AttrsList::new(&base);
@@ -754,23 +882,23 @@ impl Shell {
                 bold,
             } in self.terminal.runs(top + row)
             {
-                let start = char_to_byte(&text, text.chars().count());
-                text.push_str(&run);
-                let end = char_to_byte(&text, text.chars().count());
                 let attrs = match color {
-                    Some(color) => attrs(self.family, color),
-                    None => attrs(self.family, theme::text()),
+                    Some(color) => bold_attrs(self.family, color),
+                    None => bold_attrs(self.family, theme::text()),
                 };
-                let styled;
-                list.add_span(
-                    start..end,
-                    if bold {
-                        styled = attrs.weight(Weight::BOLD);
-                        &styled
-                    } else {
-                        &attrs
-                    },
-                );
+                let bolded;
+                let plain = if bold {
+                    bolded = attrs.weight(Weight::BOLD);
+                    &bolded
+                } else {
+                    &attrs
+                };
+                let spaced = plain.clone().letter_spacing(self.wide_tracking);
+                for (range, wide) in stretches(&run) {
+                    let start = text.len();
+                    text.push_str(&run[range]);
+                    list.add_span(start..text.len(), if wide { &spaced } else { plain });
+                }
             }
             buffer.lines.push(BufferLine::new(
                 text,
@@ -787,6 +915,18 @@ impl Shell {
     /// draws no prompt line and edits no input line underneath it.
     fn owns_screen(&self) -> bool {
         self.terminal.running()
+    }
+
+    /// The input line belongs to the row the cursor stands on. A built-in that
+    /// printed nothing leaves the cursor on the row below the command, so the
+    /// prompt is picked up and carried down with it — the way a shell prints
+    /// another prompt rather than leaving the caret inside the last command. A
+    /// child that was given a screen keeps it, and the prompt waits for the
+    /// screen to come back.
+    fn take_back_the_row(&mut self) {
+        if !self.owns_screen() {
+            self.emit_input();
+        }
     }
 
     fn input_line_bytes(&self) -> usize {
@@ -812,7 +952,7 @@ impl Shell {
         } else {
             format!("{}{}", self.prompt.text, self.input)
         };
-        let base = attrs(
+        let base = bold_attrs(
             self.family,
             theme::prompt().map_or(theme::text(), |prompt| prompt.input),
         );
@@ -842,33 +982,60 @@ impl Shell {
     /// Enter closes the input row. What the user typed is already on screen,
     /// prompt and syntax colours and all, so the echo needs no second copy.
     fn push_echo(&mut self, _prompt: Prompt, _command: &str) {
-        self.terminal.feed(b"\x1b[999C\r\n");
+        let last = self.input_rows.len().saturating_sub(1);
+        let mut bytes: Vec<u8> = Vec::new();
+        if last > self.input_caret_row {
+            bytes.extend(format!("\x1b[{}B", last - self.input_caret_row).into_bytes());
+        }
+        bytes.extend(b"\x1b[999C\r\n");
+        self.terminal.feed(&bytes);
     }
 
-    /// Take the input line off the screen. Only its own row: whatever sits
+    /// Take the input line off the screen. Its own rows only: whatever sits
     /// below belongs to the session, and a full screen program can hand the
     /// cursor back with the session still underneath it.
     fn erase_input(&mut self) {
-        self.terminal.feed(b"\r\x1b[K");
+        let rows = self.input_rows.len().max(1);
+        let mut bytes: Vec<u8> = Vec::new();
+        if self.input_caret_row > 0 {
+            bytes.extend(format!("\x1b[{}A", self.input_caret_row).into_bytes());
+        }
+        bytes.extend(b"\r\x1b[K");
+        for _ in 1..rows {
+            bytes.extend(b"\x1b[1B\r\x1b[K");
+        }
+        if rows > 1 {
+            bytes.extend(format!("\x1b[{}A", rows - 1).into_bytes());
+        }
+        self.terminal.feed(&bytes);
+        self.input_rows = vec![0];
+        self.input_caret_row = 0;
     }
 
-    /// The prompt and what has been typed, on the current row, with the caret
-    /// left where the line editor says it is. A command longer than the row
-    /// scrolls to the left instead of wrapping, so the row stays one row.
+    /// The prompt and what has been typed, from the current row down, with the
+    /// caret left where the line editor says it is. A line longer than the
+    /// width wraps over the rows below, as it does in every other terminal: the
+    /// grid does the wrapping, and the layout worked out beforehand says which
+    /// row of the line the caret ended up on and how far along it is.
     fn emit_input(&mut self) {
         let (text, list) = self.prompt_line();
-        let mut cells = cells_of(&text, &list);
-        let columns = self.terminal.columns().max(2);
-        let caret = (self.input_line_chars() + self.input_cursor).min(cells.len());
-        let hidden = caret.saturating_sub(columns - 2);
-        let shown: Vec<Cell> = cells.drain(hidden..).take(columns - 1).collect();
-        let tail = shown.len().saturating_sub(caret - hidden);
-        self.terminal.feed(b"\r\x1b[K");
-        self.write_cells(&shown, false);
-        if tail > 0 {
-            self.terminal.feed(format!("\x1b[{tail}D").as_bytes());
+        let cells = cells_of(&text, &list);
+        let chars: Vec<char> = cells.iter().map(|cell| cell.0).collect();
+        let rows = row_lengths(&chars, self.terminal.columns());
+        let caret = (self.input_line_chars() + self.input_cursor).min(chars.len());
+        let (row, column) = place(&rows, &chars, self.terminal.columns(), caret);
+        self.erase_input();
+        self.write_cells(&cells, false);
+        let mut bytes: Vec<u8> = Vec::new();
+        let below = rows.len() - 1 - row;
+        if below > 0 {
+            bytes.extend(format!("\x1b[{below}A").into_bytes());
         }
-        self.input_row = (self.terminal.cursor_line() - self.terminal.top_line()).max(0) as usize;
+        bytes.extend(format!("\x1b[{}G", column + 1).into_bytes());
+        self.terminal.feed(&bytes);
+        self.input_row = (self.terminal.cursor_row() as i32 - row as i32).max(0) as usize;
+        self.input_rows = rows;
+        self.input_caret_row = row;
     }
 
     /// Cells out as SGR runs. `newline` ends the row, which is what makes the
@@ -924,7 +1091,17 @@ impl Shell {
             "clear" | "cls" => {
                 // The same two sequences a shell's Clear-Host sends: wipe the
                 // view, then the scrollback it scrolled into.
-                self.terminal.feed(b"\x1b[2J\x1b[3J\x1b[H");
+                // The banner is furniture, so clearing starts below it and the
+                // cursor goes back there. Once it has scrolled up out of the
+                // screen there is no furniture left to spare, and the wipe is
+                // the whole one a shell's Clear-Host sends.
+                let edge = self.banner_rows - self.terminal.history();
+                if edge > 0 && edge < self.terminal.rows() as i32 {
+                    self.terminal
+                        .feed(format!("\x1b[{};1H\x1b[J", edge + 1).as_bytes());
+                } else {
+                    self.terminal.feed(b"\x1b[2J\x1b[3J\x1b[H");
+                }
                 self.emit_input();
                 true
             }
@@ -1146,6 +1323,73 @@ fn sgr(color: Color, bold: bool) -> Vec<u8> {
     }
 }
 
+/// The columns a character takes in the grid. The grid measures with the same
+/// table, so the input line's own layout cannot disagree with it.
+fn columns_of(ch: char) -> usize {
+    ch.width().unwrap_or(0)
+}
+
+/// How the grid will break the input line's characters over its rows: the
+/// number of characters on each row. A wide glyph that no longer fits in the
+/// last column moves down whole, which is what leaves a row short.
+fn row_lengths(chars: &[char], columns: usize) -> Vec<usize> {
+    let columns = columns.max(1);
+    let mut rows = vec![0usize];
+    let mut used = 0usize;
+    for ch in chars {
+        let width = columns_of(*ch);
+        if used + width > columns {
+            rows.push(0);
+            used = 0;
+        }
+        if let Some(last) = rows.last_mut() {
+            *last += 1;
+        }
+        used += width;
+    }
+    rows
+}
+
+/// Which row of the wrapped line a character index stands on, and how many
+/// columns along it. A row that is exactly full has no cell left for the
+/// caret, so the point at its end belongs to the next row, at its start.
+fn place(rows: &[usize], chars: &[char], columns: usize, index: usize) -> (usize, usize) {
+    let index = index.min(chars.len());
+    let mut start = 0usize;
+    for (row, length) in rows.iter().enumerate() {
+        let end = start + length;
+        let full = width_of(&chars[start..end]) >= columns;
+        if index < end || index == end && (!full || row + 1 == rows.len()) {
+            return (row, width_of(&chars[start..index]));
+        }
+        start = end;
+    }
+    (rows.len() - 1, width_of(&chars[start..]))
+}
+
+fn width_of(chars: &[char]) -> usize {
+    chars.iter().map(|ch| columns_of(*ch)).sum()
+}
+
+/// Which character of the wrapped line a column of one of its rows stands on.
+/// A wide glyph owns two columns, and which half of it the point is on decides
+/// whether the caret goes before or after it.
+fn locate(rows: &[usize], chars: &[char], row: usize, column: usize) -> usize {
+    let start: usize = rows[..row].iter().sum();
+    let end = (start + rows[row]).min(chars.len());
+    let mut used = 0usize;
+    let mut index = start;
+    while index < end {
+        let width = columns_of(chars[index]).max(1);
+        if column < used + (width + 1) / 2 {
+            break;
+        }
+        used += width;
+        index += 1;
+    }
+    index
+}
+
 /// Flatten a styled line into one entry per character, so the row can be
 /// clipped to the grid without splitting a span's bookkeeping.
 fn cells_of(text: &str, list: &AttrsList) -> Vec<Cell> {
@@ -1177,12 +1421,52 @@ fn cell_width(font_system: &mut FontSystem, family: &'static str, font_size: f32
     const SAMPLES: usize = 32;
     let probe = make_label(
         font_system,
-        &attrs(family, theme::text()),
+        &bold_attrs(family, theme::text()),
         font_size,
         &"0".repeat(SAMPLES),
     );
     let (width, _) = measure(&probe);
     (width / SAMPLES as f32).max(1.0)
+}
+
+/// The tracking, in em, that fills a wide glyph out to the two cells the grid
+/// gave it. The body font has no CJK, so those glyphs come from a fallback that
+/// draws them one em wide while a cell is only six tenths of one: without this
+/// the text runs out from under the caret, the selection and the click by two
+/// thirds of a cell for every wide character.
+fn wide_tracking(
+    font_system: &mut FontSystem,
+    family: &'static str,
+    font_size: f32,
+    cell: f32,
+) -> f32 {
+    const SAMPLES: usize = 32;
+    let probe = make_label(
+        font_system,
+        &bold_attrs(family, theme::text()),
+        font_size,
+        &"清".repeat(SAMPLES),
+    );
+    let (width, _) = measure(&probe);
+    let advance = width / SAMPLES as f32;
+    ((2.0 * cell - advance) / font_size).max(0.0)
+}
+
+/// Split a run of text into stretches of narrow and wide characters, because
+/// only the wide ones need the tracking. Zero width characters — the combining
+/// marks a grid merges into the cell before them — stay with the narrow ones,
+/// where the cluster they belong to is shaped.
+fn stretches(run: &str) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut out: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    for (index, ch) in run.char_indices() {
+        let end = index + ch.len_utf8();
+        let wide = columns_of(ch) == 2;
+        match out.last_mut() {
+            Some((range, class)) if *class == wide => range.end = end,
+            _ => out.push((index..end, wide)),
+        }
+    }
+    out
 }
 
 fn list_directory(path: &Path) -> std::io::Result<Vec<String>> {
@@ -1337,7 +1621,7 @@ fn add_syntax_spans(list: &mut AttrsList, family: &'static str, text: &str, offs
         };
         list.add_span(
             offset + range.start..offset + range.end,
-            &attrs(family, color),
+            &bold_attrs(family, color),
         );
     }
 }
@@ -1599,6 +1883,136 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_input_line_occupies_exactly_the_rows_the_layout_promised() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        let columns = shell.terminal.columns();
+        // Wide glyphs are the hard case: the grid gives each of them two
+        // columns, so a line counted in characters overflows its row.
+        shell.input = format!("echo {}", "清".repeat(columns));
+        shell.refresh_prompt(&mut fonts.system);
+
+        let rows = shell.input_rows.len();
+        // The guard asks the grid, not the layout: a line the grid never broke
+        // over more than one row would prove nothing either way.
+        let screen = shell.terminal.screen_text();
+        let carried = screen.lines().filter(|line| line.contains('清')).count();
+        assert!(carried > 1, "the line has to wrap to prove anything");
+        assert_eq!(
+            carried, rows,
+            "the grid used {carried} rows but the layout promised {rows}:\n{screen}"
+        );
+
+        // Typing on redraws the whole line; none of its old rows may survive.
+        shell.input.push('x');
+        shell.refresh_prompt(&mut fonts.system);
+        let after = shell.terminal.screen_text();
+        let carried = after.lines().filter(|line| line.contains('清')).count();
+        assert_eq!(
+            carried,
+            shell.input_rows.len(),
+            "the redraw left a row of the old line behind:\n{after}"
+        );
+    }
+
+    #[test]
+    fn the_caret_lands_on_the_row_of_the_line_it_is_on() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        let columns = shell.terminal.columns();
+        shell.input = "y".repeat(columns * 2);
+        shell.input_cursor = shell.input.chars().count();
+        shell.refresh_prompt(&mut fonts.system);
+
+        let top = shell.input_row_in_view() as f32;
+        let (_, height) = shell.terminal.cell();
+        let caret = shell.cursor_rect().expect("a caret to draw");
+        let row = (caret.1 / height).round() as usize;
+        assert!(
+            row > shell.input_row_in_view(),
+            "a line twice as wide as the grid cannot keep its caret on the first row"
+        );
+        let (placed, _) = {
+            let chars: Vec<char> = shell.prompt_line().0.chars().collect();
+            place(
+                &shell.input_rows,
+                &chars,
+                shell.terminal.columns(),
+                chars.len(),
+            )
+        };
+        assert_eq!(
+            row,
+            shell.input_row_in_view() + placed.min(shell.input_rows.len() - 1),
+            "the caret sits on the row the layout says, at {top} rows down"
+        );
+    }
+
+    /// The grid gives a wide character two cells, so the pixels have to fill
+    /// two cells too. Otherwise every wide glyph on the way pulls the text out
+    /// from under the caret, the selection and the click.
+    #[test]
+    fn the_wide_glyphs_on_a_row_really_take_their_two_cells() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        for input in [
+            "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "echo 之偶群殴农村比较陈水扁".to_string(),
+            "之偶群殴农村比较陈水扁之偶群殴农村比较陈水扁".to_string(),
+        ] {
+            shell.input = input.clone();
+            shell.input_cursor = input.chars().count();
+            shell.refresh_prompt(&mut fonts.system);
+            shell.rebuild_buffer(&mut fonts.system);
+            let (cell, _) = shell.terminal.cell();
+            let top = shell.input_row_in_view();
+            let text = shell.buffer.lines[top].text().to_string();
+            let caret_byte = char_to_byte(&text, shell.input_line_chars() + input.chars().count());
+            let shaped = shell
+                .buffer
+                .layout_runs()
+                .filter(|run| run.line_i == top)
+                .flat_map(|run| run.glyphs.iter())
+                .filter(|glyph| glyph.start >= caret_byte)
+                .map(|glyph| glyph.x)
+                .fold(f32::MAX, f32::min);
+            let grid = shell.terminal.cursor_column() as f32 * cell;
+            assert!(
+                (shaped - grid).abs() < 0.5,
+                "{input:?}: the grid put the caret at {grid:.1} but the text ends at {shaped:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_wrapped_line_lands_where_the_caret_was_drawn() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        let columns = shell.terminal.columns();
+        shell.input = "echo ".to_string() + &"清".repeat(columns);
+        let total = shell.input.chars().count();
+        shell.refresh_prompt(&mut fonts.system);
+        assert!(
+            shell.input_rows.len() > 2,
+            "the line has to be long enough to wrap: {:?}",
+            shell.input_rows
+        );
+        let (cell, height) = shell.terminal.cell();
+        for index in 0..total {
+            shell.input_cursor = index;
+            shell.refresh_prompt(&mut fonts.system);
+            let (x, y, _) = shell.cursor_rect().expect("a caret to draw");
+            let got = shell
+                .input_position(x + cell * 0.5, y + height * 0.5)
+                .expect("the click landed on the input line");
+            assert_eq!(
+                got, index,
+                "the caret drawn for {index} was not where it said"
+            );
+        }
+    }
+
+    #[test]
     fn the_pwsh_aliases_reach_the_same_builtins() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut fonts = Fonts::load();
@@ -1756,6 +2170,160 @@ mod tests {
         assert!(screen.contains('>'), "the prompt is still there: {screen}");
     }
 
+    /// cls wipes the session, not the furniture: the banner stays on the screen
+    /// and the prompt comes back on the first row below it.
+    #[test]
+    fn cls_clears_below_the_banner() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        let banner = shell.banner_rows;
+        shell.push_line("some output".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+        shell.input = "cls".to_string();
+        shell.submit(&mut fonts.system);
+        let screen = shell.terminal.screen_text();
+        assert!(
+            !screen.contains("some output"),
+            "cls left the session text behind: {screen}"
+        );
+        assert_eq!(
+            shell.terminal.cursor().map(|(_, line)| line),
+            Some(banner),
+            "the prompt sits on the first row below the banner"
+        );
+        assert!(
+            screen.contains("Hardware"),
+            "the banner survived cls: {screen}"
+        );
+    }
+
+    /// The banner is furniture, not session text, so no selection may cover it.
+    #[test]
+    fn the_banner_stays_out_of_the_selection() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        let (cell, height) = shell.terminal.cell();
+        let banner = shell.banner_rows;
+        assert!(banner > 1, "the banner is a block of rows: {banner}");
+        let on =
+            |row: i32, column: usize| (cell * (column as f32 + 0.5), height * (row as f32 + 0.5));
+
+        let (x, y) = on(banner - 1, 4);
+        assert!(
+            shell.mouse_press(&mut fonts.system, x, y).is_none(),
+            "a press on the banner reported an anchor"
+        );
+        assert!(
+            shell.terminal.selection().is_none(),
+            "a press on the banner began a selection"
+        );
+
+        let (x, y) = on(banner + 1, 0);
+        let anchor = shell
+            .position_at(x, y)
+            .expect("a row below the banner has a point");
+        shell.mouse_press(&mut fonts.system, x, y);
+        let (x, y) = on(0, 0);
+        let cursor = shell.position_at(x, y).expect("the top row has a point");
+        shell.mouse_drag(anchor, cursor);
+        let (start, _) = shell
+            .terminal
+            .selection()
+            .expect("the drag selected something");
+        assert!(
+            start.line.0 >= banner,
+            "the drag reached into the banner: {}",
+            start.line.0
+        );
+
+        shell.select_all(&mut fonts.system);
+        let (start, _) = shell
+            .terminal
+            .selection()
+            .expect("select all selected something");
+        assert_eq!(
+            start.line.0, banner,
+            "select all has to start under the banner"
+        );
+    }
+
+    /// A selection may cover rows that cannot be edited: the session text the
+    /// commands printed. Copying still takes all of it, but an edit reaches the
+    /// input line rather than doing nothing at all.
+    #[test]
+    fn an_edit_over_session_text_changes_the_input_line() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        shell.push_line("some output".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+        shell.insert_text(&mut fonts.system, "ls -la");
+
+        shell.select_all(&mut fonts.system);
+        let copied = shell.selected_text().expect("the selection has text");
+        assert!(
+            copied.contains("some output") && copied.contains("ls -la"),
+            "copy takes the session text and the line together: {copied:?}"
+        );
+
+        shell.insert_text(&mut fonts.system, "x");
+        assert_eq!(shell.input, "x", "typing replaced the editable part");
+        assert!(
+            shell.terminal.selection().is_none(),
+            "the edit ended the highlight"
+        );
+    }
+
+    /// Cutting a mixed selection is a copy of everything and a change to the
+    /// part that can be changed.
+    #[test]
+    fn cutting_a_mixed_selection_clears_the_editable_part() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        shell.push_line("some output".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+        shell.insert_text(&mut fonts.system, "ls -la");
+
+        shell.select_all(&mut fonts.system);
+        let cut = shell.cut_selection(&mut fonts.system).expect("cut text");
+        assert!(
+            cut.contains("some output") && cut.contains("ls -la"),
+            "cut copies what was selected: {cut:?}"
+        );
+        assert_eq!(shell.input, "", "the editable part went with it");
+        assert!(
+            shell.terminal.selection().is_none(),
+            "the cut ended the highlight"
+        );
+    }
+
+    /// A selection that never reaches the input line still copies, and the line
+    /// stays editable: the keystroke lands on it and the highlight goes.
+    #[test]
+    fn a_selection_above_the_line_leaves_the_line_editable() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        shell.push_line("some output".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+        shell.insert_text(&mut fonts.system, "ls");
+
+        let first = shell.terminal.first_line();
+        let row = (0..shell.terminal.rows() as i32)
+            .find(|row| shell.terminal.row_text(first + row).contains("some output"))
+            .expect("the output is on screen");
+        shell.terminal.select(
+            Point::new(Line(first + row), Column(0)),
+            Point::new(Line(first + row), Column(11)),
+        );
+        assert_eq!(shell.selected_text().as_deref(), Some("some output"));
+
+        shell.insert_text(&mut fonts.system, " -l");
+        assert_eq!(shell.input, "ls -l", "typing still reached the line");
+        assert!(
+            shell.terminal.selection().is_none(),
+            "the edit ended the highlight"
+        );
+    }
+
     #[test]
     fn restart_reports_an_effect_instead_of_restarting_itself() {
         let mut fonts = Fonts::load();
@@ -1765,6 +2333,35 @@ mod tests {
             shell.submit(&mut fonts.system),
             Some(ShellEffect::Restart)
         ));
+    }
+
+    /// A built-in that prints nothing still closes the row it was typed on, and
+    /// the prompt goes with the cursor to the next one. Without that the caret
+    /// stays behind inside the command that just ran, and the next keystroke
+    /// drops the input line a row below where it was drawn.
+    #[test]
+    fn a_silent_command_carries_the_prompt_down_with_it() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        let before = shell.input_row;
+        shell.insert_text(&mut fonts.system, "miku");
+        assert_eq!(shell.input_row, before, "typing stays on its row");
+        assert!(matches!(
+            shell.submit(&mut fonts.system),
+            Some(ShellEffect::Miku)
+        ));
+        assert_eq!(
+            shell.input_row,
+            before + 1,
+            "the command took its row and the prompt moved below it"
+        );
+        let shown = shell.terminal.screen_text();
+        assert!(shown.contains("miku"), "the command is on screen: {shown}");
+        assert_eq!(
+            shell.terminal.cursor_row(),
+            shell.input_row,
+            "the caret is where the prompt was drawn"
+        );
     }
 
     #[test]
@@ -1892,5 +2489,41 @@ mod tests {
             .position(|row| row.trim() == "spoken")
             .unwrap_or_else(|| panic!("the child wrote nothing below the prompt: {screen}"));
         assert!(said > echo, "output must land below the prompt:\n{screen}");
+    }
+    /// The input line is a grid line like any other. Scrolling down into the
+    /// session carries it off the bottom of the tab, and the caret has to leave
+    /// with the row rather than stay pinned where that row used to be.
+    #[test]
+    fn the_caret_leaves_with_the_row_it_stands_on() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 600.0);
+        for index in 0..40 {
+            shell.push_line(format!("row {index}"), LineKind::Output);
+        }
+        shell.rebuild_buffer(&mut fonts.system);
+        let at_rest = shell.cursor_rect().expect("a caret on the input row");
+
+        shell.terminal.scroll_by(-2);
+        shell.rebuild_buffer(&mut fonts.system);
+        assert!(shell.terminal.scrolled(), "the view is into the session");
+        match shell.cursor_rect() {
+            Some((_, y, _)) => assert!(
+                y > at_rest.1,
+                "the caret rides its row down instead of staying put: {y} vs {}",
+                at_rest.1
+            ),
+            None => assert!(
+                shell.input_row + 2 >= shell.terminal.rows(),
+                "hidden only because its row left the tab"
+            ),
+        }
+
+        shell.terminal.scroll_by(2);
+        shell.rebuild_buffer(&mut fonts.system);
+        assert_eq!(
+            shell.cursor_rect().map(|(x, y, h)| (x, y, h)),
+            Some(at_rest),
+            "back at the bottom the caret is where it was"
+        );
     }
 }

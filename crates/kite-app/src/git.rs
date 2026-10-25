@@ -6,8 +6,10 @@
 //! rebuild, is not on the table. The work happens off the UI thread in [`Probe`].
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -288,9 +290,64 @@ fn query(root: PathBuf) -> Status {
     Status::new(root, found)
 }
 
+/// The flags git reads before the subcommand. `safe.directory=*` is scoped to this
+/// one read-only invocation and never written to the user's config: a repository on
+/// a drive carried over from an old install is owned by a foreign SID, and without
+/// it git refuses to read the work tree, so the sidebar silently loses every mark.
+/// `core.fsmonitor=false` keeps a foreign repo's `fsmonitor` hook from running when
+/// all kite wants is a status snapshot.
+const GUARD: &[&str] = &["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
+
+/// The `git` to run, located once and cached. A program started from the desktop
+/// inherits no shell `PATH`, so a bare `git` would not resolve and the sidebar would
+/// lose every mark; probe the places a git actually lives instead of assuming one.
+fn git_program() -> &'static OsStr {
+    static GIT: OnceLock<PathBuf> = OnceLock::new();
+    GIT.get_or_init(locate_git).as_os_str()
+}
+
+fn locate_git() -> PathBuf {
+    let exe = if cfg!(windows) { "git.exe" } else { "git" };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    for key in [
+        "ProgramW6432",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+    ] {
+        if let Some(root) = std::env::var_os(key) {
+            let root = PathBuf::from(root);
+            for tail in ["Git/cmd", "Git/bin", "Programs/Git/cmd", "Programs/Git/bin"] {
+                dirs.push(root.join(tail));
+            }
+        }
+    }
+    // The copy a development toolchain already keeps under the user profile.
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(root) = std::env::var_os(key) {
+            let base = PathBuf::from(root).join(".qoder").join("bin").join("git");
+            for tail in ["cmd", "bin", "mingw64/bin", "usr/bin"] {
+                dirs.push(base.join(tail));
+            }
+        }
+    }
+    for dir in dirs {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    // Nothing found: let the OS try, and the listing stays blank if that fails too.
+    PathBuf::from("git")
+}
+
 fn run(root: &Path, args: &[&str]) -> Vec<u8> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program());
     command
+        .args(GUARD)
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())

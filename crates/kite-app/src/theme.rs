@@ -104,11 +104,11 @@ impl Default for Colors {
             whitespace_dot: Color::rgba(0x8a, 0x93, 0xb5, 0x72),
             whitespace_mark: Color::rgba(0x7a, 0xa2, 0xf7, 0x8c),
             miku_0: Color::rgba(0x45, 0x47, 0x5a, 0x80),
-            miku_1: Color::rgb(0x3f, 0x9c, 0x56),
-            miku_2: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_1: Color::rgb(0xa6, 0xe3, 0xa1),
+            miku_2: Color::rgb(0x8b, 0xd7, 0x94),
             miku_3: Color::rgb(0x71, 0xc4, 0x7f),
-            miku_4: Color::rgb(0x8b, 0xd7, 0x94),
-            miku_5: Color::rgb(0xa6, 0xe3, 0xa1),
+            miku_4: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_5: Color::rgb(0x3f, 0x9c, 0x56),
         }
     }
 }
@@ -150,11 +150,11 @@ impl Colors {
             whitespace_dot: Color::rgba(0x8a, 0x93, 0xb5, 0x72),
             whitespace_mark: Color::rgba(0x7a, 0xa2, 0xf7, 0x8c),
             miku_0: Color::rgba(0x45, 0x47, 0x5a, 0x80),
-            miku_1: Color::rgb(0x3f, 0x9c, 0x56),
-            miku_2: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_1: Color::rgb(0xa6, 0xe3, 0xa1),
+            miku_2: Color::rgb(0x8b, 0xd7, 0x94),
             miku_3: Color::rgb(0x71, 0xc4, 0x7f),
-            miku_4: Color::rgb(0x8b, 0xd7, 0x94),
-            miku_5: Color::rgb(0xa6, 0xe3, 0xa1),
+            miku_4: Color::rgb(0x58, 0xb0, 0x6a),
+            miku_5: Color::rgb(0x3f, 0x9c, 0x56),
         }
     }
 }
@@ -518,6 +518,9 @@ fn config_path() -> Option<PathBuf> {
 }
 
 pub const FONT_SIZE_BASE: f32 = 15.0;
+/// A file opens bigger than the shell: the grid has to keep the terminal's own
+/// metrics, but reading code wants more than that.
+pub const EDITOR_FONT_RATIO: f32 = 1.15;
 pub const LINE_HEIGHT_RATIO: f32 = 1.45;
 pub const MIN_FONT_SIZE: f32 = 9.0;
 pub const MAX_FONT_SIZE: f32 = 40.0;

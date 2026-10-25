@@ -7,15 +7,22 @@ use glyphon::cosmic_text::{
 use glyphon::{FontSystem, TextArea, TextBounds};
 use kite_core::{Document, Position, Selection, file_key};
 use winit::dpi::PhysicalSize;
+use winit::keyboard::KeyCode;
 
 use crate::editor::Editor;
 use crate::miku::Miku;
 use crate::renderer::QuadVertex;
 use crate::shell::{Shell, ShellEffect};
 use crate::sidebar::{Sidebar, SidebarAction};
+use crate::sparks::Sparks;
 use crate::syntax::Engine;
 use crate::text::{attrs, make_label, measure};
 use crate::theme;
+use crate::visualizer::{STRIP_HEIGHT, STRIP_MIN_HEIGHT, Visualizer};
+
+/// The sidebar's text size, before the window scale. It is set here once so the
+/// initial build and every later resize agree on one number.
+const SIDEBAR_FONT_SIZE: f32 = 16.2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -129,6 +136,9 @@ pub struct Ui {
     right: Rect,
     sidebar_rect: Rect,
     status_rect: Rect,
+    strip_rect: Rect,
+    visualizer: Visualizer,
+    sparks: Sparks,
     window_close: Rect,
     tab_strip: Rect,
     tab_scroll: f32,
@@ -160,7 +170,11 @@ impl Ui {
         let status_line_height = (status_font_size * 1.3).ceil();
         let body_font_size = theme::FONT_SIZE_BASE * scale;
 
-        let body_height = (size.height as f32 - titlebar_h - status_h).max(1.0);
+        let body_height = (size.height as f32
+            - titlebar_h
+            - status_h
+            - strip_height(scale, size.height as f32 / scale))
+        .max(1.0);
         let editor_width = (size.width as f32 - body_pad * 2.0).max(1.0);
         let editor_height = (body_height - body_pad * 2.0).max(1.0);
 
@@ -174,7 +188,7 @@ impl Ui {
         let sidebar = Sidebar::new(
             font_system,
             family,
-            13.5 * scale,
+            SIDEBAR_FONT_SIZE * scale,
             sidebar_w - body_pad * 2.0,
             body_height - body_pad * 2.0,
         );
@@ -232,6 +246,9 @@ impl Ui {
             right: Rect::default(),
             sidebar_rect: Rect::default(),
             status_rect: Rect::default(),
+            strip_rect: Rect::default(),
+            visualizer: Visualizer::new(),
+            sparks: Sparks::new(),
             window_close: Rect::default(),
             tab_strip: Rect::default(),
             tab_scroll: 0.0,
@@ -422,13 +439,13 @@ impl Ui {
         for index in 0..self.tabs.len() {
             self.refresh_label(font_system, index);
         }
-        self.sidebar.set_font_size(font_system, 13.5 * scale);
+        self.sidebar
+            .set_font_size(font_system, SIDEBAR_FONT_SIZE * scale);
+        let editor_size = self.editor_font_size();
         for tab in &mut self.tabs {
             match &mut tab.content {
                 TabContent::Shell(shell) => shell.set_font_size(font_system, self.body_font_size),
-                TabContent::Editor(editor) => {
-                    editor.set_font_size(font_system, self.body_font_size)
-                }
+                TabContent::Editor(editor) => editor.set_font_size(font_system, editor_size),
                 // The board's type comes from its own geometry, which the new
                 // scale reaches through the layout below.
                 TabContent::Miku(_) => {}
@@ -499,28 +516,18 @@ impl Ui {
         self.recompute_layout(font_system);
     }
 
+    /// `1` is the shell and every other tab takes the next slot in order, so the
+    /// board is always `2` while it exists. `0` is the tenth tab.
     pub fn activate_digit(&mut self, font_system: &mut FontSystem, digit: u8) -> bool {
-        if digit == 0 {
-            if self.active != 0 {
-                self.activate_tab(font_system, 0);
-                return true;
-            }
+        let slot = usize::from(if digit == 0 { 10 } else { digit });
+        let index = slot - 1;
+        if index >= self.tabs.len() {
             return false;
         }
-        let mut file_index = 0;
-        for (index, tab) in self.tabs.iter().enumerate() {
-            if tab.is_shell() {
-                continue;
-            }
-            file_index += 1;
-            if file_index == digit as usize {
-                if self.active != index {
-                    self.activate_tab(font_system, index);
-                }
-                return true;
-            }
+        if self.active != index {
+            self.activate_tab(font_system, index);
         }
-        false
+        true
     }
 
     pub fn close_tab(&mut self, font_system: &mut FontSystem, index: usize) -> bool {
@@ -582,7 +589,7 @@ impl Ui {
             self.family,
             content.w,
             content.h,
-            self.body_font_size,
+            self.editor_font_size(),
             self.engine.clone(),
         );
         let title = editor.display_title();
@@ -669,6 +676,12 @@ impl Ui {
             .is_some_and(|miku| miku.poll(font_system))
     }
 
+    /// What a file page is drawn at. The shell keeps the body size because its
+    /// grid is the terminal's own metric; a file is read, not echoed.
+    fn editor_font_size(&self) -> f32 {
+        self.body_font_size * theme::EDITOR_FONT_RATIO
+    }
+
     pub fn adjust_body_font(&mut self, font_system: &mut FontSystem, delta: f32) {
         let min = theme::MIN_FONT_SIZE * self.scale;
         let max = theme::MAX_FONT_SIZE * self.scale;
@@ -677,10 +690,11 @@ impl Ui {
             return;
         }
         self.body_font_size = size;
+        let editor_size = self.editor_font_size();
         for tab in &mut self.tabs {
             match &mut tab.content {
                 TabContent::Shell(shell) => shell.set_font_size(font_system, size),
-                TabContent::Editor(editor) => editor.set_font_size(font_system, size),
+                TabContent::Editor(editor) => editor.set_font_size(font_system, editor_size),
                 // The board sizes its own type from the panel, so Ctrl++/Ctrl+-
                 // does not reach it.
                 TabContent::Miku(_) => {}
@@ -1008,9 +1022,79 @@ impl Ui {
         areas
     }
 
+    /// Hit the band with one physical keypress. A collapsed band takes the hit
+    /// and drops it: it has nothing to show and must not start animating.
+    pub fn visualizer_beat(&mut self, key: KeyCode) {
+        if self.strip_rect.h > 0.0 {
+            self.visualizer.beat(key);
+        }
+    }
+
+    pub fn visualizer_live(&self) -> bool {
+        self.strip_rect.h > 0.0 && self.visualizer.live()
+    }
+
+    pub fn visualizer_tick(&mut self) -> bool {
+        self.strip_rect.h > 0.0 && self.visualizer.tick()
+    }
+
+    /// Where the powder leaves: the middle of the caret, in window coordinates.
+    /// Nothing when this is not a caret that types.
+    fn caret_spot(&self) -> Option<(f32, f32)> {
+        if self.focus != Focus::Right || self.mode != Mode::Insert {
+            return None;
+        }
+        let content = self.body_text_rect();
+        let (x, y, height) = match &self.active_tab().content {
+            TabContent::Editor(editor) => editor.cursor_rect()?,
+            TabContent::Shell(shell) => shell.cursor_rect()?,
+            TabContent::Miku(_) => return None,
+        };
+        Some((content.x + x, content.y + y + height * 0.5))
+    }
+
+    /// The ink of the glyph beside the caret — the one typing just wrote, or
+    /// the one a delete is about to eat.
+    pub fn caret_ink(&self, left: bool) -> Option<Color> {
+        if self.focus != Focus::Right || self.mode != Mode::Insert {
+            return None;
+        }
+        match &self.active_tab().content {
+            TabContent::Editor(editor) => editor.glyph_ink(left),
+            TabContent::Shell(shell) => shell.glyph_ink(left),
+            TabContent::Miku(_) => None,
+        }
+    }
+
+    /// A keystroke throws powder off the caret it just landed on, in the ink of
+    /// the glyph it just wrote.
+    pub fn spark_at_caret(&mut self) {
+        let ink = self.caret_ink(true).unwrap_or_else(theme::text);
+        if let Some((x, y)) = self.caret_spot() {
+            self.sparks.burst(x, y, self.scale, ink);
+        }
+    }
+
+    /// A delete throws the same powder, in the ink of the glyph it ate. That
+    /// ink has to be read before the key lands, so it comes in as an argument.
+    pub fn spark_delete(&mut self, ink: Color) {
+        if let Some((x, y)) = self.caret_spot() {
+            self.sparks.burst(x, y, self.scale, ink);
+        }
+    }
+
+    pub fn sparks_live(&self) -> bool {
+        self.sparks.live()
+    }
+
+    pub fn sparks_tick(&mut self) {
+        self.sparks.tick();
+    }
+
     pub fn background_quads(&self) -> Vec<QuadVertex> {
         let mut quads = Vec::new();
         push_rect(&mut quads, self.right, theme::panel());
+        push_rect(&mut quads, self.strip_rect, theme::panel());
         push_rect(&mut quads, self.status_rect, theme::status());
         push_rect(
             &mut quads,
@@ -1200,6 +1284,8 @@ impl Ui {
             }
         }
 
+        quads.extend(self.visualizer.quads(self.strip_rect, self.scale));
+
         quads
     }
 
@@ -1216,7 +1302,7 @@ impl Ui {
                         &mut quads,
                         &editor.buffer,
                         content,
-                        self.body_font_size,
+                        self.editor_font_size(),
                         line_height,
                         &breaks,
                     );
@@ -1266,6 +1352,7 @@ impl Ui {
             }
         }
 
+        quads.extend(self.sparks.quads());
         quads
     }
 
@@ -1501,7 +1588,17 @@ impl Ui {
         let height = self.size.height as f32;
         self.titlebar_h = 40.0 * self.scale;
         self.status_h = 26.0 * self.scale;
-        let body_h = (height - self.titlebar_h - self.status_h).max(1.0);
+        let strip_h = strip_height(self.scale, height / self.scale);
+        if strip_h == 0.0 {
+            self.visualizer.reset();
+        }
+        self.strip_rect = Rect {
+            x: 0.0,
+            y: height - self.status_h - strip_h,
+            w: width,
+            h: strip_h,
+        };
+        let body_h = (height - self.titlebar_h - self.status_h - strip_h).max(1.0);
         self.status_rect = Rect {
             x: 0.0,
             y: height - self.status_h,
@@ -1757,21 +1854,67 @@ fn bounds_of(rect: Rect) -> TextBounds {
     }
 }
 
-fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
+/// The band above the status bar, in physical pixels. A window too short for
+/// it gets no band at all rather than a squashed one.
+fn strip_height(scale: f32, logical_height: f32) -> f32 {
+    if logical_height >= STRIP_MIN_HEIGHT {
+        STRIP_HEIGHT * scale
+    } else {
+        0.0
+    }
+}
+
+fn linear_color(color: Color) -> [f32; 4] {
+    let [r, g, b, a] = color.as_rgba();
+    [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ]
+}
+
+pub(crate) fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
     push_round_rect(quads, rect, color, 0.0);
+}
+
+/// A rectangle whose colour runs from one edge to the other. The shader
+/// interpolates the vertex colours, so two corners per row are enough.
+pub(crate) fn push_gradient_rect(
+    quads: &mut Vec<QuadVertex>,
+    rect: Rect,
+    top: Color,
+    bottom: Color,
+) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    let (t, b) = (linear_color(top), linear_color(bottom));
+    let (x0, y0) = (rect.x, rect.y);
+    let (x1, y1) = (rect.right(), rect.bottom());
+    let size = [rect.w, rect.h];
+    for (corner, color) in [
+        ([x0, y0], t),
+        ([x1, y0], t),
+        ([x1, y1], b),
+        ([x0, y0], t),
+        ([x1, y1], b),
+        ([x0, y1], b),
+    ] {
+        quads.push(QuadVertex {
+            position: corner,
+            color,
+            rect: [x0, y0, size[0], size[1]],
+            radius: 0.0,
+        });
+    }
 }
 
 fn push_round_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color, radius: f32) {
     if rect.w <= 0.0 || rect.h <= 0.0 {
         return;
     }
-    let [r, g, b, a] = color.as_rgba();
-    let color = [
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
-        a as f32 / 255.0,
-    ];
+    let color = linear_color(color);
     let (x0, y0) = (rect.x, rect.y);
     let (w, h) = (rect.w, rect.h);
     let x1 = rect.right();
@@ -1786,7 +1929,7 @@ fn push_round_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color, radius
     }
 }
 
-fn push_line(
+pub(crate) fn push_line(
     quads: &mut Vec<QuadVertex>,
     x1: f32,
     y1: f32,
@@ -1803,13 +1946,7 @@ fn push_line(
     }
     let nx = -dy / length * width / 2.0;
     let ny = dx / length * width / 2.0;
-    let [r, g, b, a] = color.as_rgba();
-    let color = [
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
-        a as f32 / 255.0,
-    ];
+    let color = linear_color(color);
     let corners = [
         [x1 + nx, y1 + ny],
         [x2 + nx, y2 + ny],
@@ -1930,6 +2067,45 @@ mod tests {
     }
 
     #[test]
+    fn the_band_collapses_when_the_window_gets_too_short() {
+        let mut fonts = Fonts::load();
+        let mut tall = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        assert_eq!(tall.strip_rect.h, 64.0);
+        assert_eq!(tall.strip_rect.bottom(), 1000.0 - 26.0);
+        assert_eq!(tall.right.h, 1000.0 - 40.0 - 26.0 - 64.0);
+        tall.visualizer_beat(KeyCode::KeyF);
+        assert!(tall.visualizer_live());
+
+        let mut short = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 300),
+            1.0,
+        );
+        assert_eq!(short.strip_rect.h, 0.0, "no room means no band");
+        short.visualizer_beat(KeyCode::KeyF);
+        assert!(!short.visualizer_live(), "a collapsed band cannot animate");
+
+        short.resize(&mut fonts.system, PhysicalSize::new(1600, 1000));
+        assert_eq!(short.strip_rect.h, 64.0);
+        assert!(
+            !short.visualizer_live(),
+            "growing back does not resume the gesture it missed"
+        );
+
+        // The line the band collapses to is ten band heights of window away.
+        short.resize(&mut fonts.system, PhysicalSize::new(1600, 639));
+        assert_eq!(short.strip_rect.h, 0.0, "a short window gets no line");
+        short.resize(&mut fonts.system, PhysicalSize::new(1600, 640));
+        assert_eq!(short.strip_rect.h, 64.0, "the band is back with the room");
+    }
+
+    #[test]
     fn the_status_bar_counts_characters_only_on_a_file_page() {
         let mut fonts = Fonts::load();
         let mut ui = Ui::new(
@@ -1969,5 +2145,54 @@ mod tests {
         assert_eq!(ui.status_right_w, 0.0, "the shell has no character count");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn digits_count_from_the_shell_and_zero_is_the_tenth() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"one\n").unwrap();
+            ui.open_file(&mut fonts.system, path).unwrap();
+        }
+
+        assert!(ui.activate_digit(&mut fonts.system, 1));
+        assert_eq!(ui.active, 0, "1 is the shell");
+        assert!(ui.activate_digit(&mut fonts.system, 3));
+        assert_eq!(ui.active, 2, "b.txt is the third tab");
+        assert!(
+            !ui.activate_digit(&mut fonts.system, 4),
+            "there is no fourth tab"
+        );
+
+        ui.open_miku(&mut fonts.system);
+        assert_eq!(ui.active, 1);
+        assert!(ui.activate_digit(&mut fonts.system, 2));
+        assert!(ui.active_miku().is_some(), "2 is the board while it exists");
+        assert!(ui.activate_digit(&mut fonts.system, 4));
+        assert_eq!(
+            ui.tabs[ui.active].title, "b.txt",
+            "the board takes a slot, it does not steal one"
+        );
+        assert!(!ui.activate_digit(&mut fonts.system, 0), "no tenth tab yet");
+
+        for name in [
+            "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "h.txt", "i.txt",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"one\n").unwrap();
+            ui.open_file(&mut fonts.system, path).unwrap();
+        }
+        assert_eq!(ui.tabs.len(), 11);
+        assert!(ui.activate_digit(&mut fonts.system, 0));
+        assert_eq!(ui.active, 9, "0 is the tenth tab");
+        assert_eq!(ui.tabs[ui.active].title, "h.txt");
     }
 }

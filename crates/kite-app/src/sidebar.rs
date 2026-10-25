@@ -10,7 +10,7 @@ use glyphon::cosmic_text::{
 use kite_core::display_path;
 
 use crate::editor::measure_cell;
-use crate::text::{attrs, buffer_line, force_relayout};
+use crate::text::{bold_attrs, buffer_line, force_relayout};
 use crate::theme;
 use crate::{archive, git};
 
@@ -48,6 +48,10 @@ pub struct Row {
     pub is_dir: bool,
     pub label: String,
     pub is_drive: bool,
+    /// A git repository's own folder. Its name wears the git colour even while the
+    /// folder is collapsed, because a `.git` beside it is a fact of the disk rather
+    /// than something the background probe has to answer for.
+    repo: bool,
     /// Tracked by git but gone from the work tree: listed, never opened.
     pub missing: bool,
     /// The archive holding this row, for the rows that live inside one. Their
@@ -431,6 +435,7 @@ impl Sidebar {
                         is_dir: true,
                         label,
                         is_drive: true,
+                        repo: false,
                         missing: false,
                         archive: None,
                         icon,
@@ -488,20 +493,24 @@ impl Sidebar {
             } else if row.is_drive {
                 theme::green()
             } else if row.is_dir {
-                theme::accent()
+                if row.repo {
+                    ICON_ORANGE
+                } else {
+                    theme::accent()
+                }
             } else {
                 theme::text()
             };
-            let line_attrs = attrs(self.family, color);
+            let line_attrs = bold_attrs(self.family, color);
             let mut spans = AttrsList::new(&line_attrs);
             if let Some((mark, color)) = &row.mark {
                 let width = mark.len_utf8();
-                spans.add_span(0..width, &attrs(self.family, *color));
+                spans.add_span(0..width, &bold_attrs(self.family, *color));
             }
-            spans.add_span(row.icon.clone(), &attrs(self.family, row.icon_color));
+            spans.add_span(row.icon.clone(), &bold_attrs(self.family, row.icon_color));
             if let Some((added, removed)) = &row.delta {
-                spans.add_span(added.clone(), &attrs(self.family, theme::green()));
-                spans.add_span(removed.clone(), &attrs(self.family, theme::red()));
+                spans.add_span(added.clone(), &bold_attrs(self.family, theme::green()));
+                spans.add_span(removed.clone(), &bold_attrs(self.family, theme::red()));
             }
             buffer.lines.push(BufferLine::new(
                 row.label.clone(),
@@ -511,7 +520,7 @@ impl Sidebar {
             ));
         }
         if buffer.lines.is_empty() {
-            let line_attrs = attrs(self.family, theme::text_dim());
+            let line_attrs = bold_attrs(self.family, theme::text_dim());
             buffer.lines.push(buffer_line(" ", &line_attrs));
         }
         let line = self
@@ -596,6 +605,7 @@ impl Sidebar {
 
         for (_, _, name, path, is_dir, found) in entries {
             let missing = found.is_some_and(|entry| entry.state == git::State::Deleted) && !is_dir;
+            let repo = is_dir && path.join(".git").exists();
             let (icon, icon_color) = if is_dir {
                 directory_icon(&path, &name)
             } else {
@@ -619,6 +629,7 @@ impl Sidebar {
                 is_dir,
                 label,
                 is_drive: false,
+                repo,
                 missing,
                 archive: None,
                 icon: icon_range,
@@ -687,6 +698,7 @@ impl Sidebar {
                 is_dir,
                 label,
                 is_drive: false,
+                repo: false,
                 missing: false,
                 archive: Some(file.to_path_buf()),
                 icon: icon_range,
@@ -727,23 +739,26 @@ fn virtual_prefix(file: &Path, path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// git's own letters, so the column reads like `git status` rather than a private icon set.
+/// A status glyph from the codicons set the Nerd Font carries — the same family VS
+/// Code's source control uses — so the column reads as icons that match the file-type
+/// glyphs beside them. The codepoints are the font's own `cod-*` names, confirmed
+/// against its cmap.
 fn mark_of(state: Option<git::State>) -> Option<(char, Color)> {
     let (mark, color) = match state? {
-        git::State::Added => ('A', ICON_GREEN),
-        git::State::Conflicted => ('U', theme::pink()),
-        git::State::Deleted => ('D', theme::red()),
-        git::State::Ignored => ('!', theme::text_faint()),
-        git::State::Modified => ('M', ICON_YELLOW),
-        git::State::Renamed => ('R', ICON_BLUE),
-        git::State::Untracked => ('?', ICON_TEAL),
+        git::State::Added => ('\u{eadc}', ICON_GREEN),
+        git::State::Conflicted => ('\u{ec6e}', theme::pink()),
+        git::State::Deleted => ('\u{eadf}', theme::red()),
+        git::State::Ignored => ('\u{eadd}', theme::text_faint()),
+        git::State::Modified => ('\u{eade}', ICON_YELLOW),
+        git::State::Renamed => ('\u{eae0}', ICON_BLUE),
+        git::State::Untracked => ('\u{ea7f}', ICON_TEAL),
     };
     Some((mark, color))
 }
 
-/// The row's text: git's letter, the indent, the icon, the name, and the line counts
-/// pushed to the right edge of the panel. The name is what remains when there is no
-/// room left for that alignment.
+/// The row's text: git's mark, a gutter, the indent, the file icon, the name, and
+/// the line counts pushed to the right edge of the panel. The name is what remains
+/// when there is no room left for that alignment.
 fn row_text(
     mark: Option<char>,
     depth: usize,
@@ -754,8 +769,8 @@ fn row_text(
 ) -> (String, Range<usize>, Option<(Range<usize>, Range<usize>)>) {
     let indent = "  ".repeat(depth);
     let mark = mark.unwrap_or(' ');
-    let start = mark.len_utf8() + indent.len();
-    let mut label = format!("{mark}{indent}{icon}  {name}");
+    let start = mark.len_utf8() + 1 + indent.len();
+    let mut label = format!("{mark} {indent}{icon}  {name}");
     let end = start + icon.len_utf8();
     let delta = match delta {
         Some(delta) => {
@@ -782,7 +797,7 @@ fn directory_icon(path: &Path, name: &str) -> (char, Color) {
         return (GIT_FOLDER_ICON, ICON_ORANGE);
     }
     if is_empty_dir(path) {
-        return (EMPTY_FOLDER_ICON, ICON_SAPPHIRE);
+        return (EMPTY_FOLDER_ICON, theme::accent());
     }
     match name.to_lowercase().as_str() {
         ".github" => ('', ICON_SAPPHIRE),
@@ -802,7 +817,7 @@ fn directory_icon(path: &Path, name: &str) -> (char, Color) {
         "music" => ('󱍙', ICON_ORANGE),
         "pictures" => ('󰉏', ICON_ORANGE),
         "videos" => ('󱞊', ICON_ORANGE),
-        _ => (FOLDER_ICON, ICON_SAPPHIRE),
+        _ => (FOLDER_ICON, theme::accent()),
     }
 }
 
@@ -958,7 +973,7 @@ mod tests {
         assert_eq!(directory_icon(&plain, "src"), ('󰴉', ICON_MAUVE));
         assert_eq!(
             directory_icon(&empty, "empty"),
-            (EMPTY_FOLDER_ICON, ICON_SAPPHIRE)
+            (EMPTY_FOLDER_ICON, theme::accent())
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -1007,8 +1022,8 @@ mod tests {
         let glyph = label[range.clone()].chars().next().unwrap();
         assert_eq!(glyph, GLYPH);
         assert_eq!(range.len(), glyph.len_utf8());
-        // One git column, then two indent levels.
-        assert_eq!(range.start, 5);
+        // One git column, a gutter, then two indent levels.
+        assert_eq!(range.start, 6);
         assert_eq!(label.chars().next().unwrap(), 'M');
     }
 
@@ -1120,6 +1135,7 @@ mod tests {
             is_dir,
             label: String::new(),
             is_drive: false,
+            repo: false,
             missing: false,
             archive: None,
             icon: 0..0,
