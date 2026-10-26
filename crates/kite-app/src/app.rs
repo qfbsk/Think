@@ -264,7 +264,8 @@ impl App {
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
 
-        if ui.visualizer_live() || ui.sparks_live() {
+        ui.caret_tick();
+        if ui.visualizer_live() || ui.sparks_live() || ui.caret_flying() {
             ui.visualizer_tick();
             ui.sparks_tick();
             window.request_redraw();
@@ -1276,7 +1277,7 @@ fn handle_insert_key(
                         let filtered: String =
                             text.chars().filter(|value| !value.is_control()).collect();
                         if !filtered.is_empty() {
-                            paste_into_ui(ui, system, &filtered);
+                            type_into_ui(ui, system, &filtered);
                             changed = true;
                         }
                     }
@@ -1312,6 +1313,23 @@ fn insert_into_ui(ui: &mut Ui, system: &mut FontSystem, text: &str) {
 
 fn paste_into_ui(ui: &mut Ui, system: &mut FontSystem, text: &str) {
     insert_into_ui(ui, system, text);
+}
+
+/// A run of typed characters. Exactly one character gets the editor's pair
+/// completions; anything longer (a composed IME string, a multi-char key) and
+/// every shell insert go in verbatim, so pastes never auto-complete.
+fn type_into_ui(ui: &mut Ui, system: &mut FontSystem, text: &str) {
+    let mut chars = text.chars();
+    let single = chars.next().filter(|_| chars.next().is_none());
+    if let Some(ch) = single {
+        if let Some(editor) = ui.active_editor_mut() {
+            if let Err(error) = editor.insert_typed(system, ch) {
+                ui.message = Some(format!("!{error}"));
+            }
+            return;
+        }
+    }
+    paste_into_ui(ui, system, text);
 }
 
 fn shell_safe(text: &str) -> String {

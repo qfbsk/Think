@@ -590,6 +590,6 @@ mod tests {
 
     #[test]
     fn the_match_colour_comes_from_the_theme() {
-        assert_eq!(color_name(Engine::new().pair_color()), "#b4befe");
+        assert_eq!(color_name(Engine::new().pair_color()), "#f9e2af");
     }
 }

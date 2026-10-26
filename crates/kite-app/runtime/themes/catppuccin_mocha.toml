@@ -31,7 +31,7 @@
 "punctuation.special" = "sky"
 
 # kite: the bracket pair the caret sits to the right of.
-"bracket.match" = "lavender"
+"bracket.match" = "yellow"
 
 "keyword" = "mauve"
 "keyword.control.conditional" = { fg = "mauve", modifiers = ["italic"] }

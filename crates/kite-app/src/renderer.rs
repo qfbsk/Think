@@ -8,7 +8,7 @@ use wgpu::{
     AddressMode, Backends, BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType, BufferUsages,
     ColorTargetState, ColorWrites, CommandEncoderDescriptor, CompositeAlphaMode, Device,
-    DeviceDescriptor, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor, Limits,
+    DeviceDescriptor, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor,
     LoadOp, MemoryHints, MipmapFilterMode, MultisampleState, Operations,
     PipelineCompilationOptions, PresentMode, PrimitiveState, Queue, RenderPassColorAttachment,
     RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, Sampler,
@@ -134,7 +134,10 @@ impl Renderer {
             .request_device(&DeviceDescriptor {
                 label: Some("kite"),
                 required_features: wgpu::Features::empty(),
-                required_limits: Limits::downlevel_defaults(),
+                // The swapchain may not be bigger than this limit, so asking
+                // for the downlevel 2048 made every maximized or fullscreen
+                // window on a scaled display panic in `Surface::configure`.
+                required_limits: adapter.limits(),
                 memory_hints: MemoryHints::MemoryUsage,
                 ..DeviceDescriptor::default()
             })
@@ -162,6 +165,11 @@ impl Renderer {
         } else {
             caps.alpha_modes[0]
         };
+        // The swapchain is a texture, and the window manager happily reports
+        // sizes the device cannot hold as one: configuring past the limit
+        // panics and takes the whole window down with it.
+        let limit = device.limits().max_texture_dimension_2d;
+        let size = size.min(PhysicalSize::new(limit, limit));
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -439,7 +447,10 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
-        let size = size.max(PhysicalSize::new(1, 1));
+        let limit = self.device.limits().max_texture_dimension_2d;
+        let size = size
+            .max(PhysicalSize::new(1, 1))
+            .min(PhysicalSize::new(limit, limit));
         if size.width == self.config.width && size.height == self.config.height {
             return;
         }

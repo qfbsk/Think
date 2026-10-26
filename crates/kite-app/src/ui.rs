@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use glyphon::cosmic_text::{
     Attrs, AttrsList, Buffer, BufferLine, Color, LineEnding, Metrics, Shaping, Weight, Wrap,
@@ -103,6 +104,49 @@ impl Tab {
     }
 }
 
+/// The drawn caret chasing the logical one. Every move re-targets and the
+/// drawn spot eases toward it — τ = 30 ms, so ~90 ms to cover 95% of the
+/// distance; a held key (~32 ms per repeat) re-targets mid-flight and the
+/// caret flows instead of stepping. Jumps past `SNAP` (a click across the
+/// document, a tab switch) teleport: a long glide there reads as lag, not
+/// as motion. Only the drawing moves; hit-testing and text stay on the
+/// logical caret.
+struct CaretState {
+    x: f32,
+    y: f32,
+    flying: bool,
+    had_target: bool,
+    target: (f32, f32),
+    last_tick: Instant,
+}
+
+impl Default for CaretState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            flying: false,
+            had_target: false,
+            target: (0.0, 0.0),
+            last_tick: Instant::now(),
+        }
+    }
+}
+
+/// Physical pixels a retarget may cover as a glide; past it, snap.
+const CARET_SNAP: f32 = 400.0;
+/// Below this distance to the target the glide counts as landed.
+const CARET_LANDED: f32 = 0.4;
+const CARET_TAU: f32 = 0.030;
+
+/// One exponential-chase step: cover the fraction `1 - e^(-dt/τ)` of the
+/// remaining distance from `cur` to `target`. τ = 30 ms, so a single 90 ms
+/// frame closes ~95% of the gap and the caret reads as gliding, not stepping.
+fn caret_step(cur: f32, target: f32, dt: f32) -> f32 {
+    let alpha = 1.0 - (-dt / CARET_TAU).exp();
+    cur + (target - cur) * alpha
+}
+
 pub struct Ui {
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -113,6 +157,7 @@ pub struct Ui {
     pub scale: f32,
     pub body_font_size: f32,
     pub cursor_blink: bool,
+    caret: CaretState,
     pub show_whitespace: bool,
     pub topmost: bool,
     pub message: Option<String>,
@@ -225,6 +270,7 @@ impl Ui {
             scale,
             body_font_size,
             cursor_blink: true,
+            caret: CaretState::default(),
             show_whitespace: false,
             topmost: false,
             message: None,
@@ -1332,18 +1378,27 @@ impl Ui {
             push_rect(&mut quads, self.sidebar_rect, theme::overlay_dim());
         }
 
-        if self.focus == Focus::Right && (self.mode == Mode::Normal || self.cursor_blink) {
+        if self.focus == Focus::Right
+            && (self.mode == Mode::Normal || self.cursor_blink || self.caret.flying)
+        {
             let cursor = match &self.active_tab().content {
                 TabContent::Editor(editor) => editor.cursor_rect(),
                 TabContent::Shell(shell) => shell.cursor_rect(),
                 TabContent::Miku(_) => None,
             };
             if let Some((x, y, height)) = cursor {
+                let raw_x = content.x + x;
+                let raw_y = content.y + y + 2.0 * self.scale;
+                let (cx, cy) = if self.caret.had_target {
+                    (self.caret.x, self.caret.y)
+                } else {
+                    (raw_x, raw_y)
+                };
                 push_rect(
                     &mut quads,
                     Rect {
-                        x: content.x + x,
-                        y: content.y + y + 2.0 * self.scale,
+                        x: cx,
+                        y: cy,
                         w: 2.0 * self.scale,
                         h: (height - 4.0 * self.scale).max(2.0),
                     },
@@ -1380,6 +1435,69 @@ impl Ui {
 
     pub fn toggle_cursor_blink(&mut self) {
         self.cursor_blink = !self.cursor_blink;
+    }
+
+    /// Advance the caret's glide one frame toward the logical caret. It reads
+    /// the active tab's own cursor rect, so callers never pass coordinates.
+    /// Called from the redraw path (to pick up a new target) and from the
+    /// animation loop while it is still flying (to keep easing).
+    pub fn caret_tick(&mut self) {
+        let now = Instant::now();
+        let content = self.body_text_rect();
+        let rect = match &self.active_tab().content {
+            TabContent::Editor(editor) => editor.cursor_rect(),
+            TabContent::Shell(shell) => shell.cursor_rect(),
+            TabContent::Miku(_) => None,
+        };
+        let (tx, ty) = match rect {
+            Some((x, y, _)) => (content.x + x, content.y + y + 2.0 * self.scale),
+            None => {
+                self.caret.had_target = false;
+                self.caret.flying = false;
+                self.caret.last_tick = now;
+                return;
+            }
+        };
+
+        // A logical spot we have not aimed at yet: glide if it is close enough
+        // to read as motion, otherwise teleport. Resetting the clock here means
+        // the first eased frame steps by ~0 and the flight begins fresh rather
+        // than snapping shut over whatever idle time elapsed since the last tick.
+        if !self.caret.had_target || self.caret.target != (tx, ty) {
+            let dx = tx - self.caret.x;
+            let dy = ty - self.caret.y;
+            if !self.caret.had_target || (dx * dx + dy * dy).sqrt() > CARET_SNAP {
+                self.caret.x = tx;
+                self.caret.y = ty;
+                self.caret.flying = false;
+            } else {
+                self.caret.flying = true;
+            }
+            self.caret.target = (tx, ty);
+            self.caret.last_tick = now;
+            self.caret.had_target = true;
+            return;
+        }
+
+        let dt = now.duration_since(self.caret.last_tick).as_secs_f32();
+        self.caret.last_tick = now;
+        if !self.caret.flying {
+            return;
+        }
+        let dx = tx - self.caret.x;
+        let dy = ty - self.caret.y;
+        if (dx * dx + dy * dy).sqrt() <= CARET_LANDED {
+            self.caret.x = tx;
+            self.caret.y = ty;
+            self.caret.flying = false;
+            return;
+        }
+        self.caret.x = caret_step(self.caret.x, tx, dt);
+        self.caret.y = caret_step(self.caret.y, ty, dt);
+    }
+
+    pub fn caret_flying(&self) -> bool {
+        self.caret.flying
     }
 
     pub fn set_mouse(&mut self, x: f32, y: f32) {
@@ -1592,10 +1710,17 @@ impl Ui {
         if strip_h == 0.0 {
             self.visualizer.reset();
         }
+        // The left/right split runs all the way down to the status bar, so the
+        // strip only occupies the content column while the sidebar is open.
+        self.sidebar_w = if self.sidebar.visible {
+            (280.0 * self.scale).min(width * 0.45)
+        } else {
+            0.0
+        };
         self.strip_rect = Rect {
-            x: 0.0,
+            x: self.sidebar_w,
             y: height - self.status_h - strip_h,
-            w: width,
+            w: (width - self.sidebar_w).max(1.0),
             h: strip_h,
         };
         let body_h = (height - self.titlebar_h - self.status_h - strip_h).max(1.0);
@@ -1613,12 +1738,11 @@ impl Ui {
         };
 
         if self.sidebar.visible {
-            self.sidebar_w = (280.0 * self.scale).min(width * 0.45);
             self.sidebar_rect = Rect {
                 x: 0.0,
                 y: self.titlebar_h,
                 w: self.sidebar_w,
-                h: body_h,
+                h: body_h + strip_h,
             };
             self.right = Rect {
                 x: self.sidebar_w,
@@ -1627,7 +1751,6 @@ impl Ui {
                 h: body_h,
             };
         } else {
-            self.sidebar_w = 0.0;
             self.sidebar_rect = Rect::default();
             self.right = Rect {
                 x: 0.0,
@@ -2194,5 +2317,30 @@ mod tests {
         assert!(ui.activate_digit(&mut fonts.system, 0));
         assert_eq!(ui.active, 9, "0 is the tenth tab");
         assert_eq!(ui.tabs[ui.active].title, "h.txt");
+    }
+
+    #[test]
+    fn the_caret_glides_rather_than_snapping() {
+        // One 90 ms frame closes ~95% of the gap: the caret is well past the
+        // midpoint (it is gliding, not stepping) but has not teleported.
+        let after_one = caret_step(0.0, 100.0, 0.090);
+        assert!(
+            after_one > 90.0 && after_one < 100.0,
+            "90 ms should cover most but not all of the distance, got {after_one}"
+        );
+
+        // A single frame is monotonic and never overshoots the target.
+        assert!(caret_step(0.0, 100.0, 0.016) < after_one);
+        assert!(caret_step(0.0, 100.0, 10.0) <= 100.0);
+
+        // Repeated frames converge onto the target to within the landing band.
+        let mut pos = 0.0;
+        for _ in 0..30 {
+            pos = caret_step(pos, 100.0, 0.016);
+        }
+        assert!(
+            (100.0 - pos).abs() <= CARET_LANDED,
+            "the glide must settle on the caret, stopped at {pos}"
+        );
     }
 }

@@ -123,7 +123,7 @@ impl Sidebar {
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
         let cell_width = measure_cell(font_system, family, font_size, line_height);
         let mut sidebar = Self {
-            visible: false,
+            visible: true,
             root,
             rows: Vec::new(),
             selected: 0,

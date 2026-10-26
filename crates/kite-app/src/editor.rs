@@ -442,6 +442,86 @@ impl Editor {
         Ok(())
     }
 
+    /// A single typed character, with the completions a typist expects: an
+    /// opener brings its closer and leaves the caret between the two, and `{`
+    /// opens onto three indented lines. A closer that is already there is not
+    /// doubled: `)` and `]` step over it, while `}`, `"` and `'` — the ones
+    /// pressed reflexively — are swallowed and leave the caret where it was.
+    /// The completion is written straight into the document and the caret
+    /// placed by hand, never re-fed through this method, so it cannot retrigger
+    /// itself.
+    pub fn insert_typed(
+        &mut self,
+        font_system: &mut FontSystem,
+        ch: char,
+    ) -> Result<(), Unencodable> {
+        if !self.selection.is_empty() {
+            return self.insert_text(font_system, &ch.to_string());
+        }
+        let caret = self.selection.cursor;
+        let line = self.document.line_text(caret.line);
+        let at = byte_of_char(&line, caret.ch);
+        let (before, rest) = (&line[..at], &line[at..]);
+        let is_blank = |text: &str| text.chars().all(|c| c == ' ' || c == '\t');
+
+        if matches!(ch, ')' | ']' | '}' | '"' | '\'') {
+            let found = if rest.chars().next() == Some(ch) {
+                // The closer we placed earlier, still the very next character.
+                Some(Position::new(caret.line, caret.ch + 1))
+            } else if is_blank(before)
+                && is_blank(rest)
+                && caret.line + 1 < self.document.line_count()
+            {
+                // The brace expansion parks the caret on an indent-only line with
+                // its closer as the first thing on the line below; typing the
+                // closer there must consume that closer, not stack a second one
+                // on the middle line.
+                let below = self.document.line_text(caret.line + 1);
+                below
+                    .chars()
+                    .position(|c| c != ' ' && c != '\t')
+                    .filter(|&at| below[at..].starts_with(ch))
+                    .map(|at| Position::new(caret.line + 1, at + 1))
+            } else {
+                None
+            };
+            if let Some(target) = found {
+                if matches!(ch, ')' | ']') {
+                    self.selection = Selection::caret(target);
+                    self.desired_x = None;
+                    self.after_change(font_system);
+                }
+                return Ok(());
+            }
+        }
+
+        let close = match ch {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"' => '"',
+            '\'' => '\'',
+            _ => return self.insert_text(font_system, &ch.to_string()),
+        };
+
+        let lead: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let inserted = if ch == '{' {
+            format!("{{\n{lead}\t\n{lead}{close}")
+        } else {
+            format!("{ch}{close}")
+        };
+        self.selection = self.document.apply_edit(self.selection, &inserted)?;
+        let inner = if ch == '{' {
+            Position::new(caret.line + 1, lead.chars().count() + 1)
+        } else {
+            Position::new(caret.line, caret.ch + 1)
+        };
+        self.selection = Selection::caret(inner);
+        self.desired_x = None;
+        self.after_change(font_system);
+        Ok(())
+    }
+
     /// Enter keeps the current line's leading whitespace, steps one literal tab
     /// deeper after an unclosed opener, and splits a pair the caret sits inside
     /// into three lines. Bytes outside the inserted text are never touched.
@@ -1280,6 +1360,96 @@ mod tests {
         // opener, so this is a plain line break: text after the caret is intact.
         assert_eq!(rows(&editor), vec!["f(a", "b)", ""]);
         assert_eq!(editor.selection.cursor, Position::new(1, 0));
+    }
+
+    #[test]
+    fn typing_an_opener_parks_the_caret_between_the_pair() {
+        let (mut editor, mut fonts) = editor("f\n");
+        place(&mut editor, &mut fonts, 0, 1);
+        editor.insert_typed(&mut fonts.system, '(').unwrap();
+        assert_eq!(rows(&editor), vec!["f()", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(0, 2));
+    }
+
+    #[test]
+    fn typing_the_closer_over_a_completion_steps_over_it() {
+        let (mut editor, mut fonts) = editor("f\n");
+        place(&mut editor, &mut fonts, 0, 1);
+        editor.insert_typed(&mut fonts.system, '(').unwrap();
+        editor.insert_typed(&mut fonts.system, ')').unwrap();
+        assert_eq!(rows(&editor), vec!["f()", ""], "the closer is not doubled");
+        assert_eq!(
+            editor.selection.cursor,
+            Position::new(0, 3),
+            "the caret steps onto the existing closer"
+        );
+    }
+
+    #[test]
+    fn typing_a_brace_opens_three_indented_lines() {
+        let (mut editor, mut fonts) = editor("    if (x)\n");
+        place(&mut editor, &mut fonts, 0, 10);
+        editor.insert_typed(&mut fonts.system, '{').unwrap();
+        assert_eq!(rows(&editor), vec!["    if (x){", "    \t", "    }", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 5));
+    }
+
+    #[test]
+    fn closing_the_expansion_neither_doubles_nor_moves() {
+        let (mut editor, mut fonts) = editor("    if (x)\n");
+        place(&mut editor, &mut fonts, 0, 10);
+        editor.insert_typed(&mut fonts.system, '{').unwrap();
+        // The caret sits on the indent-only middle line; the typist's closing
+        // brace must eat the closer below and stay put, not leave two of them
+        // and not drag the caret down onto the brace.
+        editor.insert_typed(&mut fonts.system, '}').unwrap();
+        assert_eq!(rows(&editor), vec!["    if (x){", "    \t", "    }", ""]);
+        assert_eq!(editor.selection.cursor, Position::new(1, 5));
+    }
+
+    #[test]
+    fn a_closer_after_real_code_still_inserts() {
+        let (mut editor, mut fonts) = editor("{\n    stmt\n}\n");
+        place(&mut editor, &mut fonts, 1, 8);
+        editor.insert_typed(&mut fonts.system, '}').unwrap();
+        assert_eq!(
+            rows(&editor),
+            vec!["{", "    stmt}", "}", ""],
+            "a closer below a line of code is not the expansion's, so it inserts"
+        );
+    }
+
+    #[test]
+    fn typing_a_quote_twice_yields_one_pair_not_four() {
+        let (mut editor, mut fonts) = editor("\n");
+        place(&mut editor, &mut fonts, 0, 0);
+        editor.insert_typed(&mut fonts.system, '"').unwrap();
+        editor.insert_typed(&mut fonts.system, '"').unwrap();
+        assert_eq!(rows(&editor), vec!["\"\"", ""]);
+        assert_eq!(
+            editor.selection.cursor,
+            Position::new(0, 1),
+            "the second quote is swallowed and the caret stays between the pair"
+        );
+    }
+
+    #[test]
+    fn an_apostrophe_over_its_own_completion_is_swallowed() {
+        let (mut editor, mut fonts) = editor("a\n");
+        place(&mut editor, &mut fonts, 0, 1);
+        editor.insert_typed(&mut fonts.system, '\'').unwrap();
+        editor.insert_typed(&mut fonts.system, '\'').unwrap();
+        editor.insert_typed(&mut fonts.system, '\'').unwrap();
+        assert_eq!(rows(&editor), vec!["a''", ""], "one pair, however often it is pressed");
+        assert_eq!(editor.selection.cursor, Position::new(0, 2));
+    }
+
+    #[test]
+    fn a_verbatim_insert_does_not_pair() {
+        let (mut editor, mut fonts) = editor("f\n");
+        place(&mut editor, &mut fonts, 0, 1);
+        editor.insert_text(&mut fonts.system, "(").unwrap();
+        assert_eq!(rows(&editor), vec!["f(", ""], "pastes and IME stay literal");
     }
 
     #[test]
