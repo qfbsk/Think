@@ -37,6 +37,8 @@ enum Drag {
     },
     Editor(Position),
     Shell(GridPos),
+    /// engineering palette: a slider or its scrollbar is held
+    Palette,
 }
 
 /// Which way a held arrow key steps. The name is the one the vertical repeat
@@ -184,9 +186,17 @@ impl App {
         }
 
         let background = ui.background_quads();
-        let foreground = ui.foreground_quads();
+        let foreground = ui.foreground_quads(&mut fonts.system);
         let areas = ui.text_areas();
-        renderer.render(&mut fonts.system, swash, &background, &foreground, areas);
+        let palette_areas = ui.palette_areas();
+        renderer.render(
+            &mut fonts.system,
+            swash,
+            &background,
+            &foreground,
+            areas,
+            palette_areas,
+        );
     }
 
     fn poll_and_blink(&mut self, event_loop: &ActiveEventLoop) {
@@ -326,7 +336,44 @@ impl App {
             }
             return;
         }
+
+        // engineering palette: Ctrl+F12 toggles, the path field eats keys,
+        // Escape closes
         let ctrl = self.modifiers.control_key() && !self.modifiers.alt_key();
+        if ctrl && matches!(event.logical_key, Key::Named(NamedKey::F12)) && !event.repeat {
+            if let Some(ui) = self.ui.as_mut() {
+                ui.palette.toggle();
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            return;
+        }
+        if let Some(ui) = self.ui.as_mut() {
+            if ui.palette.text_active() {
+                let eaten = ui.palette.key(
+                    &mut self.fonts.as_mut().expect("fonts").system,
+                    &mut self.clipboard,
+                    &event,
+                    ctrl,
+                );
+                if eaten {
+                    self.post_palette();
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                return;
+            }
+            if ui.palette.open && matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                ui.palette.toggle();
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+                return;
+            }
+        }
+
         let shift = self.modifiers.shift_key();
         let KeyEvent {
             logical_key: key,
@@ -553,12 +600,14 @@ impl App {
             self.drag = None;
             // A child that asked for the mouse also wants to hear it let go.
             if let Some(ui) = self.ui.as_mut() {
+                ui.palette.release(); // engineering palette
                 let content = ui.editor_content_rect();
                 let (x, y) = ui.mouse();
                 if let Some(shell) = ui.active_shell_mut() {
                     shell.mouse_release(x - content.x, y - content.y);
                 }
             }
+            self.post_palette();
             return;
         }
 
@@ -576,6 +625,16 @@ impl App {
         };
         let system = &mut fonts.system;
         let (x, y) = ui.mouse();
+
+        // engineering palette: the panel takes its own clicks
+        if ui.palette.open {
+            let size = (ui.size.width as f32, ui.size.height as f32);
+            if ui.palette.press(system, size, x, y) {
+                *drag = Some(Drag::Palette);
+                window.request_redraw();
+                return;
+            }
+        }
 
         if ui.hit_window_close(x, y) {
             ui.kill_shells();
@@ -648,6 +707,23 @@ impl App {
     }
 
     fn handle_cursor_moved(&mut self, x: f32, y: f32) {
+        // engineering palette: a palette drag owns the mouse move whole
+        if matches!(self.drag, Some(Drag::Palette)) {
+            let size = self
+                .ui
+                .as_ref()
+                .map(|ui| (ui.size.width as f32, ui.size.height as f32));
+            if let Some(size) = size {
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.palette.drag_to(size, x, y);
+                }
+                self.post_palette();
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            return;
+        }
         let App {
             fonts,
             window,
@@ -692,6 +768,8 @@ impl App {
                 let _ = (origin, cursor);
             }
             None => {}
+            // handled in the early return above
+            Some(Drag::Palette) => {}
         }
 
         let icon = if resize_direction(ui, x, y).is_some() {
@@ -724,6 +802,15 @@ impl App {
         };
         if lines.abs() < f32::EPSILON {
             return;
+        }
+        // engineering palette: the wheel over the panel scrolls the panel
+        {
+            let (x, y) = ui.mouse();
+            let size = (ui.size.width as f32, ui.size.height as f32);
+            if ui.palette.over(size, x, y) {
+                ui.palette.wheel(size, lines);
+                return;
+            }
         }
         if self.modifiers.control_key() {
             let step = if lines > 0.0 { 1.0 } else { -1.0 };
@@ -948,6 +1035,34 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// engineering palette: the deferred repaint after a palette interaction
+    fn post_palette(&mut self) {
+        let App {
+            fonts,
+            window,
+            renderer,
+            ui,
+            ..
+        } = self;
+        let (Some(fonts), Some(ui)) = (fonts.as_mut(), ui.as_mut()) else {
+            return;
+        };
+        let (repaint, reload) = ui.palette.post();
+        if repaint {
+            ui.retheme(&mut fonts.system);
+        }
+        if reload {
+            if let Some(renderer) = renderer.as_mut() {
+                renderer.reload_background();
+            }
+        }
+        if repaint || reload {
+            if let Some(window) = window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn sync_ime(&mut self) {
         let (Some(window), Some(ui)) = (self.window.as_ref(), self.ui.as_ref()) else {
             return;
@@ -1095,7 +1210,11 @@ fn handle_insert_key(
     }
 
     if ctrl {
-        if repeat {
+        // Holding a key is how you cover a range instead of one piece, so the
+        // chords that walk — through history or through words — answer to the
+        // auto-repeat. The rest do not: a held Ctrl+V would paste the same
+        // text thirty times and a held Ctrl+W would be an exit nobody meant.
+        if repeat && !holds_to_repeat(&key) {
             return false;
         }
         match key {
@@ -1293,6 +1412,17 @@ fn handle_insert_key(
     changed
 }
 
+/// The chords that keep working while the key is held down.
+fn holds_to_repeat(key: &Key) -> bool {
+    match key {
+        Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowRight) => true,
+        Key::Character(value) => {
+            matches!(value.as_str(), "z" | "Z" | "y" | "Y" | "[" | "{" | "]" | "}")
+        }
+        _ => false,
+    }
+}
+
 fn insert_into_ui(ui: &mut Ui, system: &mut FontSystem, text: &str) {
     let error = if let Some(editor) = ui.active_editor_mut() {
         editor
@@ -1455,6 +1585,86 @@ fn global_cursor() -> Option<PhysicalPosition<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holding a chord is how you cover a range, so the repeated key presses
+    /// the system sends must reach the action and not be swallowed.
+    #[test]
+    fn a_held_undo_chord_keeps_undoing() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            winit::dpi::PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("undo.txt");
+        std::fs::write(&path, b"").unwrap();
+        ui.open_file(&mut fonts.system, path).unwrap();
+
+        let mut window: Option<Arc<Window>> = None;
+        let mut next_blink = Instant::now();
+        let mut ime: Option<(Instant, String)> = None;
+        let mut clipboard: Option<arboard::Clipboard> = None;
+        let system = &mut fonts.system;
+
+        for _ in 0..10 {
+            let key = Key::Character("a".into());
+            handle_insert_key(
+                &mut window,
+                &mut ui,
+                system,
+                &mut clipboard,
+                &key,
+                Some("a"),
+                false,
+                false,
+                &mut next_blink,
+                &mut ime,
+            );
+        }
+        let chars = |ui: &mut Ui| ui.active_editor_mut().unwrap().document.char_count();
+        assert_eq!(chars(&mut ui), 10, "ten typed characters");
+
+        let z = Key::Character("z".into());
+        let mut seen = vec![];
+        for step in 0..3 {
+            handle_insert_key(
+                &mut window,
+                &mut ui,
+                system,
+                &mut clipboard,
+                &z,
+                None,
+                true,
+                step > 0,
+                &mut next_blink,
+                &mut ime,
+            );
+            seen.push(chars(&mut ui));
+        }
+        assert_eq!(
+            seen,
+            vec![9, 8, 7],
+            "a held Ctrl+Z must undo one step per press, not just the first"
+        );
+    }
+
+    #[test]
+    fn held_chords_are_the_ones_that_walk() {
+        let character = |value: &str| Key::Character(value.into());
+        // Undo, redo, word jumps and line ends: holding them covers a range.
+        for key in ["z", "Z", "y", "Y", "[", "{", "]", "}"] {
+            assert!(holds_to_repeat(&character(key)), "{key} should repeat");
+        }
+        assert!(holds_to_repeat(&Key::Named(NamedKey::ArrowLeft)));
+        assert!(holds_to_repeat(&Key::Named(NamedKey::ArrowRight)));
+        // A held key must not paste the clipboard thirty times, save in a loop,
+        // cut the selection away or close a tab nobody meant to close.
+        for key in ["v", "V", "c", "C", "x", "X", "s", "S", "a", "A", "w", "q"] {
+            assert!(!holds_to_repeat(&character(key)), "{key} must not repeat");
+        }
+    }
 
     #[test]
     fn vertical_repeat_accelerates_then_caps() {

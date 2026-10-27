@@ -99,6 +99,9 @@ pub struct Sidebar {
     pub rows: Vec<Row>,
     pub selected: usize,
     pub buffer: Buffer,
+    /// Whether this pane holds focus; the ui flips it and re-themes, and the
+    /// listing bakes its colors through `theme::pane`.
+    pub focused: bool,
     expanded: HashSet<PathBuf>,
     git: git::Probe,
     archive: archive::Probe,
@@ -128,6 +131,7 @@ impl Sidebar {
             rows: Vec::new(),
             selected: 0,
             buffer,
+            focused: false,
             expanded: HashSet::new(),
             git: git::Probe::new(),
             archive: archive::Probe::new(),
@@ -488,29 +492,37 @@ impl Sidebar {
         buffer.set_tab_width(4);
         buffer.set_size(Some(self.width), Some(self.height));
         for row in &self.rows {
+            let colors = theme::pane(self.focused);
+            let draw = |color: Color| {
+                if self.focused {
+                    color
+                } else {
+                    theme::unfocused(color)
+                }
+            };
             let color = if row.missing {
-                theme::red()
+                colors.red
             } else if row.is_drive {
-                theme::green()
+                colors.green
             } else if row.is_dir {
                 if row.repo {
-                    ICON_ORANGE
+                    draw(ICON_ORANGE)
                 } else {
-                    theme::accent()
+                    colors.accent
                 }
             } else {
-                theme::text()
+                colors.text
             };
             let line_attrs = bold_attrs(self.family, color);
             let mut spans = AttrsList::new(&line_attrs);
             if let Some((mark, color)) = &row.mark {
                 let width = mark.len_utf8();
-                spans.add_span(0..width, &bold_attrs(self.family, *color));
+                spans.add_span(0..width, &bold_attrs(self.family, draw(*color)));
             }
-            spans.add_span(row.icon.clone(), &bold_attrs(self.family, row.icon_color));
+            spans.add_span(row.icon.clone(), &bold_attrs(self.family, draw(row.icon_color)));
             if let Some((added, removed)) = &row.delta {
-                spans.add_span(added.clone(), &bold_attrs(self.family, theme::green()));
-                spans.add_span(removed.clone(), &bold_attrs(self.family, theme::red()));
+                spans.add_span(added.clone(), &bold_attrs(self.family, colors.green));
+                spans.add_span(removed.clone(), &bold_attrs(self.family, colors.red));
             }
             buffer.lines.push(BufferLine::new(
                 row.label.clone(),
@@ -520,7 +532,7 @@ impl Sidebar {
             ));
         }
         if buffer.lines.is_empty() {
-            let line_attrs = bold_attrs(self.family, theme::text_dim());
+            let line_attrs = bold_attrs(self.family, theme::pane(self.focused).text_dim);
             buffer.lines.push(buffer_line(" ", &line_attrs));
         }
         let line = self
@@ -843,6 +855,9 @@ fn file_icon(name: &str) -> (char, Color) {
         "c" => ('󰙱', ICON_BLUE),
         "h" | "hpp" | "hh" | "hxx" => ('󰫵', ICON_MAUVE),
         "cpp" | "cc" | "cxx" => ('󰙲', ICON_SAPPHIRE),
+        // The Arduino mark from this font's devicons set: an infinity sign
+        // with a minus in one loop and a plus in the other.
+        "ino" => ('', ICON_TEAL),
         "cs" => ('󰌛', ICON_GREEN),
         "rs" => ('󱘗', ICON_ORANGE),
         "go" => ('󰟓', ICON_SAPPHIRE),
@@ -948,6 +963,7 @@ mod tests {
         assert_eq!(file_icon("README.md"), ('', ICON_YELLOW));
         assert_eq!(file_icon(".gitignore"), ('󰊢', ICON_MAUVE));
         assert_eq!(file_icon("Cargo.toml"), ('', ICON_ORANGE));
+        assert_eq!(file_icon("Blink.ino"), ('', ICON_TEAL));
         assert_eq!(file_icon("no-extension"), (FILE_ICON, ICON_GREY));
     }
 

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>打字可视化 · 键位对应版</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #12001f; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+
+  .hud {
+    position: fixed; top: 18px; right: 24px;
+    color: rgba(255, 210, 255, .85);
+    text-shadow: 0 0 12px rgba(255, 80, 255, .8);
+    text-align: right; user-select: none; pointer-events: none;
+    line-height: 1.5;
+  }
+  .hud .kpm { font-size: 34px; font-weight: 600; letter-spacing: 1px; }
+  .hud .label { font-size: 12px; letter-spacing: 3px; opacity: .6; }
+
+  .hint {
+    position: fixed; left: 50%; top: 14px; transform: translateX(-50%);
+    color: rgba(255, 190, 255, .55); font-size: 13px; letter-spacing: 3px;
+    user-select: none; pointer-events: none;
+    animation: breath 3s ease-in-out infinite;
+    transition: opacity 1s;
+  }
+  .hint.faded { opacity: 0; animation: none; }
+  @keyframes breath { 0%,100% { opacity: .35; } 50% { opacity: .8; } }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div class="hud">
+  <div class="kpm" id="kpm">0</div>
+  <div class="label">KPM · 击键/分</div>
+</div>
+<div class="hint" id="hint">按哪个键 · 亮哪个位置 —— 打得越快它越疯</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const kpmEl = document.getElementById('kpm');
+  const hintEl = document.getElementById('hint');
+
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = W * DPR; cv.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- 状态 ----------
+  let energy = 0.12;
+  let keystrokes = [];
+  let firstKey = false;
+
+  // ---------- 背景装饰 ----------
+  let dots = [], shards = [];
+  function buildDecor() {
+    dots = []; shards = [];
+    for (let i = 0; i < 46; i++) {
+      dots.push({
+        x: Math.random(), y: Math.random() * 0.85,
+        r: Math.random() * 2.2 + 0.6,
+        a: Math.random() * 0.5 + 0.15,
+        tw: Math.random() * Math.PI * 2,
+        ts: Math.random() * 1.5 + 0.4
+      });
+    }
+    for (let i = 0; i < 6; i++) {
+      shards.push({
+        x: Math.random(), y: Math.random() * 0.55,
+        w: Math.random() * 0.22 + 0.08,
+        h: Math.random() * 0.5 + 0.25,
+        rot: (Math.random() - 0.5) * 0.9,
+        a: Math.random() * 0.05 + 0.03
+      });
+    }
+  }
+  buildDecor();
+  window.addEventListener('resize', buildDecor);
+
+  // ---------- 频谱柱 ----------
+  const BAR_COUNT = 110;
+  const bars = [];
+  for (let i = 0; i < BAR_COUNT; i++) {
+    bars.push({ v: 0.02, tv: 0.02, pulse: Math.random() * Math.PI * 2,
+      speed: Math.random() * 6 + 5, spike: 0 });
+  }
+
+  // ---------- 白色波形 ----------
+  const WAVE_POINTS = 72;
+  const wave = [];
+  for (let i = 0; i < WAVE_POINTS; i++) {
+    wave.push({ v: 0, tv: 0, phase: Math.random() * Math.PI * 2 });
+  }
+
+  // ---------- 键盘布局（真实 QWERTY，宽度近似真实键盘比例） ----------
+  // [label, e.code, widthUnits]
+  const KB_ROWS = [
+    [['`','Backquote',1],['1','Digit1',1],['2','Digit2',1],['3','Digit3',1],['4','Digit4',1],['5','Digit5',1],['6','Digit6',1],['7','Digit7',1],['8','Digit8',1],['9','Digit9',1],['0','Digit0',1],['-','Minus',1],['=','Equal',1],['⌫','Backspace',2]],
+    [['Tab','Tab',1.5],['Q','KeyQ',1],['W','KeyW',1],['E','KeyE',1],['R','KeyR',1],['T','KeyT',1],['Y','KeyY',1],['U','KeyU',1],['I','KeyI',1],['O','KeyO',1],['P','KeyP',1],['[','BracketLeft',1],[']','BracketRight',1],['\\','Backslash',1.5]],
+    [['Caps','CapsLock',1.75],['A','KeyA',1],['S','KeyS',1],['D','KeyD',1],['F','KeyF',1],['G','KeyG',1],['H','KeyH',1],['J','KeyJ',1],['K','KeyK',1],['L','KeyL',1],[';','Semicolon',1],["'",'Quote',1],['⏎','Enter',2.25]],
+    [['Shift','ShiftLeft',2.25],['Z','KeyZ',1],['X','KeyX',1],['C','KeyC',1],['V','KeyV',1],['B','KeyB',1],['N','KeyN',1],['M','KeyM',1],[',','Comma',1],['.','Period',1],['/','Slash',1],['Shift','ShiftRight',2.75]],
+    [['Ctrl','ControlLeft',1.5],['Win','MetaLeft',1.25],['Alt','AltLeft',1.25],['','Space',6.5],['Alt','AltRight',1.25],['Fn','Fn',1.25],['Ctrl','ControlRight',1.5]]
+  ];
+  const KB_UNITS = 15.5;
+
+  let kbW = 0, kbX = 0;
+  const keyMap = new Map();   // e.code -> key 对象
+  function layoutKeys() {
+    keyMap.clear();
+    kbW = Math.min(W * 0.86, 1000);
+    kbX = (W - kbW) / 2;
+    const unit = kbW / KB_UNITS;
+    const keyH = Math.min(unit * 0.95, H * 0.055);
+    const gap = unit * 0.08;
+    const kbY = H - keyH * 5 - gap * 4 - H * 0.035;
+
+    KB_ROWS.forEach((row, r) => {
+      let x = kbX;
+      const y = kbY + r * (keyH + gap);
+      for (const [label, code, wu] of row) {
+        const w = unit * wu - gap;
+        keyMap.set(code, { x, y, w, h: keyH, label, flash: 0, cx: x + w / 2 });
+        x += unit * wu;
+      }
+    });
+  }
+  layoutKeys();
+  window.addEventListener('resize', layoutKeys);
+
+  // ---------- 击键 ----------
+  function hitAt(xNorm, strength) {
+    // 把该归一化位置的冲量打进对应区域的柱子（高斯衰减）
+    const center = xNorm * (BAR_COUNT - 1);
+    for (let off = -7; off <= 7; off++) {
+      const i = Math.round(center + off);
+      if (i < 0 || i >= BAR_COUNT) continue;
+      const g = Math.exp(-(off * off) / 9);
+      bars[i].spike = Math.min(1.6, bars[i].spike + g * strength);
+    }
+    // 波形偏向该位置地踹一脚
+    for (let k = 0; k < 4; k++) {
+      const i = Math.max(0, Math.min(WAVE_POINTS - 1,
+        Math.round(center / BAR_COUNT * WAVE_POINTS + (Math.random() - 0.5) * 8)));
+      wave[i].v += (Math.random() * 0.6 + 0.2) * strength;
+    }
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;                 // 按住不放不算，要真打
+    const now = performance.now();
+    keystrokes.push(now);
+    if (keystrokes.length > 150) keystrokes.shift();
+
+    energy = Math.min(1, energy + 0.075);
+
+    // 找到对应键位 → 亮起来 + 在该键正上方激发
+    const k = keyMap.get(e.code);
+    if (k) {
+      k.flash = 1;
+      hitAt((k.cx - kbX) / kbW, 0.5 + Math.random() * 0.35);
+    } else {
+      hitAt(Math.random(), 0.4);   // 键盘上没画的键（F区、方向键等）
+    }
+
+    if (!firstKey) { firstKey = true; hintEl.classList.add('faded'); }
+  });
+
+  // ---------- 工具 ----------
+  function smoothEdges(n, i) {
+    const x = i / (n - 1);
+    const edge = Math.min(1, Math.sin(x * Math.PI) * 2.2);
+    return Math.max(0.06, edge);
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // ---------- 主循环 ----------
+  let last = performance.now();
+  let kpmTimer = 0, lastKpmShown = 0;
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const t = now / 1000;
+
+    // 能量衰减
+    energy *= Math.pow(0.55, dt);
+    energy = Math.max(0.06, energy);
+
+    // KPM（最近 6 秒折算每分钟）
+    keystrokes = keystrokes.filter(ts => now - ts < 6000);
+    const kpm = keystrokes.length * 10;
+    kpmTimer += dt;
+    if (kpmTimer > 0.15) {
+      kpmTimer = 0;
+      if (kpm !== lastKpmShown) { kpmEl.textContent = kpm; lastKpmShown = kpm; }
+    }
+
+    // 背景
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#0d0016');
+    bg.addColorStop(0.45, '#1c0328');
+    bg.addColorStop(0.62, '#2a0538');
+    bg.addColorStop(1, '#07000d');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // 暗色碎片
+    for (const s of shards) {
+      ctx.save();
+      ctx.translate(s.x * W, s.y * H);
+      ctx.rotate(s.rot);
+      ctx.fillStyle = `rgba(10, 0, 20, ${s.a + 0.12})`;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(s.w * W, -s.h * H * 0.3);
+      ctx.lineTo(s.w * W * 0.8, s.h * H * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 星点
+    for (const d of dots) {
+      const tw = 0.5 + 0.5 * Math.sin(t * d.ts + d.tw);
+      ctx.fillStyle = `rgba(255, 170, 255, ${d.a * (0.4 + tw * (0.5 + energy * 0.6))})`;
+      ctx.beginPath();
+      ctx.arc(d.x * W, d.y * H * 0.72, d.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ---------- 基线 ----------
+    const baseline = H * 0.50;
+    const margin = W * 0.02;
+    const spanW = W - margin * 2;
+
+    // ---------- 更新柱子 ----------
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const b = bars[i];
+      const env = smoothEdges(BAR_COUNT, i);
+      b.pulse += dt * b.speed * (0.5 + energy * 1.6);
+      const wobble = 0.5 + 0.5 * Math.sin(b.pulse) * Math.sin(b.pulse * 0.63 + i);
+      b.tv = env * (0.04 + energy * (0.25 + 0.75 * wobble)) * (0.7 + 0.3 * Math.sin(i * 12.9898));
+      b.tv = Math.min(1, b.tv + b.spike * 0.8);
+      b.spike *= Math.pow(0.02, dt);
+      b.v += (b.tv - b.v) * (1 - Math.pow(0.0005, dt));
+    }
+
+    // ---------- 更新波形 ----------
+    for (let i = 0; i < WAVE_POINTS; i++) {
+      const p = wave[i];
+      p.phase += dt * (2 + energy * 9);
+      const env = smoothEdges(WAVE_POINTS, i);
+      p.tv = env * energy * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(p.phase + Math.sin(p.phase * 0.37) * 2)));
+      p.v += (p.tv - p.v) * (1 - Math.pow(0.001, dt));
+      p.v *= Math.pow(0.35, dt) * 0.2 + 0.8;
+    }
+
+    // ---------- 绘制柱子 ----------
+    const barW = spanW / BAR_COUNT;
+    const solidW = Math.max(1.5, barW * 0.42);
+    const glow = ctx.createLinearGradient(0, baseline, 0, baseline - H * 0.46);
+    glow.addColorStop(0, '#ff1fd4');
+    glow.addColorStop(0.55, '#e436ff');
+    glow.addColorStop(1, '#8a2bff');
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const h = bars[i].v * H * 0.42;
+      if (h < 0.8) continue;
+      const x = margin + i * barW + (barW - solidW) / 2;
+      ctx.fillStyle = glow;
+      ctx.shadowColor = 'rgba(255, 60, 230, 0.9)';
+      ctx.shadowBlur = 14 + energy * 18;
+      ctx.fillRect(x, baseline - h, solidW, h);
+      ctx.shadowBlur = 0;
+    }
+
+    // ---------- 白色波形 ----------
+    ctx.save();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2.4;
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.95)';
+    ctx.shadowBlur = 12 + energy * 16;
+    ctx.beginPath();
+    for (let i = 0; i < WAVE_POINTS; i++) {
+      const x = margin + (i / (WAVE_POINTS - 1)) * spanW;
+      const y = baseline - Math.max(0, wave[i].v) * H * 0.3;
+      if (i === 0) ctx.moveTo(x, y);
+      else {
+        const px = margin + ((i - 1) / (WAVE_POINTS - 1)) * spanW;
+        const py = baseline - Math.max(0, wave[i - 1].v) * H * 0.3;
+        ctx.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // ---------- 倒影 ----------
+    ctx.save();
+    ctx.translate(0, baseline * 2);
+    ctx.scale(1, -0.55);
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const h = bars[i].v * H * 0.42;
+      if (h < 0.8) continue;
+      const x = margin + i * barW + (barW - solidW) / 2;
+      ctx.fillStyle = 'rgba(230, 60, 230, 0.28)';
+      ctx.fillRect(x, baseline - h, solidW, h);
+    }
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.30)';
+    ctx.lineWidth = 2;
+    ctx.shadowColor = 'rgba(255,255,255,0.4)';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    for (let i = 0; i < WAVE_POINTS; i++) {
+      const x = margin + (i / (WAVE_POINTS - 1)) * spanW;
+      const y = baseline - Math.max(0, wave[i].v) * H * 0.3;
+      if (i === 0) ctx.moveTo(x, y);
+      else {
+        const px = margin + ((i - 1) / (WAVE_POINTS - 1)) * spanW;
+        const py = baseline - Math.max(0, wave[i - 1].v) * H * 0.3;
+        ctx.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 倒影渐隐
+    const fade = ctx.createLinearGradient(0, baseline, 0, H);
+    fade.addColorStop(0, 'rgba(7,0,13,0.25)');
+    fade.addColorStop(0.35, 'rgba(7,0,13,0.75)');
+    fade.addColorStop(1, 'rgba(7,0,13,1)');
+    ctx.fillStyle = fade;
+    ctx.fillRect(0, baseline, W, H - baseline);
+
+    // 基线微光
+    const lineGlow = ctx.createLinearGradient(margin, 0, W - margin, 0);
+    lineGlow.addColorStop(0, 'rgba(255,80,255,0)');
+    lineGlow.addColorStop(0.5, `rgba(255,140,255,${0.35 + energy * 0.4})`);
+    lineGlow.addColorStop(1, 'rgba(255,80,255,0)');
+    ctx.fillStyle = lineGlow;
+    ctx.fillRect(margin, baseline - 0.5, spanW, 1);
+
+    // ---------- 键盘 ----------
+    for (const k of keyMap.values()) {
+      k.flash *= Math.pow(0.008, dt);   // 亮起后快速熄灭
+      const f = k.flash;
+      const lit = f > 0.02;
+
+      ctx.save();
+      // 键帽
+      roundRect(k.x, k.y, k.w, k.h, 5);
+      if (lit) {
+        ctx.shadowColor = 'rgba(255, 70, 240, 1)';
+        ctx.shadowBlur = 22;
+        ctx.fillStyle = `rgba(255, 90, 245, ${0.55 + f * 0.45})`;
+      } else {
+        ctx.fillStyle = 'rgba(190, 40, 255, 0.07)';
+      }
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      // 描边
+      roundRect(k.x, k.y, k.w, k.h, 5);
+      ctx.strokeStyle = lit
+        ? `rgba(255, 200, 255, ${0.5 + f * 0.5})`
+        : 'rgba(230, 90, 255, 0.28)';
+      ctx.lineWidth = lit ? 1.6 : 1;
+      ctx.stroke();
+      // 键名
+      if (k.label) {
+        const fontSize = Math.min(k.w * 0.32, k.h * 0.42, 14);
+        ctx.fillStyle = lit ? 'rgba(255, 240, 255, 0.95)' : 'rgba(255, 170, 255, 0.5)';
+        ctx.font = `${fontSize}px "Segoe UI", sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(k.label, k.x + k.w / 2, k.y + k.h / 2 + 1);
+      }
+      ctx.restore();
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

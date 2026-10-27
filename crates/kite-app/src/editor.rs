@@ -18,6 +18,9 @@ pub struct Editor {
     pub buffer: Buffer,
     pub selection: Selection,
     pub desired_x: Option<f32>,
+    /// Whether the right pane currently holds focus; the ui flips it and
+    /// re-themes, and every baked color goes through `theme::pane`.
+    pub focused: bool,
     /// Decoded mirror of the document, only for the highlighter; never saved.
     rope: Option<Rope>,
     language: Option<Language>,
@@ -67,7 +70,7 @@ impl Editor {
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);
         buffer.set_size(Some(view_width.max(1.0)), Some(view_height.max(1.0)));
-        let line_attrs = bold_attrs(family, theme::text());
+        let line_attrs = bold_attrs(family, theme::pane(true).text);
         for index in 0..document.line_count() {
             let text = document.line_text(index);
             buffer.lines.push(buffer_line(&text, &line_attrs));
@@ -87,6 +90,7 @@ impl Editor {
             buffer,
             selection: Selection::caret(Position::default()),
             desired_x: None,
+            focused: true,
             rope,
             language,
             tree,
@@ -148,14 +152,14 @@ impl Editor {
                 runs.iter()
                     .find(|run| run.start <= byte && byte < run.end)
                     .map(|run| run.color)
-                    .unwrap_or_else(theme::text),
+                    .unwrap_or_else(|| theme::pane(self.focused).text),
             )
         };
         let before = caret.ch.checked_sub(1).and_then(|index| ink(index));
         let after = ink(caret.ch);
         self.ink_before_caret = before;
         self.ink_after_caret = after;
-        let base = bold_attrs(self.family, theme::text());
+        let base = bold_attrs(self.family, theme::pane(self.focused).text);
         for index in first..last {
             let text = self.document.line_text(index);
             let start = self
@@ -220,12 +224,22 @@ impl Editor {
             self.rebuild_tree();
             return;
         }
+        // ropey counts characters while tree-sitter counts bytes, so the two
+        // indices stay apart: feeding a byte index to `remove` deletes too
+        // little as soon as the file holds one non-ASCII character, and the
+        // mirror then drifts until a slice lands mid-character.
         let from = self.rope.as_ref().unwrap().line_to_byte(change.start_line);
         let to = self
             .rope
             .as_ref()
             .unwrap()
             .line_to_byte(change.start_line + change.old_count);
+        let from_char = self.rope.as_ref().unwrap().line_to_char(change.start_line);
+        let to_char = self
+            .rope
+            .as_ref()
+            .unwrap()
+            .line_to_char(change.start_line + change.old_count);
         let joined: Vec<String> = (0..change.new_count)
             .map(|index| self.document.line_text(change.start_line + index))
             .collect();
@@ -235,8 +249,8 @@ impl Editor {
         }
         {
             let rope = self.rope.as_mut().expect("rope");
-            rope.remove(from..to);
-            rope.insert(from, &text);
+            rope.remove(from_char..to_char);
+            rope.insert(from_char, &text);
         }
         self.colored = None;
         let edit = InputEdit {
@@ -338,7 +352,7 @@ impl Editor {
             } else {
                 " ".repeat(digits)
             };
-            rows.push((text, theme::text_dim()));
+            rows.push((text, theme::pane(self.focused).text_dim));
         }
 
         let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
@@ -353,7 +367,7 @@ impl Editor {
         if buffer.lines.is_empty() {
             buffer.lines.push(buffer_line(
                 " ",
-                &bold_attrs(self.family, theme::text_dim()),
+                &bold_attrs(self.family, theme::pane(self.focused).text_dim),
             ));
         }
         buffer.set_scroll(Scroll {
@@ -897,7 +911,7 @@ impl Editor {
                 self.buffer.set_scroll(Scroll { line, ..scroll });
             }
             deeper = change.new_count > change.old_count;
-            let line_attrs = bold_attrs(self.family, theme::text());
+            let line_attrs = bold_attrs(self.family, theme::pane(self.focused).text);
             let new_lines = (0..change.new_count)
                 .map(|index| {
                     let text = self.document.line_text(change.start_line + index);
@@ -930,7 +944,7 @@ impl Editor {
     }
 
     fn rebuild_buffer(&mut self, font_system: &mut FontSystem) {
-        let line_attrs = bold_attrs(self.family, theme::text());
+        let line_attrs = bold_attrs(self.family, theme::pane(self.focused).text);
         let mut buffer = Buffer::new_empty(Metrics::new(self.font_size, self.line_height));
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_tab_width(4);
@@ -1209,6 +1223,36 @@ mod tests {
             .map(|line| line.text().to_string())
             .collect();
         assert_eq!(rows, vec!["1", "2", "3", "4"]);
+    }
+
+    /// ropey counts characters and tree-sitter counts bytes. Feeding one to the
+    /// other kept the highlighter's mirror one byte behind per non-ASCII
+    /// character on every edit, until a slice landed mid-character and killed
+    /// the app — so this types Chinese *and* walks the highlighter over it.
+    #[test]
+    fn typing_in_a_file_with_chinese_keeps_the_mirror_identical() {
+        let source = "// 清枫不识客\nfn main() {\n    let x = 1; // 注释在这里\n}\n";
+        let (mut editor, mut fonts) = rust_editor(source);
+        for key in ["a", "中", "b", "文", "\n", "c"] {
+            editor.insert_text(&mut fonts.system, key).unwrap();
+            editor.highlight(&mut fonts.system);
+        }
+        editor.move_right(&mut fonts.system);
+        let _ = editor.backspace(&mut fonts.system);
+        editor.highlight(&mut fonts.system);
+
+        let rope = editor.rope.as_ref().expect("a mirror");
+        let joined = (0..editor.document.line_count())
+            .map(|index| editor.document.line_text(index))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rope.to_string(),
+            joined,
+            "the mirror drifted away from the document"
+        );
+        assert_eq!(rope.len_chars(), joined.chars().count());
+        assert_eq!(rope.len_bytes(), joined.len());
     }
 
     /// The cost of a keystroke is the screen, not the file: a change relays out

@@ -44,6 +44,16 @@ const DEFINITIONS: &[Definition] = &[
         locals: include_str!("../runtime/queries/c/locals.scm"),
     },
     Definition {
+        name: "cpp",
+        // `.ino` is an Arduino sketch: same grammar, only `setup()`/`loop()`
+        // and the pin helpers are prelude sugar the C++ grammar parses fine.
+        extensions: &["cpp", "cxx", "cc", "hpp", "hh", "hxx", "ino"],
+        grammar: || Grammar::try_from(tree_sitter_cpp::LANGUAGE).ok(),
+        highlights: include_str!("../runtime/queries/cpp/highlights.scm"),
+        injections: include_str!("../runtime/queries/cpp/injections.scm"),
+        locals: include_str!("../runtime/queries/cpp/locals.scm"),
+    },
+    Definition {
         name: "rust",
         extensions: &["rs"],
         grammar: || Grammar::try_from(tree_sitter_rust::LANGUAGE).ok(),
@@ -536,6 +546,16 @@ mod tests {
     fn unknown_extensions_stay_uncoloured() {
         assert!(language_for_path(Path::new("x.unknownext")).is_none());
         assert!(language_for_path(Path::new("noextension")).is_none());
+    }
+
+    /// A sketch is C++ with a prelude — `setup()`, `loop()` and the pin helpers
+    /// are ordinary calls to the grammar, so one definition colours both.
+    #[test]
+    fn an_arduino_sketch_is_read_as_cpp() {
+        let sketch = "void setup() {\n  pinMode(13, OUTPUT);\n}\nvoid loop() {\n  delay(500);\n}\n";
+        assert_eq!(highlight(sketch, "ino", "void"), "#cba6f7");
+        assert_eq!(highlight(sketch, "ino", "500"), "#fab387");
+        assert_eq!(highlight("// note\n", "ino", "note"), "#9399b2");
     }
 
     /// Two megabytes is the largest file the budget keeps, and it is the one

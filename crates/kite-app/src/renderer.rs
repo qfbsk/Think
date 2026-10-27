@@ -49,23 +49,35 @@ struct BackgroundUniform {
     tint: [f32; 4],
 }
 
-const BACKGROUND_BLURRED: &[u8] = include_bytes!("../assets/background.jpg");
-const BACKGROUND_SHARP: &[u8] = include_bytes!("../assets/background-neo.jpg");
+const BACKGROUND: &[u8] = include_bytes!("../assets/background-neo.jpg");
 
-fn embedded_background(wallpaper: theme::Wallpaper) -> image::RgbaImage {
-    let bytes = match wallpaper {
-        theme::Wallpaper::Blurred => BACKGROUND_BLURRED,
-        theme::Wallpaper::Sharp => BACKGROUND_SHARP,
-    };
-    image::load_from_memory(bytes)
+fn embedded_background() -> image::RgbaImage {
+    image::load_from_memory(BACKGROUND)
         .expect("embedded kite background is not a valid jpeg")
         .to_rgba8()
 }
 
-fn load_background(max_dimension: u32) -> (image::RgbaImage, Option<String>) {
-    let embedded = || embedded_background(theme::wallpaper());
+/// The wallpaper only ever shows cover-cropped into the window, so the source
+/// is pre-scaled to exactly that crop: a blur radius means display pixels, and
+/// a 20 MP photo cannot drag hundreds of megabytes of blur buffers in.
+fn load_background(max_dimension: u32, view: (u32, u32)) -> (image::RgbaImage, Option<String>) {
+    let fit = |image: image::RgbaImage| {
+        let (vw, vh) = (view.0.max(1) as f32, view.1.max(1) as f32);
+        let (iw, ih) = (image.width() as f32, image.height() as f32);
+        let cover = (vw / iw).max(vh / ih);
+        if cover >= 1.0 {
+            return image;
+        }
+        let w = (iw * cover).round().max(1.0) as u32;
+        let h = (ih * cover).round().max(1.0) as u32;
+        image::imageops::resize(&image, w, h, image::imageops::FilterType::CatmullRom)
+    };
+    let blur = |mut image: image::RgbaImage| {
+        crate::blur::box_blur(&mut image, theme::background_blur());
+        image
+    };
     let Some(path) = theme::background_image() else {
-        return (embedded(), None);
+        return (blur(fit(embedded_background())), None);
     };
     match image::open(&path) {
         Ok(image) => {
@@ -74,10 +86,10 @@ fn load_background(max_dimension: u32) -> (image::RgbaImage, Option<String>) {
             } else {
                 image
             };
-            (image.to_rgba8(), None)
+            (blur(fit(image.to_rgba8())), None)
         }
         Err(error) => (
-            embedded(),
+            blur(fit(embedded_background())),
             Some(format!("background {}: {error}", path.display())),
         ),
     }
@@ -98,7 +110,7 @@ pub struct Renderer {
     bg_image_size: [f32; 2],
     background_texture: Texture,
     background_sampler: Sampler,
-    background_source: (theme::Wallpaper, Option<PathBuf>),
+    background_source: (Option<PathBuf>, u32),
     background_notice: Option<String>,
 
     pipeline: RenderPipeline,
@@ -110,6 +122,8 @@ pub struct Renderer {
     _cache: Cache,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    /// engineering palette: its text needs its own pass above every quad
+    palette_text_renderer: TextRenderer,
     viewport: Viewport,
 }
 
@@ -120,18 +134,29 @@ impl Renderer {
 
     pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
         let size = window.inner_size().max(PhysicalSize::new(1, 1));
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::DX12,
-            ..InstanceDescriptor::new_with_display_handle(Box::new(
-                event_loop.owned_display_handle(),
-            ))
-        });
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions::default())
-            .await
-            .expect("no graphics adapter available");
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
+        // The GL driver's heaps idle tens of megabytes of commit cheaper than
+        // DX12's; DX12 stays the fallback for machines without a usable GL.
+        let order: &[Backends] = match std::env::var("KITE_BACKEND").ok().as_deref() {
+            Some("vulkan") => &[Backends::VULKAN],
+            Some("gl") => &[Backends::GL],
+            Some("dx12") => &[Backends::DX12],
+            _ => &[Backends::GL, Backends::DX12],
+        };
+        let mut chosen = None;
+        for backends in order {
+            let instance = Instance::new(InstanceDescriptor {
+                backends: *backends,
+                ..InstanceDescriptor::new_with_display_handle(Box::new(
+                    event_loop.owned_display_handle(),
+                ))
+            });
+            let Ok(adapter) = instance
+                .request_adapter(&RequestAdapterOptions::default())
+                .await
+            else {
+                continue;
+            };
+            let device_desc = DeviceDescriptor {
                 label: Some("kite"),
                 required_features: wgpu::Features::empty(),
                 // The swapchain may not be bigger than this limit, so asking
@@ -140,9 +165,14 @@ impl Renderer {
                 required_limits: adapter.limits(),
                 memory_hints: MemoryHints::MemoryUsage,
                 ..DeviceDescriptor::default()
-            })
-            .await
-            .expect("could not create graphics device");
+            };
+            if let Ok((device, queue)) = adapter.request_device(&device_desc).await {
+                chosen = Some((instance, adapter, device, queue));
+                break;
+            }
+        }
+        let (instance, adapter, device, queue) =
+            chosen.expect("no graphics backend available");
 
         let surface = instance
             .create_surface(window.clone())
@@ -257,8 +287,10 @@ impl Renderer {
             cache: None,
         });
 
-        let (background, background_notice) =
-            load_background(device.limits().max_texture_dimension_2d);
+        let (background, background_notice) = load_background(
+            device.limits().max_texture_dimension_2d,
+            (size.width, size.height),
+        );
         let (bg_width, bg_height) = background.dimensions();
         let background_texture = device.create_texture(&TextureDescriptor {
             label: Some("kite background"),
@@ -417,6 +449,10 @@ impl Renderer {
         let mut atlas = TextAtlas::with_color_mode(&device, &queue, &cache, format, ColorMode::Web);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        // engineering palette: its labels sit above every quad, so they need
+        // their own pass after the foreground
+        let palette_text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         Self {
             instance,
@@ -432,7 +468,7 @@ impl Renderer {
             bg_image_size: [bg_width as f32, bg_height as f32],
             background_texture,
             background_sampler,
-            background_source: (theme::wallpaper(), theme::background_image()),
+            background_source: (theme::background_image(), theme::background_blur()),
             background_notice,
             pipeline,
             uniform_buffer,
@@ -442,6 +478,7 @@ impl Renderer {
             _cache: cache,
             atlas,
             text_renderer,
+            palette_text_renderer,
             viewport,
         }
     }
@@ -459,13 +496,17 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Re-upload the wallpaper when a `theme` command changed its source.
-    fn sync_background(&mut self) {
-        let source = (theme::wallpaper(), theme::background_image());
+    /// Re-decodes the wallpaper only when its source moved (image path or blur
+    /// radius), so `render` can afford to call it every frame.
+    pub fn reload_background(&mut self) {
+        let source = (theme::background_image(), theme::background_blur());
         if source == self.background_source {
             return;
         }
-        let (image, notice) = load_background(self.device.limits().max_texture_dimension_2d);
+        let (image, notice) = load_background(
+            self.device.limits().max_texture_dimension_2d,
+            (self.config.width, self.config.height),
+        );
         let (width, height) = image.dimensions();
         let texture = self.device.create_texture(&TextureDescriptor {
             label: Some("kite background"),
@@ -527,8 +568,9 @@ impl Renderer {
         background_quads: &[QuadVertex],
         foreground_quads: &[QuadVertex],
         text_areas: Vec<TextArea<'_>>,
+        palette_areas: Vec<TextArea<'_>>,
     ) {
-        self.sync_background();
+        self.reload_background();
         self.viewport.update(
             &self.queue,
             glyphon::Resolution {
@@ -547,6 +589,17 @@ impl Renderer {
             swash_cache,
         ) {
             eprintln!("kite: text prepare failed: {error}");
+        }
+        if let Err(error) = self.palette_text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            font_system,
+            &mut self.atlas,
+            &self.viewport,
+            palette_areas,
+            swash_cache,
+        ) {
+            eprintln!("kite: palette text prepare failed: {error}");
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -661,6 +714,13 @@ impl Renderer {
                 let start = background_quads.len() as u32;
                 let end = start + foreground_quads.len() as u32;
                 pass.draw(start..end, 0..1);
+            }
+            // engineering palette labels, above every quad
+            if let Err(error) = self
+                .palette_text_renderer
+                .render(&mut self.atlas, &self.viewport, &mut pass)
+            {
+                eprintln!("kite: palette text render failed: {error}");
             }
         }
 

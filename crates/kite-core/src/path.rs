@@ -41,6 +41,16 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
+/// The same location as a plain Win32 path. `fs::canonicalize` hands back a
+/// verbatim `\\?\` path, and a child process started in one cannot write to
+/// its own directory: cmd calls it an unsupported UNC path and `ld` fails to
+/// create its output. Anything stored for later, or handed to a child, goes
+/// through here so the shape is right once and everywhere.
+pub fn plain_path(path: &Path) -> PathBuf {
+    let text = display_path(path);
+    PathBuf::from(text)
+}
+
 /// Absolute save target that preserves the path the tab was opened with.
 /// It does not resolve symlinks and does not require the file to exist.
 pub fn absolute_bound_path(path: &Path) -> io::Result<PathBuf> {
@@ -79,5 +89,29 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let upper = dir.path().join("MIXEDCASE.TXT");
         assert_eq!(file_key(&file).unwrap(), file_key(&upper).unwrap());
+    }
+
+    /// A child process has to be able to write in the directory it starts in,
+    /// so the path handed to it is never the verbatim form canonicalize gives.
+    #[cfg(windows)]
+    #[test]
+    fn a_canonicalized_path_becomes_one_a_child_can_work_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize is verbatim: {canonical:?}"
+        );
+        let plain = plain_path(&canonical);
+        assert!(!plain.to_string_lossy().starts_with(r"\\?\"));
+        assert!(plain.is_dir(), "still the same directory: {plain:?}");
+        // A drive root keeps its separator, so it stays a directory path.
+        assert_eq!(plain_path(Path::new(r"\\?\C:\")), PathBuf::from(r"C:\"));
+        assert!(plain_path(Path::new(r"\\?\C:\")).is_dir());
+        // A UNC share loses only the prefix.
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\server\share")),
+            PathBuf::from(r"\\server\share")
+        );
     }
 }

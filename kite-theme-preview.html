@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>kite 主题遮罩预览器</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #11111b; color: #cdd6f4; font: 13px/1.5 "JetBrains Mono", Consolas, monospace; display: flex; height: 100vh; overflow: hidden; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; min-width: 0; }
+  #view { box-shadow: 0 0 0 1px #45475a, 0 8px 40px #000a; image-rendering: auto; }
+  #panel { width: 372px; overflow-y: auto; border-left: 1px solid #45475a; background: #181825; padding: 12px 14px 40px; }
+  h1 { font-size: 14px; margin: 0 0 4px; }
+  h2 { font-size: 12px; margin: 18px 0 6px; color: #89b4fa; text-transform: uppercase; letter-spacing: .08em; }
+  .note { color: #6c7086; font-size: 11px; margin: 0 0 10px; }
+  .row { display: grid; grid-template-columns: 86px 34px 1fr 84px; gap: 8px; align-items: center; margin: 5px 0; }
+  .row label { color: #a6adc8; }
+  .row output { text-align: right; color: #f9e2af; font-size: 11px; }
+  input[type=color] { width: 34px; height: 24px; padding: 0; border: 1px solid #45475a; background: none; }
+  input[type=range] { width: 100%; }
+  input[type=number], input[type=text], textarea, select { background: #11111b; color: #cdd6f4; border: 1px solid #45475a; font: inherit; padding: 3px 6px; width: 100%; }
+  textarea { height: 150px; resize: vertical; }
+  .line { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+  .line > label { width: 86px; color: #a6adc8; flex: none; }
+  button { background: #313244; color: #cdd6f4; border: 1px solid #45475a; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #45475a; }
+  .seg { display: flex; gap: 6px; }
+  .seg button.on { background: #89b4fa; color: #1e1e2e; border-color: #89b4fa; }
+  #warn { color: #f38ba8; font-size: 11px; min-height: 15px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="view" width="1600" height="900"></canvas></div>
+<div id="panel">
+  <h1>kite 遮罩预览器</h1>
+  <p class="note">公式与 kite 逐像素相同：壁纸 <code>mix(img, bg, dim)</code>（sRGB 空间，居中 cover 裁剪），模糊 = 三趟盒式（源图像素半径，边缘复制，f64，末了才 round，与 blur.rs 同序），其上各纱按 8-bit src-over 叠，顺序 = ui.rs background_quads。模糊拉杆拖动中是 1/4 分辨率代理实时预览，松手或键盘定格才跑全分辨率精确值。改完把下面的 toml 贴进 %APPDATA%\kite\theme.toml 重启即一致。</p>
+
+  <h2>窗口</h2>
+  <div class="line"><label>尺寸</label><input type="number" id="w" value="1600" min="320" max="3840"> × <input type="number" id="h" value="900" min="200" max="2160"></div>
+  <div class="line"><label>侧栏</label><div class="seg"><button id="sbOn" class="on">显示</button><button id="sbOff">隐藏</button></div></div>
+  <div class="line"><label>焦点在</label><div class="seg"><button id="foR" class="on">右侧</button><button id="foS">侧栏</button></div></div>
+
+  <h2>壁纸</h2>
+  <div class="line"><label>来源</label><div class="seg"><button id="wpNeo" class="on">neo 清晰</button><button id="wpBlur">模糊</button><button id="wpFile">导入</button></div></div>
+  <div class="line"><label></label><input type="file" id="file" accept="image/*" hidden><span id="wpName" class="note">crates/kite-app/assets/background-neo.jpg</span></div>
+  <div class="row"><label>模糊（源图像素）</label><input type="range" id="r_blur" min="0" max="64" value="0"><output id="o_blur"></output></div>
+  <div id="warn"></div>
+
+  <h2>整图纱</h2>
+  <div class="row"><label>bg（纱色）</label><input type="color" id="c_bg" value="#1e1e2e"><input type="range" id="a_dim" min="0" max="100" value="18"><output id="o_dim"></output></div>
+  <div class="row"><label>dim</label><span></span><input type="range" id="r_dim" min="0" max="100" value="18"><output id="o_dim2"></output></div>
+
+  <h2>各层纱（色 + alpha）</h2>
+  <div id="veils"></div>
+
+  <h2>预设</h2>
+  <div class="line"><button id="pNeo">neo</button><button id="pDef">default</button></div>
+
+  <h2>theme.toml</h2>
+  <div class="line"><button id="copy">复制导出</button><button id="apply">导入粘贴的 toml</button></div>
+  <textarea id="toml" spellcheck="false"></textarea>
+</div>
+
+<script>
+"use strict";
+// ---- state: exactly the keys kite reads for the veil stack ----
+const VEILS = [
+  ["panel",      "主面板+可视化条"],
+  ["panel_dim",  "标签栏"],
+  ["sidebar",    "侧栏"],
+  ["status",     "状态栏"],
+  ["border",     "1px 分隔线"],
+  ["overlay_dim","焦点遮罩(盖无焦点侧)"],
+  ["tab_active", "活动标签"],
+  ["accent",     "标签下划线"],
+];
+const PRESETS = {
+  neo: { bg:"#1e1e2e", dim:0.18, panel:"#0c2644b4", panel_dim:"#081c34c0", sidebar:"#0c2b5398",
+         status:"#11111be0", border:"#45475a80", overlay_dim:"#06122680", tab_active:"#313244cc",
+         tab_hover:"#45475a80", accent:"#89b4fa", wallpaper:"Sharp", blur:0 },
+  default: { bg:"#1e1e2e", dim:0.18, panel:"#1e1e2eb4", panel_dim:"#181825d2", sidebar:"#18182598",
+         status:"#11111be0", border:"#45475a80", overlay_dim:"#11111b59", tab_active:"#313244cc",
+         tab_hover:"#45475a80", accent:"#89b4fa", wallpaper:"Blurred", blur:0 },
+};
+const S = { w:1600, h:900, sidebar:true, focus:"right", wp:"neo", blur:0,
+            bg:"#1e1e2e", dim:0.18, panel:"#0c2644b4", panel_dim:"#081c34c0", sidebar:"#0c2b5398",
+            status:"#11111be0", border:"#45475a80", overlay_dim:"#06122680", tab_active:"#313244cc",
+            accent:"#89b4fa" };
+
+const cv = document.getElementById("view"), ctx = cv.getContext("2d");
+const hexRGB = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16));
+const rgba = (h8, aOverride) => {
+  const [r,g,b] = hexRGB(h8);
+  const a = aOverride !== undefined ? aOverride : parseInt(h8.slice(7,9) || "ff", 16) / 255;
+  return `rgba(${r},${g},${b},${a})`;
+};
+const withAlpha = (h8, a01) => "#" + h8.slice(1,7) + Math.round(a01*255).toString(16).padStart(2,"0");
+const alphaOf = h => h.length >= 9 ? parseInt(h.slice(7,9),16) : 255;
+
+// ---- wallpapers: same cover-crop maths as bg.wgsl ----
+const images = { neo: new Image(), blur: new Image(), file: null };
+images.neo.src = "crates/kite-app/assets/background-neo.jpg";
+images.blur.src = "crates/kite-app/assets/background.jpg";
+let wpReady = { neo:false, blur:false, file:false };
+for (const k of ["neo","blur"]) {
+  images[k].onload = () => { wpReady[k] = true; draw(); };
+  images[k].onerror = () => { document.getElementById("warn").textContent =
+    "内嵌壁纸读不到：把本 html 放在 E:\\Think 根目录，或用「导入」选一张图。"; };
+}
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => { images.file = img; wpReady.file = true; setWp("file");
+    document.getElementById("wpName").textContent = f.name + "（导入图：kite 侧需在 toml 写 image = 该文件路径）"; };
+  img.src = URL.createObjectURL(f);
+};
+
+function setWp(kind) {
+  S.wp = kind;
+  for (const [id,k] of [["wpNeo","neo"],["wpBlur","blur"],["wpFile","file"]])
+    document.getElementById(id).classList.toggle("on", k === kind);
+  draw();
+}
+document.getElementById("wpNeo").onclick = () => setWp("neo");
+document.getElementById("wpBlur").onclick = () => setWp("blur");
+document.getElementById("wpFile").onclick = () => document.getElementById("file").click();
+
+// ---- blur: the exact loop from blur.rs, in the same order over f64 ----
+// Three box passes, edge-replicate, divide by window, round only at the end.
+function boxBlur(img, radius) {
+  const w = img.width, h = img.height;
+  const sc = document.createElement("canvas"); sc.width = w; sc.height = h;
+  const sctx = sc.getContext("2d"); sctx.drawImage(img, 0, 0);
+  const data = sctx.getImageData(0, 0, w, h).data;
+  const r = radius, win = 2*r + 1;
+  let src = new Float64Array(w*h*3);
+  for (let i = 0, j = 0; i < w*h; i++) { src[j++] = data[i*4]; src[j++] = data[i*4+1]; src[j++] = data[i*4+2]; }
+  let dst = new Float64Array(src.length);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < h; y++) {
+      const row = y*w*3; let s0 = 0, s1 = 0, s2 = 0;
+      for (let x = 0; x < w; x++) {
+        if (x === 0) {
+          for (let i = 0; i <= 2*r; i++) { const at = Math.min(w-1, Math.max(0, i-r))*3;
+            s0 += src[row+at]; s1 += src[row+at+1]; s2 += src[row+at+2]; }
+        } else {
+          const a = Math.min(w-1, x+r)*3; s0 += src[row+a]; s1 += src[row+a+1]; s2 += src[row+a+2];
+          const b = Math.max(0, x-r-1)*3; s0 -= src[row+b]; s1 -= src[row+b+1]; s2 -= src[row+b+2];
+        }
+        const d = row + x*3; dst[d] = s0/win; dst[d+1] = s1/win; dst[d+2] = s2/win;
+      }
+    }
+    let t = src; src = dst; dst = t;
+    for (let x = 0; x < w; x++) {
+      const col = x*3; let s0 = 0, s1 = 0, s2 = 0;
+      for (let y = 0; y < h; y++) {
+        if (y === 0) {
+          for (let i = 0; i <= 2*r; i++) { const at = Math.min(h-1, Math.max(0, i-r))*w*3 + col;
+            s0 += src[at]; s1 += src[at+1]; s2 += src[at+2]; }
+        } else {
+          const a = Math.min(h-1, y+r)*w*3 + col; s0 += src[a]; s1 += src[a+1]; s2 += src[a+2];
+          const b = Math.max(0, y-r-1)*w*3 + col; s0 -= src[b]; s1 -= src[b+1]; s2 -= src[b+2];
+        }
+        const d = y*w*3 + col; dst[d] = s0/win; dst[d+1] = s1/win; dst[d+2] = s2/win;
+      }
+    }
+    t = src; src = dst; dst = t;
+  }
+  const out = document.createElement("canvas"); out.width = w; out.height = h;
+  const octx = out.getContext("2d"); const od = octx.createImageData(w, h);
+  for (let i = 0; i < w*h; i++) {
+    od.data[i*4]   = Math.min(255, Math.max(0, Math.round(src[i*3])));
+    od.data[i*4+1] = Math.min(255, Math.max(0, Math.round(src[i*3+1])));
+    od.data[i*4+2] = Math.min(255, Math.max(0, Math.round(src[i*3+2])));
+    od.data[i*4+3] = data[i*4+3];
+  }
+  octx.putImageData(od, 0, 0);
+  return out;
+}
+const blurCache = { exact: new Map(), proxy: new Map() };
+function cached(map, ck, make) {
+  if (map.has(ck)) { const v = map.get(ck); map.delete(ck); map.set(ck, v); return v; }
+  const v = make(); map.set(ck, v);
+  while (map.size > 2) map.delete(map.keys().next().value);
+  return v;
+}
+// An exact blur costs ~400ms at 1080p, so a live drag rides a quarter-res
+// proxy; only the settled radius pays for the real thing.
+const PROXY = 4;
+let draggingBlur = false;
+function proxyOf(img, key, radius) {
+  return cached(blurCache.proxy, key + "|" + radius, () => {
+    const pw = Math.max(1, Math.round(img.width / PROXY)), ph = Math.max(1, Math.round(img.height / PROXY));
+    const c = document.createElement("canvas"); c.width = pw; c.height = ph;
+    c.getContext("2d").drawImage(img, 0, 0, pw, ph);
+    return boxBlur(c, Math.max(1, Math.round(radius / PROXY)));
+  });
+}
+function exactOf(img, key, radius) {
+  return cached(blurCache.exact, key + "|" + radius, () => boxBlur(img, radius));
+}
+let rafPending = false;
+function scheduleDraw() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => { rafPending = false; draw(); });
+}
+const blurSlider = document.getElementById("r_blur");
+blurSlider.addEventListener("pointerdown", () => { draggingBlur = true; });
+window.addEventListener("pointerup", () => { if (draggingBlur) { draggingBlur = false; scheduleDraw(); } });
+blurSlider.oninput = e => { S.blur = +e.target.value; scheduleDraw(); };
+blurSlider.onchange = () => { draggingBlur = false; scheduleDraw(); };
+
+// ---- controls ----
+const veilHost = document.getElementById("veils");
+for (const [key, label] of VEILS) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML = `<label title="${key}">${label}</label>
+    <input type="color" id="c_${key}" value="${S[key].slice(0,7)}">
+    <input type="range" id="a_${key}" min="0" max="255" value="${alphaOf(S[key])}">
+    <output id="o_${key}"></output>`;
+  veilHost.appendChild(row);
+}
+function syncControls() {
+  document.getElementById("c_bg").value = S.bg.slice(0,7);
+  document.getElementById("r_dim").value = Math.round(S.dim*100);
+  document.getElementById("a_dim").value = Math.round(S.dim*100);
+  for (const [key] of VEILS) {
+    document.getElementById("c_"+key).value = S[key].slice(0,7);
+    document.getElementById("a_"+key).value = alphaOf(S[key]);
+  }
+  document.getElementById("w").value = S.w; document.getElementById("h").value = S.h;
+  document.getElementById("r_blur").value = S.blur;
+  exportToml();
+}
+function readouts() {
+  document.getElementById("o_dim").textContent = (S.dim).toFixed(2);
+  document.getElementById("o_dim2").textContent = (S.dim).toFixed(2);
+  document.getElementById("o_blur").textContent = `${S.blur} px`;
+  for (const [key] of VEILS) {
+    const a = alphaOf(S[key]);
+    document.getElementById("o_"+key).textContent = `${a} ${(a/255*100).toFixed(0)}%`;
+  }
+}
+document.getElementById("c_bg").oninput = e => { S.bg = e.target.value + "ff"; draw(); };
+for (const kind of ["r_dim","a_dim"])
+  document.getElementById(kind).oninput = e => { S.dim = e.target.value/100;
+    document.getElementById("r_dim").value = e.target.value;
+    document.getElementById("a_dim").value = e.target.value; draw(); };
+for (const [key] of VEILS) {
+  document.getElementById("c_"+key).oninput = e => { S[key] = e.target.value + S[key].slice(7,9); draw(); };
+  document.getElementById("a_"+key).oninput = e => { S[key] = S[key].slice(0,7) + (+e.target.value).toString(16).padStart(2,"0"); draw(); };
+}
+document.getElementById("w").oninput = e => { S.w = Math.max(320, e.target.value|0); draw(); };
+document.getElementById("h").oninput = e => { S.h = Math.max(200, e.target.value|0); draw(); };
+const seg = (onId, offId, fn) => {
+  document.getElementById(onId).onclick = () => { fn(true);
+    document.getElementById(onId).classList.add("on"); document.getElementById(offId).classList.remove("on"); };
+  document.getElementById(offId).onclick = () => { fn(false);
+    document.getElementById(offId).classList.add("on"); document.getElementById(onId).classList.remove("on"); };
+};
+seg("sbOn","sbOff", v => { S.sidebar = v; draw(); });
+seg("foR","foS", v => { S.focus = v ? "right" : "sidebar"; draw(); });
+document.getElementById("pNeo").onclick = () => Object.assign(S, PRESETS.neo);
+document.getElementById("pDef").onclick = () => Object.assign(S, PRESETS.default);
+for (const id of ["pNeo","pDef"]) document.getElementById(id).onclick = (() => {
+  const old = document.getElementById(id).onclick;
+  return () => { old(); syncControls(); draw(); };
+})();
+
+// ---- toml in/out ----
+function exportToml() {
+  const t = [];
+  t.push(`# 贴进 %APPDATA%\\kite\\theme.toml（重启生效）`);
+  t.push(`[background]`);
+  t.push(`dim = ${S.dim.toFixed(2)}`);
+  t.push(`blur = ${S.blur}`);
+  t.push(`# image = "C:\\\\path\\\\wall.jpg"   # 导入图时取消注释并写绝对路径`);
+  t.push(`[colors]`);
+  t.push(`bg = "${S.bg.slice(0,7)}"`);
+  for (const [key] of VEILS) t.push(`${key} = "${S[key]}"`);
+  t.push(`tab_hover = "${S.tab_hover || "#45475a80"}"`);
+  document.getElementById("toml").value = t.join("\n");
+}
+document.getElementById("copy").onclick = () => {
+  const ta = document.getElementById("toml"); ta.select(); document.execCommand("copy");
+};
+document.getElementById("apply").onclick = () => {
+  let section = "";
+  for (const line of document.getElementById("toml").value.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const m = s.match(/^\[([a-z_]+)\]$/); if (m) { section = m[1]; continue; }
+    const kv = s.match(/^([a-z_]+)\s*=\s*"?([^"]*)"?$/); if (!kv) continue;
+    const [, k, v] = kv;
+    if (section === "background" && k === "dim") S.dim = Math.min(1, Math.max(0, parseFloat(v)));
+    if (section === "background" && k === "blur") S.blur = Math.min(64, Math.max(0, parseInt(v, 10) || 0));
+    if (section === "colors" && (k === "bg" || VEILS.some(x => x[0] === k) || k === "tab_hover")) {
+      const val = v.startsWith("#") ? v : "#"+v;
+      S[k] = val.length === 7 ? val + "ff" : val;
+    }
+  }
+  syncControls(); draw();
+};
+
+// ---- the compositor: same order and maths as kite ----
+function draw() {
+  const W = S.w, H = S.h;
+  cv.width = W; cv.height = H;
+  const fit = Math.min(1, (stage.clientWidth - 32) / W, (stage.clientHeight - 32) / H);
+  cv.style.width = (W*fit) + "px"; cv.style.height = (H*fit) + "px";
+
+  // 1. wallpaper, cover-cropped about the centre (bg.wgsl vs_main)
+  const base = S.wp === "file" ? images.file : images[S.wp];
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = "#000"; ctx.fillRect(0,0,W,H);
+  if (base && wpReady[S.wp]) {
+    const img = S.blur > 0
+      ? (draggingBlur ? proxyOf(base, S.wp, S.blur) : exactOf(base, S.wp, S.blur))
+      : base;
+    const cover = Math.max(W / img.width, H / img.height);
+    const vw = W / cover, vh = H / cover;
+    const ox = (img.width - vw) / 2, oy = (img.height - vh) / 2;
+    ctx.drawImage(img, ox, oy, vw, vh, 0, 0, W, H);
+  }
+  // 2. the whole-image veil: mix(img, bg, dim)  ==  src-over of bg at alpha dim
+  ctx.fillStyle = rgba(S.bg + "ff", S.dim); ctx.fillRect(0,0,W,H);
+
+  // 3. geometry, ui.rs recompute_layout with scale = 1
+  const titleH = 40, statusH = 26;
+  const stripH = H >= 640 ? 64 : 0;
+  const sbW = S.sidebar ? Math.min(280, W*0.45) : 0;
+  const bodyH = Math.max(1, H - titleH - statusH - stripH);
+  const right  = { x: sbW, y: titleH, w: W - sbW, h: bodyH };
+  const strip  = { x: sbW, y: H - statusH - stripH, w: W - sbW, h: stripH };
+  const status = { x: 0,   y: H - statusH, w: W, h: statusH };
+  const side   = { x: 0,   y: titleH, w: sbW, h: bodyH + stripH };
+  const R = r => ctx.fillRect(r.x, r.y, r.w, r.h);
+
+  ctx.fillStyle = rgba(S.panel);      R(right);            // main panel
+  ctx.fillStyle = rgba(S.panel);      R(strip);            // visualizer band
+  ctx.fillStyle = rgba(S.status);     R(status);           // status bar
+  ctx.fillStyle = rgba(S.border);     R({ x: sbW, y: titleH, w: W, h: 1 });
+  ctx.fillStyle = rgba(S.border);     R({ x: 0, y: H - statusH - 1, w: W, h: 1 });
+  if (S.sidebar) {
+    ctx.fillStyle = rgba(S.sidebar);  R(side);
+    ctx.fillStyle = rgba(S.border);   R({ x: sbW - 1, y: titleH, w: 1, h: side.h });
+  }
+  ctx.fillStyle = rgba(S.panel_dim);  R({ x: 0, y: 0, w: W, h: titleH });   // tab bar
+  // mock tabs: inactive then active, like layout_tabs
+  ctx.fillStyle = rgba(S.panel_dim);  R({ x: 56, y: 6, w: 96, h: titleH - 12 });
+  ctx.fillStyle = rgba(S.tab_active); R({ x: 156, y: 6, w: 168, h: titleH - 12 });
+  ctx.fillStyle = rgba(S.accent + "ff", 1); R({ x: 162, y: titleH - 8, w: 156, h: 2 });
+  // 4. the focus veil, last of all (ui.rs 1374-1379)
+  if (S.sidebar) {
+    ctx.fillStyle = rgba(S.overlay_dim);
+    R(S.focus === "right" ? side : right);
+  }
+  readouts(); exportToml();
+}
+const stage = document.getElementById("stage");
+window.onresize = draw;
+syncControls(); draw();
+</script>
+</body>
+</html>

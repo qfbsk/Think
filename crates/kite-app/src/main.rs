@@ -3,12 +3,14 @@
 mod activity;
 mod app;
 mod archive;
+mod blur;
 mod banner;
 mod day;
 mod editor;
 mod fonts;
 mod git;
 mod miku;
+mod palette; // engineering only, remove whole
 mod renderer;
 mod shell;
 mod sidebar;

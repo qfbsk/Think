@@ -50,23 +50,22 @@ impl Prompt {
         self.text.chars().count()
     }
 
-    fn paint(&self, list: &mut AttrsList, family: &'static str) {
-        let Some(prompt) = theme::prompt() else {
-            list.add_span(0..self.len(), &bold_attrs(family, theme::text_dim()));
-            return;
-        };
+    fn paint(&self, list: &mut AttrsList, family: &'static str, focused: bool) {
+        let colors = theme::pane(focused);
+        let prompt = theme::pane_prompt(focused);
         if !self.identity.is_empty() {
-            list.add_span(self.identity.clone(), &bold_attrs(family, theme::accent()));
+            list.add_span(self.identity.clone(), &bold_attrs(family, prompt.user));
         }
         list.add_span(self.path.clone(), &bold_attrs(family, prompt.path));
         if !self.git.is_empty() {
-            list.add_span(self.git.clone(), &bold_attrs(family, theme::accent()));
+            list.add_span(self.git.clone(), &bold_attrs(family, colors.accent));
             list.add_span(
                 self.branch.clone(),
-                &bold_attrs(family, theme::text()).weight(Weight::BOLD),
+                &bold_attrs(family, colors.text).weight(Weight::BOLD),
             );
         }
-        list.add_span(self.arrow.clone(), &bold_attrs(family, prompt.arrow));
+        // The `>` closes the path, so it is part of the same run of colour.
+        list.add_span(self.arrow.clone(), &bold_attrs(family, prompt.path));
     }
 }
 
@@ -129,6 +128,9 @@ pub struct Shell {
     pub input_cursor: usize,
     pub input_selection: Option<(usize, usize)>,
     pub buffer: Buffer,
+    /// Whether the right pane currently holds focus; the ui flips it and
+    /// re-themes, and every baked color goes through `theme::pane`.
+    pub focused: bool,
     /// Which row of the view holds the first row of the input line. It is the
     /// bottom row while the session runs normally, but a full screen program can
     /// hand the cursor back somewhere higher up.
@@ -222,10 +224,11 @@ impl Shell {
             prompt,
             branch,
             identity,
+            focused: true,
         };
         let lines = banner::lines();
         for line in &lines {
-            let cells = colored(&line.text, &line.spans);
+            let cells = colored(&line.text, &line.spans, theme::pane(true).text);
             shell.write_cells(&cells, true);
         }
         // Where the banner left the cursor: everything above it, plus the rows
@@ -282,7 +285,9 @@ impl Shell {
     }
 
     fn set_cwd(&mut self, cwd: PathBuf) {
-        self.cwd = cwd;
+        // Every child process starts in this directory, so it is stored plain:
+        // a verbatim `\\?\` path makes cmd and `ld` unable to write a file.
+        self.cwd = kite_core::plain_path(&cwd);
         self.refresh_branch();
     }
 
@@ -754,6 +759,13 @@ impl Shell {
     /// Where the caret is on the screen. The grid's own cursor is the caret
     /// whether a child holds the screen or the line editor does, because
     /// `emit_input` walks it to the caret as it writes the line.
+    /// The caret's logical spot: a grid line counted from the start of the
+    /// session, so it does not move when only the view scrolls.
+    pub fn cursor_spot(&self) -> Option<(isize, isize)> {
+        let (column, line) = self.terminal.cursor()?;
+        Some((column as isize, line as isize))
+    }
+
     pub fn cursor_rect(&self) -> Option<(f32, f32, f32)> {
         let (column, line) = self.terminal.cursor()?;
         let row = line - self.terminal.first_line();
@@ -776,7 +788,7 @@ impl Shell {
         Some(
             self.terminal
                 .cell_color(line, column)
-                .unwrap_or(theme::text()),
+                .unwrap_or(theme::pane(self.focused).text),
         )
     }
 
@@ -871,7 +883,7 @@ impl Shell {
         buffer.set_wrap(Wrap::None);
         buffer.set_tab_width(4);
         buffer.set_size(Some(self.view_width), Some(self.view_height));
-        let base = bold_attrs(self.family, theme::text());
+        let base = bold_attrs(self.family, theme::pane(self.focused).text);
         let top = self.terminal.first_line();
         for row in 0..self.terminal.rows() as i32 {
             let mut text = String::new();
@@ -884,7 +896,7 @@ impl Shell {
             {
                 let attrs = match color {
                     Some(color) => bold_attrs(self.family, color),
-                    None => bold_attrs(self.family, theme::text()),
+                    None => bold_attrs(self.family, theme::pane(self.focused).text),
                 };
                 let bolded;
                 let plain = if bold {
@@ -952,14 +964,11 @@ impl Shell {
         } else {
             format!("{}{}", self.prompt.text, self.input)
         };
-        let base = bold_attrs(
-            self.family,
-            theme::prompt().map_or(theme::text(), |prompt| prompt.input),
-        );
+        let base = bold_attrs(self.family, theme::pane_prompt(self.focused).input);
         let mut list = AttrsList::new(&base);
         if !self.owns_screen() {
-            self.prompt.paint(&mut list, self.family);
-            add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes);
+            self.prompt.paint(&mut list, self.family, self.focused);
+            add_syntax_spans(&mut list, self.family, &self.input, prompt_bytes, self.focused);
         }
         (text, list)
     }
@@ -968,10 +977,11 @@ impl Shell {
     /// holds the colours, so there is no second copy of the history to keep in
     /// step.
     fn push_line(&mut self, text: String, kind: LineKind) {
+        let colors = theme::pane(self.focused);
         let color = match kind {
-            LineKind::Error => theme::red(),
-            LineKind::Echo => theme::text_dim(),
-            LineKind::Output => theme::text(),
+            LineKind::Error => colors.red,
+            LineKind::Echo => colors.text_dim,
+            LineKind::Output => colors.text,
         };
         self.erase_input();
         let cells: Vec<Cell> = text.chars().map(|ch| (ch, color, false)).collect();
@@ -1019,7 +1029,7 @@ impl Shell {
     /// row of the line the caret ended up on and how far along it is.
     fn emit_input(&mut self) {
         let (text, list) = self.prompt_line();
-        let cells = cells_of(&text, &list);
+        let cells = cells_of(&text, &list, theme::pane(self.focused).text);
         let chars: Vec<char> = cells.iter().map(|cell| cell.0).collect();
         let rows = row_lengths(&chars, self.terminal.columns());
         let caret = (self.input_line_chars() + self.input_cursor).min(chars.len());
@@ -1115,10 +1125,19 @@ impl Shell {
             }
             "theme" => {
                 let Some(name) = rest.first() else {
-                    self.push_line("theme: expected index or neo".to_string(), LineKind::Error);
+                    self.push_line(
+                        format!("theme: current `{}`", theme::current_name()),
+                        LineKind::Output,
+                    );
+                    self.push_line(
+                        format!("available: {}", theme::list().join(", ")),
+                        LineKind::Output,
+                    );
                     return true;
                 };
-                match theme::set_preset(name) {
+                // The command is the only thing that persists a theme choice:
+                // palette loads stay inside the session.
+                match theme::apply(name) {
                     Ok(applied) => {
                         self.push_line(format!("theme: {applied}"), LineKind::Output);
                         *effect = Some(ShellEffect::Retheme);
@@ -1256,7 +1275,9 @@ impl Shell {
                 };
                 let path = resolve_path(&self.cwd, arg);
                 match fs::canonicalize(&path) {
-                    Ok(path) if path.is_file() => *effect = Some(ShellEffect::Open(path)),
+                    Ok(path) if path.is_file() => {
+                        *effect = Some(ShellEffect::Open(kite_core::plain_path(&path)))
+                    }
                     Ok(path) => self.push_line(
                         format!("kkk: not a file: {}", path.display()),
                         LineKind::Error,
@@ -1392,19 +1413,23 @@ fn locate(rows: &[usize], chars: &[char], row: usize, column: usize) -> usize {
 
 /// Flatten a styled line into one entry per character, so the row can be
 /// clipped to the grid without splitting a span's bookkeeping.
-fn cells_of(text: &str, list: &AttrsList) -> Vec<Cell> {
+fn cells_of(text: &str, list: &AttrsList, default: Color) -> Vec<Cell> {
     text.char_indices()
         .map(|(byte, ch)| {
             let attrs = list.get_span(byte);
-            let color = attrs.color_opt.unwrap_or_else(theme::text);
+            let color = attrs.color_opt.unwrap_or(default);
             (ch, color, attrs.weight == Weight::BOLD)
         })
         .collect()
 }
 
 /// The same, from plain byte-range colour spans.
-fn colored(text: &str, spans: &[(std::ops::Range<usize>, Color)]) -> Vec<Cell> {
-    let mut cells: Vec<Cell> = text.chars().map(|ch| (ch, theme::text(), false)).collect();
+fn colored(
+    text: &str,
+    spans: &[(std::ops::Range<usize>, Color)],
+    default: Color,
+) -> Vec<Cell> {
+    let mut cells: Vec<Cell> = text.chars().map(|ch| (ch, default, false)).collect();
     for (range, color) in spans {
         let start = byte_to_char(text, range.start);
         let end = byte_to_char(text, range.end.min(text.len()));
@@ -1610,13 +1635,20 @@ enum TokenKind {
     Argument,
 }
 
-fn add_syntax_spans(list: &mut AttrsList, family: &'static str, text: &str, offset: usize) {
+fn add_syntax_spans(
+    list: &mut AttrsList,
+    family: &'static str,
+    text: &str,
+    offset: usize,
+    focused: bool,
+) {
+    let colors = theme::pane(focused);
     for (range, kind) in command_spans(text) {
         let color = match kind {
-            TokenKind::Command => theme::accent(),
-            TokenKind::Flag => theme::pink(),
-            TokenKind::String => theme::green(),
-            TokenKind::Number => theme::yellow(),
+            TokenKind::Command => colors.accent,
+            TokenKind::Flag => colors.pink,
+            TokenKind::String => colors.green,
+            TokenKind::Number => colors.yellow,
             TokenKind::Argument => continue,
         };
         list.add_span(
@@ -2010,6 +2042,29 @@ mod tests {
                 "the caret drawn for {index} was not where it said"
             );
         }
+    }
+
+    /// The child inherits this directory as its own, and a verbatim `\\?\`
+    /// path is one cmd refuses to write into.
+    #[test]
+    fn cd_leaves_a_directory_the_child_can_work_in() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("work");
+        fs::create_dir(&dir).unwrap();
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.input = format!("cd {}", dir.display());
+        shell.submit(&mut fonts.system);
+        assert!(
+            !shell
+                .cwd
+                .to_string_lossy()
+                .starts_with(r"\\?\"),
+            "verbatim cwd reaches the child: {:?}",
+            shell.cwd
+        );
+        assert!(shell.cwd.is_dir(), "{:?}", shell.cwd);
+        assert_eq!(fs::read_dir(&shell.cwd).unwrap().count(), 0);
     }
 
     #[test]

@@ -46,6 +46,9 @@ struct Cell {
 
 pub struct Miku {
     probe: activity::Probe,
+    /// Whether the right pane holds focus; the ui flips it and re-themes, and
+    /// the board paints through `theme::pane`.
+    pub focused: bool,
     /// The calendar year on screen; paging moves it, the log never bounds it.
     year: i64,
     /// Weeks the displayed year spans, and the pitch the panel allows for them.
@@ -102,6 +105,7 @@ impl Miku {
             width: 1.0,
             height: 1.0,
             dirty: true,
+            focused: true,
         };
         page.shape(font_system);
         page
@@ -237,6 +241,7 @@ impl Miku {
         // A little rounding, not a pill: enough to soften the grid at the
         // largest pitch and to vanish entirely at the smallest.
         let round = size * 0.16;
+        let colors = theme::pane(self.focused);
         let mut quads: Vec<(Rect, Color, f32)> = self
             .cells
             .iter()
@@ -248,7 +253,7 @@ impl Miku {
                         w: size,
                         h: size,
                     },
-                    theme::miku(cell.level),
+                    colors.miku(cell.level),
                     round,
                 )
             })
@@ -260,7 +265,7 @@ impl Miku {
                         w: size,
                         h: size,
                     },
-                    theme::miku(*level),
+                    colors.miku(*level),
                     round,
                 )
             }))
@@ -282,7 +287,7 @@ impl Miku {
                 (outer, selected.1 - pad, edge, total),
                 (selected.0 + size + pad, selected.1 - pad, edge, total),
             ] {
-                quads.push((Rect { x, y, w, h }, theme::text(), 0.0));
+                quads.push((Rect { x, y, w, h }, colors.text, 0.0));
             }
         }
         quads
@@ -344,7 +349,7 @@ impl Miku {
                     };
                     let label = make_label(
                         font_system,
-                        &bold_attrs(self.family, theme::text_dim()),
+                        &bold_attrs(self.family, theme::pane(self.focused).text_dim),
                         text * 0.85,
                         &name,
                     );
@@ -368,7 +373,7 @@ impl Miku {
         for (row, name) in [(1, "Mon"), (3, "Wed"), (5, "Fri")] {
             let label = make_label(
                 font_system,
-                &bold_attrs(self.family, theme::text_dim()),
+                &bold_attrs(self.family, theme::pane(self.focused).text_dim),
                 text * 0.85,
                 name,
             );
@@ -386,7 +391,7 @@ impl Miku {
         let right = self.origin.0 + (self.columns as f32 - 1.0) * step + self.cell;
         let more = make_label(
             font_system,
-            &bold_attrs(self.family, theme::text_dim()),
+            &bold_attrs(self.family, theme::pane(self.focused).text_dim),
             text * 0.85,
             "More",
         );
@@ -395,7 +400,7 @@ impl Miku {
         let less_x = squares_right - LEVELS as f32 * step - 8.0 * self.scale;
         let less = make_label(
             font_system,
-            &bold_attrs(self.family, theme::text_dim()),
+            &bold_attrs(self.family, theme::pane(self.focused).text_dim),
             text * 0.85,
             "Less",
         );
@@ -414,7 +419,7 @@ impl Miku {
         self.body = Buffer::new_empty(Metrics::new(text, (text * 1.4).ceil()));
         self.body.set_wrap(Wrap::None);
         self.body.set_size(None, None);
-        let style = bold_attrs(self.family, theme::text());
+        let style = bold_attrs(self.family, theme::pane(self.focused).text);
         for line in lines {
             self.body
                 .lines

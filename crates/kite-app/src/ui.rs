@@ -12,6 +12,7 @@ use winit::keyboard::KeyCode;
 
 use crate::editor::Editor;
 use crate::miku::Miku;
+use crate::palette::Palette; // engineering only, remove whole
 use crate::renderer::QuadVertex;
 use crate::shell::{Shell, ShellEffect};
 use crate::sidebar::{Sidebar, SidebarAction};
@@ -111,12 +112,18 @@ impl Tab {
 /// document, a tab switch) teleport: a long glide there reads as lag, not
 /// as motion. Only the drawing moves; hit-testing and text stay on the
 /// logical caret.
+///
+/// A glide is a reaction to the *caret* moving, so the logical spot is part of
+/// the state: when only the view moved — scrolling, or scrolling the caret out
+/// of sight — the caret belongs to the text and travels with it. Easing there
+/// would read as a trail laid down by a caret nobody touched.
 struct CaretState {
     x: f32,
     y: f32,
     flying: bool,
     had_target: bool,
     target: (f32, f32),
+    spot: Option<(isize, isize)>,
     last_tick: Instant,
 }
 
@@ -128,6 +135,7 @@ impl Default for CaretState {
             flying: false,
             had_target: false,
             target: (0.0, 0.0),
+            spot: None,
             last_tick: Instant::now(),
         }
     }
@@ -179,11 +187,16 @@ pub struct Ui {
     body_pad: f32,
     sidebar_w: f32,
     right: Rect,
+    /// The right pane as a styled region: body plus visualizer band, one
+    /// background, one focus state. The band is its content, not a region.
+    right_pane: Rect,
     sidebar_rect: Rect,
     status_rect: Rect,
     strip_rect: Rect,
     visualizer: Visualizer,
     sparks: Sparks,
+    /// engineering palette: remove this field and its uses to rip the feature out
+    pub palette: Palette,
     window_close: Rect,
     tab_strip: Rect,
     tab_scroll: f32,
@@ -259,6 +272,7 @@ impl Ui {
             4.0 * scale,
             "shell",
             TabContent::Shell(shell),
+            true,
         );
         let mut ui = Self {
             tabs: vec![shell_tab],
@@ -290,11 +304,13 @@ impl Ui {
             body_pad,
             sidebar_w,
             right: Rect::default(),
+            right_pane: Rect::default(),
             sidebar_rect: Rect::default(),
             status_rect: Rect::default(),
             strip_rect: Rect::default(),
             visualizer: Visualizer::new(),
             sparks: Sparks::new(),
+            palette: Palette::new(font_system, family, scale),
             window_close: Rect::default(),
             tab_strip: Rect::default(),
             tab_scroll: 0.0,
@@ -379,12 +395,24 @@ impl Ui {
             .position(|tab| matches!(tab.content, TabContent::Miku(_)))
     }
 
+    /// Focus is an input to both panes' styles, so a flip re-bakes every
+    /// buffer that painted colors into its glyphs. Equal slots on the two
+    /// sides make the flip an exact appearance swap; nothing here knows
+    /// anything about swapping.
+    fn set_focus(&mut self, font_system: &mut FontSystem, focus: Focus) {
+        if self.focus == focus {
+            return;
+        }
+        self.focus = focus;
+        self.retheme(font_system);
+    }
+
     /// Open the board, or move to the one already open. It always sits at index
     /// one, right after the shell, so the file tabs shift along with it.
     pub fn open_miku(&mut self, font_system: &mut FontSystem) {
         if let Some(index) = self.miku_tab() {
             self.activate_tab(font_system, index);
-            self.focus = Focus::Right;
+            self.set_focus(font_system, Focus::Right);
             self.mode = Mode::Normal;
             self.recompute_layout(font_system);
             return;
@@ -401,10 +429,11 @@ impl Ui {
             4.0 * self.scale,
             "miku",
             TabContent::Miku(miku),
+            true,
         );
         self.tabs.insert(1, tab);
         self.active = 1;
-        self.focus = Focus::Right;
+        self.set_focus(font_system, Focus::Right);
         self.mode = Mode::Normal;
         for index in 1..self.tabs.len() {
             self.refresh_label(font_system, index);
@@ -503,12 +532,12 @@ impl Ui {
     pub fn toggle_sidebar(&mut self, font_system: &mut FontSystem) {
         if self.sidebar.visible {
             self.sidebar.visible = false;
-            self.focus = Focus::Right;
+            self.set_focus(font_system, Focus::Right);
             self.mode = Mode::Normal;
             self.recompute_layout(font_system);
         } else {
             self.sidebar.visible = true;
-            self.focus = Focus::Sidebar;
+            self.set_focus(font_system, Focus::Sidebar);
             self.mode = Mode::Normal;
             self.recompute_layout(font_system);
             // Reopening is the moment to ask git again; the viewport size has not
@@ -519,7 +548,7 @@ impl Ui {
     }
 
     pub fn focus_right_insert(&mut self, font_system: &mut FontSystem) {
-        self.focus = Focus::Right;
+        self.set_focus(font_system, Focus::Right);
         self.mode = Mode::Insert;
         if let Some(editor) = self.active_editor_mut() {
             editor.ensure_cursor_visible(font_system);
@@ -528,7 +557,7 @@ impl Ui {
 
     pub fn focus_sidebar(&mut self, font_system: &mut FontSystem) {
         if self.sidebar.visible {
-            self.focus = Focus::Sidebar;
+            self.set_focus(font_system, Focus::Sidebar);
             self.mode = Mode::Normal;
             self.sidebar.shape(font_system);
         }
@@ -537,11 +566,12 @@ impl Ui {
     pub fn escape(&mut self, font_system: &mut FontSystem) {
         if self.mode == Mode::Insert {
             self.mode = Mode::Normal;
-            self.focus = if self.sidebar.visible {
+            let focus = if self.sidebar.visible {
                 Focus::Sidebar
             } else {
                 Focus::Right
             };
+            self.set_focus(font_system, focus);
             if self.focus == Focus::Sidebar {
                 self.sidebar.shape(font_system);
             } else if let Some(editor) = self.active_editor_mut() {
@@ -648,10 +678,11 @@ impl Ui {
             4.0 * self.scale,
             &title,
             TabContent::Editor(editor),
+            true,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
-        self.focus = Focus::Right;
+        self.set_focus(font_system, Focus::Right);
         self.mode = Mode::Insert;
         self.message = Some(format!("opened {title}"));
         self.refresh_label(font_system, self.active);
@@ -706,7 +737,7 @@ impl Ui {
         else {
             return;
         };
-        self.focus = Focus::Right;
+        self.set_focus(font_system, Focus::Right);
         self.mode = Mode::Normal;
         if let Some(miku) = self.active_miku_mut() {
             miku.select(font_system, day);
@@ -862,8 +893,13 @@ impl Ui {
     }
 
     /// Repaint every buffer that baked theme colors into its glyphs. Geometry,
-    /// text, scroll and caret are left exactly as they were.
+    /// text, scroll and caret are left exactly as they were. The panes bake
+    /// their colors through the focus-aware resolver, so this is also what a
+    /// focus flip goes through.
     pub fn retheme(&mut self, font_system: &mut FontSystem) {
+        // engineering palette: keep its fields pointed at the running theme
+        self.palette.sync();
+        let right_focused = self.focus == Focus::Right;
         let logo_attrs = Attrs::new()
             .family(glyphon::cosmic_text::Family::Name(self.family))
             .color(theme::accent())
@@ -882,11 +918,21 @@ impl Ui {
         }
         for tab in &mut self.tabs {
             match &mut tab.content {
-                TabContent::Shell(shell) => shell.retheme(font_system),
-                TabContent::Editor(editor) => editor.retheme(font_system),
-                TabContent::Miku(miku) => miku.retheme(font_system),
+                TabContent::Shell(shell) => {
+                    shell.focused = right_focused;
+                    shell.retheme(font_system);
+                }
+                TabContent::Editor(editor) => {
+                    editor.focused = right_focused;
+                    editor.retheme(font_system);
+                }
+                TabContent::Miku(miku) => {
+                    miku.focused = right_focused;
+                    miku.retheme(font_system);
+                }
             }
         }
+        self.sidebar.focused = self.focus == Focus::Sidebar;
         self.sidebar.retheme(font_system);
         self.recompute_layout(font_system);
     }
@@ -922,6 +968,8 @@ impl Ui {
 
     pub fn text_areas(&self) -> Vec<TextArea<'_>> {
         let mut areas = Vec::new();
+        let left = theme::pane(self.focus == Focus::Sidebar);
+        let right = theme::pane(self.focus == Focus::Right);
         let logo_bounds = TextBounds {
             left: 0,
             top: 0,
@@ -970,9 +1018,9 @@ impl Ui {
                 scale: 1.0,
                 bounds,
                 default_color: if index == self.active {
-                    theme::text()
+                    right.text
                 } else {
-                    theme::text_dim()
+                    right.text_dim
                 },
                 custom_glyphs: &[],
             });
@@ -987,7 +1035,7 @@ impl Ui {
                     top: content.y,
                     scale: 1.0,
                     bounds: bounds_of(content),
-                    default_color: theme::text_dim(),
+                    default_color: right.text_dim,
                     custom_glyphs: &[],
                 });
                 let text = self.body_text_rect();
@@ -997,7 +1045,7 @@ impl Ui {
                     top: text.y,
                     scale: 1.0,
                     bounds: bounds_of(text),
-                    default_color: theme::text(),
+                    default_color: right.text,
                     custom_glyphs: &[],
                 });
             }
@@ -1009,7 +1057,7 @@ impl Ui {
                     top: content.y,
                     scale: 1.0,
                     bounds: bounds_of(content),
-                    default_color: theme::text(),
+                    default_color: right.text,
                     custom_glyphs: &[],
                 });
             }
@@ -1023,7 +1071,7 @@ impl Ui {
                         top: content.y + y,
                         scale: 1.0,
                         bounds: bounds_of(content),
-                        default_color: theme::text(),
+                        default_color: right.text,
                         custom_glyphs: &[],
                     });
                 }
@@ -1038,7 +1086,7 @@ impl Ui {
                 top: content.y,
                 scale: 1.0,
                 bounds: bounds_of(content),
-                default_color: theme::text(),
+                default_color: left.text,
                 custom_glyphs: &[],
             });
         }
@@ -1065,7 +1113,14 @@ impl Ui {
             });
         }
 
+        // engineering palette
         areas
+    }
+
+    /// engineering palette: its labels render in their own pass, above quads
+    pub fn palette_areas(&self) -> Vec<TextArea<'_>> {
+        let size = (self.size.width as f32, self.size.height as f32);
+        self.palette.areas(size)
     }
 
     /// Hit the band with one physical keypress. A collapsed band takes the hit
@@ -1115,7 +1170,9 @@ impl Ui {
     /// A keystroke throws powder off the caret it just landed on, in the ink of
     /// the glyph it just wrote.
     pub fn spark_at_caret(&mut self) {
-        let ink = self.caret_ink(true).unwrap_or_else(theme::text);
+        let ink = self
+            .caret_ink(true)
+            .unwrap_or_else(|| theme::pane(self.focus == Focus::Right).text);
         if let Some((x, y)) = self.caret_spot() {
             self.sparks.burst(x, y, self.scale, ink);
         }
@@ -1139,8 +1196,9 @@ impl Ui {
 
     pub fn background_quads(&self) -> Vec<QuadVertex> {
         let mut quads = Vec::new();
-        push_rect(&mut quads, self.right, theme::panel());
-        push_rect(&mut quads, self.strip_rect, theme::panel());
+        let left = theme::pane(self.focus == Focus::Sidebar);
+        let right = theme::pane(self.focus == Focus::Right);
+        push_rect(&mut quads, self.right_pane, right.panel);
         push_rect(&mut quads, self.status_rect, theme::status());
         push_rect(
             &mut quads,
@@ -1150,7 +1208,7 @@ impl Ui {
                 w: self.size.width as f32,
                 h: 1.0 * self.scale,
             },
-            theme::border(),
+            right.border,
         );
         push_rect(
             &mut quads,
@@ -1164,7 +1222,7 @@ impl Ui {
         );
 
         if self.sidebar.visible {
-            push_rect(&mut quads, self.sidebar_rect, theme::sidebar());
+            push_rect(&mut quads, self.sidebar_rect, left.sidebar);
             push_rect(
                 &mut quads,
                 Rect {
@@ -1173,7 +1231,7 @@ impl Ui {
                     w: 1.0 * self.scale,
                     h: self.sidebar_rect.h,
                 },
-                theme::border(),
+                left.border,
             );
             if let Some(row) = self.sidebar.selected_row() {
                 let visible_start = self.sidebar.buffer.scroll().line;
@@ -1190,7 +1248,7 @@ impl Ui {
                                 w: self.sidebar_rect.w - 8.0 * self.scale,
                                 h: self.sidebar.line_height(),
                             },
-                            theme::accent_dim(),
+                            left.accent_dim,
                         );
                     }
                     let _ = row;
@@ -1198,18 +1256,18 @@ impl Ui {
             }
         }
 
-        push_rect(&mut quads, self.tabbar_rect(), theme::panel_dim());
+        push_rect(&mut quads, self.tabbar_rect(), right.panel_dim);
         for (index, tab) in self.tabs.iter().enumerate() {
             let shown = tab.rect.clip_x(self.tab_strip.x, self.tab_strip.right());
             if shown.w <= 1.0 {
                 continue;
             }
             let color = if index == self.active {
-                theme::tab_active()
+                right.tab_active
             } else if self.hover_tab(index) {
-                theme::tab_hover()
+                right.tab_hover
             } else {
-                theme::panel_dim()
+                right.panel_dim
             };
             push_rect(&mut quads, shown, color);
             if index == self.active {
@@ -1220,13 +1278,13 @@ impl Ui {
                     h: 2.0 * self.scale,
                 }
                 .clip_x(self.tab_strip.x, self.tab_strip.right());
-                push_rect(&mut quads, underline, theme::accent());
+                push_rect(&mut quads, underline, right.accent);
             }
             if let Some(close) = tab.close_rect {
                 let color = if self.hover_close(index) {
-                    theme::red()
+                    right.red
                 } else {
-                    theme::text_faint()
+                    right.text_faint
                 };
                 let inset = 5.0 * self.scale;
                 push_line(
@@ -1310,7 +1368,7 @@ impl Ui {
                             w: width,
                             h: height,
                         },
-                        theme::selection(),
+                        right.selection,
                     );
                 }
             }
@@ -1324,20 +1382,25 @@ impl Ui {
                             w: width,
                             h: height,
                         },
-                        theme::selection(),
+                        right.selection,
                     );
                 }
             }
         }
 
-        quads.extend(self.visualizer.quads(self.strip_rect, self.scale));
+        let mut band = self.visualizer.quads(self.strip_rect, self.scale);
+        if self.focus != Focus::Right {
+            unfocus_quads(&mut band, theme::unfocus(), theme::bg());
+        }
+        quads.extend(band);
 
         quads
     }
 
-    pub fn foreground_quads(&self) -> Vec<QuadVertex> {
+    pub fn foreground_quads(&mut self, font_system: &mut FontSystem) -> Vec<QuadVertex> {
         let mut quads = Vec::new();
         let content = self.body_text_rect();
+        let right = theme::pane(self.focus == Focus::Right);
 
         if self.show_whitespace {
             match &self.active_tab().content {
@@ -1351,6 +1414,7 @@ impl Ui {
                         self.editor_font_size(),
                         line_height,
                         &breaks,
+                        right,
                     );
                 }
                 TabContent::Shell(shell) => {
@@ -1365,17 +1429,12 @@ impl Ui {
                         self.body_font_size,
                         line_height,
                         &breaks,
+                        right,
                     );
                 }
                 // The board has no text of its own to mark up.
                 TabContent::Miku(_) => {}
             }
-        }
-
-        if self.focus == Focus::Sidebar && self.sidebar.visible {
-            push_rect(&mut quads, self.right, theme::overlay_dim());
-        } else if self.focus == Focus::Right && self.sidebar.visible {
-            push_rect(&mut quads, self.sidebar_rect, theme::overlay_dim());
         }
 
         if self.focus == Focus::Right
@@ -1389,25 +1448,33 @@ impl Ui {
             if let Some((x, y, height)) = cursor {
                 let raw_x = content.x + x;
                 let raw_y = content.y + y + 2.0 * self.scale;
+                // A caret the view scrolled past is not on screen to draw.
+                let inside =
+                    raw_x >= content.x && raw_x <= content.right() && raw_y >= content.y;
                 let (cx, cy) = if self.caret.had_target {
                     (self.caret.x, self.caret.y)
                 } else {
                     (raw_x, raw_y)
                 };
-                push_rect(
-                    &mut quads,
-                    Rect {
-                        x: cx,
-                        y: cy,
-                        w: 2.0 * self.scale,
-                        h: (height - 4.0 * self.scale).max(2.0),
-                    },
-                    theme::cursor(),
-                );
+                if inside {
+                    push_rect(
+                        &mut quads,
+                        Rect {
+                            x: cx,
+                            y: cy,
+                            w: 2.0 * self.scale,
+                            h: (height - 4.0 * self.scale).max(2.0),
+                        },
+                        right.cursor,
+                    );
+                }
             }
         }
 
         quads.extend(self.sparks.quads());
+        // engineering palette: drawn last so it covers everything
+        let size = (self.size.width as f32, self.size.height as f32);
+        quads.extend(self.palette.quads(font_system, size));
         quads
     }
 
@@ -1444,16 +1511,23 @@ impl Ui {
     pub fn caret_tick(&mut self) {
         let now = Instant::now();
         let content = self.body_text_rect();
-        let rect = match &self.active_tab().content {
-            TabContent::Editor(editor) => editor.cursor_rect(),
-            TabContent::Shell(shell) => shell.cursor_rect(),
-            TabContent::Miku(_) => None,
+        let (rect, spot) = match &self.active_tab().content {
+            TabContent::Editor(editor) => {
+                let position = editor.cursor_position();
+                (
+                    editor.cursor_rect(),
+                    Some((position.line as isize, position.ch as isize)),
+                )
+            }
+            TabContent::Shell(shell) => (shell.cursor_rect(), shell.cursor_spot()),
+            TabContent::Miku(_) => (None, None),
         };
         let (tx, ty) = match rect {
             Some((x, y, _)) => (content.x + x, content.y + y + 2.0 * self.scale),
             None => {
                 self.caret.had_target = false;
                 self.caret.flying = false;
+                self.caret.spot = None;
                 self.caret.last_tick = now;
                 return;
             }
@@ -1464,9 +1538,14 @@ impl Ui {
         // the first eased frame steps by ~0 and the flight begins fresh rather
         // than snapping shut over whatever idle time elapsed since the last tick.
         if !self.caret.had_target || self.caret.target != (tx, ty) {
+            // The caret itself only moved if its logical spot did. Same spot at
+            // a new pixel means the view scrolled under it: the caret belongs to
+            // the text, so it goes where the text went, with no easing.
+            let caret_moved = self.caret.spot != spot;
             let dx = tx - self.caret.x;
             let dy = ty - self.caret.y;
-            if !self.caret.had_target || (dx * dx + dy * dy).sqrt() > CARET_SNAP {
+            if !self.caret.had_target || !caret_moved || (dx * dx + dy * dy).sqrt() > CARET_SNAP
+            {
                 self.caret.x = tx;
                 self.caret.y = ty;
                 self.caret.flying = false;
@@ -1474,6 +1553,7 @@ impl Ui {
                 self.caret.flying = true;
             }
             self.caret.target = (tx, ty);
+            self.caret.spot = spot;
             self.caret.last_tick = now;
             self.caret.had_target = true;
             return;
@@ -1675,11 +1755,8 @@ impl Ui {
             return;
         };
         let active = index == self.active;
-        let color = if active {
-            theme::text()
-        } else {
-            theme::text_dim()
-        };
+        let right = theme::pane(self.focus == Focus::Right);
+        let color = if active { right.text } else { right.text_dim };
         let font_size = self.tab_font_size;
         let delta = match &mut tab.content {
             TabContent::Editor(editor) => editor.line_delta(),
@@ -1688,7 +1765,7 @@ impl Ui {
         };
         let title = tab.title.clone();
         tab.label_delta = delta;
-        tab.label = make_counted_label(font_system, self.family, &title, delta, color, font_size);
+        tab.label = make_counted_label(font_system, self.family, &title, delta, color, font_size, right);
         let (width, _) = measure(&tab.label);
         tab.label_width = width;
         let close_extra = if tab.is_shell() {
@@ -1759,6 +1836,10 @@ impl Ui {
                 h: body_h,
             };
         }
+        self.right_pane = Rect {
+            h: self.right.h + strip_h,
+            ..self.right
+        };
 
         let content = self.editor_content_rect();
         for tab in &mut self.tabs {
@@ -1909,8 +1990,9 @@ fn make_tab(
     shell_pad: f32,
     title: &str,
     content: TabContent,
+    right_focused: bool,
 ) -> Tab {
-    let attr = attrs(family, theme::text_dim());
+    let attr = attrs(family, theme::pane(right_focused).text_dim);
     let label = make_label(font_system, &attr, font_size, title);
     let (label_width, _) = measure(&label);
     let close_extra = match &content {
@@ -1938,6 +2020,7 @@ fn make_counted_label(
     delta: (usize, usize),
     color: Color,
     font_size: f32,
+    colors: theme::Colors,
 ) -> Buffer {
     let (added, removed) = delta;
     let text = if added == 0 && removed == 0 {
@@ -1951,8 +2034,8 @@ fn make_counted_label(
         let plus_end = plus + 1 + added.to_string().len();
         let minus = plus_end + 1;
         let minus_end = minus + 1 + removed.to_string().len();
-        list.add_span(plus..plus_end, &attrs(family, theme::green()));
-        list.add_span(minus..minus_end, &attrs(family, theme::red()));
+        list.add_span(plus..plus_end, &attrs(family, colors.green));
+        list.add_span(minus..minus_end, &attrs(family, colors.red));
     }
     let line_height = (font_size * 1.35).ceil();
     let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
@@ -2088,6 +2171,21 @@ pub(crate) fn push_line(
     }
 }
 
+/// The band is right-pane content, so an unfocused right pane pulls its bar
+/// colors toward `bg` exactly like the pane's own slots.
+fn unfocus_quads(quads: &mut [QuadVertex], k: f32, toward: Color) {
+    let [tr, tg, tb, ta] = toward.as_rgba();
+    let pull = |from: f32, to: u8| from * (1.0 - k) + to as f32 / 255.0 * k;
+    for quad in quads {
+        quad.color = [
+            pull(quad.color[0], tr),
+            pull(quad.color[1], tg),
+            pull(quad.color[2], tb),
+            pull(quad.color[3], ta),
+        ];
+    }
+}
+
 fn push_whitespace_markers(
     quads: &mut Vec<QuadVertex>,
     buffer: &Buffer,
@@ -2095,9 +2193,10 @@ fn push_whitespace_markers(
     font_size: f32,
     line_height: f32,
     has_break: &dyn Fn(usize) -> bool,
+    colors: theme::Colors,
 ) {
-    let dot_color = theme::whitespace_dot();
-    let mark_color = theme::whitespace_mark();
+    let dot_color = colors.whitespace_dot;
+    let mark_color = colors.whitespace_mark;
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
         for glyph in run.glyphs {
@@ -2187,6 +2286,60 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn panes_paint_with_colors_resolved_from_focus() {
+        let mut fonts = Fonts::load();
+        theme::init();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        assert!(ui.strip_rect.h > 0.0, "a tall window keeps the band");
+        assert_eq!(
+            ui.right_pane.h,
+            ui.right.h + ui.strip_rect.h,
+            "the right pane's one background spans body and band"
+        );
+        let quad = |quads: &[QuadVertex], rect: Rect| -> [f32; 4] {
+            quads
+                .iter()
+                .find(|q| q.rect == [rect.x, rect.y, rect.w, rect.h])
+                .map(|q| q.color)
+                .expect("the pane paints its whole rect")
+        };
+        let quads = ui.background_quads();
+        assert_eq!(
+            quad(&quads, ui.right_pane),
+            linear_color(theme::pane(true).panel)
+        );
+        assert_eq!(
+            quad(&quads, ui.sidebar_rect),
+            linear_color(theme::pane(false).sidebar)
+        );
+
+        ui.focus_sidebar(&mut fonts.system);
+        let quads = ui.background_quads();
+        assert_eq!(
+            quad(&quads, ui.right_pane),
+            linear_color(theme::pane(false).panel)
+        );
+        assert_eq!(
+            quad(&quads, ui.sidebar_rect),
+            linear_color(theme::pane(true).sidebar)
+        );
+
+        // The swap property: equal slots, one resolver, so whichever pane is
+        // unfocused wears the very same shade on either side.
+        theme::debug_edit(|t| t.colors.sidebar = t.colors.panel);
+        let unfocused_left = quad(&ui.background_quads(), ui.right_pane);
+        ui.focus_right_insert(&mut fonts.system);
+        let unfocused_right = quad(&ui.background_quads(), ui.sidebar_rect);
+        assert_eq!(unfocused_left, unfocused_right);
+        theme::debug_edit(|t| t.colors.sidebar = theme::Colors::default().sidebar);
     }
 
     #[test]
@@ -2317,6 +2470,49 @@ mod tests {
         assert!(ui.activate_digit(&mut fonts.system, 0));
         assert_eq!(ui.active, 9, "0 is the tenth tab");
         assert_eq!(ui.tabs[ui.active].title, "h.txt");
+    }
+
+    /// The glide belongs to a caret that moved. Scrolling moves the view, and
+    /// the caret belongs to the text, so it has to travel with it in the same
+    /// frame — easing there is the trail the user reported.
+    #[test]
+    fn a_scrolled_view_moves_the_caret_without_a_glide() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        std::fs::write(&path, "line of text\n".repeat(400)).unwrap();
+        ui.open_file(&mut fonts.system, path).unwrap();
+
+        ui.caret_tick();
+        assert!(!ui.caret_flying(), "the first frame only aims");
+        let before = ui.caret.y;
+
+        // One wheel notch: the caret's row slides up under the view, but the
+        // caret did not move.
+        ui.active_editor_mut().unwrap().scroll_by(&mut fonts.system, 8.0);
+        ui.caret_tick();
+        assert!(
+            !ui.caret_flying(),
+            "a scroll is not a caret move, so nothing may ease"
+        );
+        assert!(
+            ui.caret.y < before,
+            "the caret travels with the text it sits beside: {before} -> {}",
+            ui.caret.y
+        );
+
+        // A real move still glides, which is the whole point of the animation.
+        ui.active_editor_mut()
+            .unwrap()
+            .move_right(&mut fonts.system);
+        ui.caret_tick();
+        assert!(ui.caret_flying(), "a caret move must still glide");
     }
 
     #[test]
