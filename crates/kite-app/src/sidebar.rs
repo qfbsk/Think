@@ -126,7 +126,8 @@ impl Sidebar {
         let buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
         let cell_width = measure_cell(font_system, family, font_size, line_height);
         let mut sidebar = Self {
-            visible: true,
+            // The tree is asked for with `-`; opening a window is not asking.
+            visible: false,
             root,
             rows: Vec::new(),
             selected: 0,
@@ -574,6 +575,12 @@ impl Sidebar {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = file_type.is_dir() && !file_type.is_symlink();
+            // Windows keeps a few folders for itself — the recycle bin, the
+            // restore-point store — and marks them as its own. Nothing inside
+            // is meant to be opened, and most of it cannot even be read.
+            if is_dir && system_folder(&path) {
+                continue;
+            }
             let found = if is_dir {
                 self.git.folder(&path).map(|state| git::Entry {
                     state,
@@ -944,6 +951,21 @@ fn drives() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Whether the system owns this folder. On Windows that is the one attribute
+/// the recycle bin and the restore-point store carry.
+#[cfg(windows)]
+fn system_folder(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0002;
+    path.metadata()
+        .is_ok_and(|meta| meta.file_attributes() & FILE_ATTRIBUTE_SYSTEM != 0)
+}
+
+#[cfg(not(windows))]
+fn system_folder(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1050,48 @@ mod tests {
         assert_eq!(glyph(row(&rows, ".hidden_dir")), FOLDER_ICON);
         assert_eq!(glyph(row(&rows, "empty")), EMPTY_FOLDER_ICON);
         assert_eq!(glyph(row(&rows, "repo")), GIT_FOLDER_ICON);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The recycle bin and the restore-point store are folders the system owns;
+    /// they are marked as such, and a file tree has no business showing them.
+    #[cfg(windows)]
+    #[test]
+    fn skips_the_folders_the_system_owns() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let base =
+            std::env::temp_dir().join(format!("kite-sidebar-system-{}", std::process::id()));
+        let owned = base.join("$RECYCLE.BIN");
+        let kept = base.join("kept");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&owned).unwrap();
+        fs::create_dir_all(&kept).unwrap();
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+        }
+        let wide: Vec<u16> = owned
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, what Windows itself sets.
+        assert_eq!(unsafe { SetFileAttributesW(wide.as_ptr(), 0x1 | 0x2) }, 1);
+
+        let names: Vec<String> = listing(&base)
+            .iter()
+            .map(|row| {
+                row.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["kept".to_string()]);
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -721,6 +721,17 @@ impl Editor {
         self.set_caret(font_system, Position::new(line, ch));
     }
 
+    /// The whole line the caret sits on, as one logical line: a row that wraps
+    /// on screen is still a single line here, and its newline stays outside the
+    /// selection so that typing over it keeps the line count.
+    pub fn select_line(&mut self, font_system: &mut FontSystem) {
+        let line = self.selection.cursor.line;
+        let end = self.document.line_char_len(line);
+        self.selection = Selection::new(Position::new(line, 0), Position::new(line, end));
+        self.desired_x = None;
+        self.ensure_cursor_visible(font_system);
+    }
+
     pub fn move_vertical(&mut self, font_system: &mut FontSystem, down: bool) {
         self.shape_view(font_system);
         let cursor = self.cursor_cosmic();

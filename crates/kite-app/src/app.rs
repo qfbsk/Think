@@ -485,6 +485,15 @@ impl App {
         // the keys it is waiting for — Ctrl+C above all — would be kite's to
         // ignore instead of the child's to answer.
         let owned = matches!(ui.active_shell(), Some(shell) if shell.is_running());
+        // Closing a file is the same ask wherever the focus happens to sit, so it
+        // is answered before the focus is consulted at all.
+        if ui.mode == Mode::Normal && !owned && !repeat && char_is(&key, "q") {
+            if ui.active_tab().is_shell() {
+                ui.message = Some("the shell tab cannot be closed".to_string());
+            } else {
+                ui.close_active_file(system);
+            }
+        }
         match (ui.focus, if owned { Mode::Insert } else { ui.mode }) {
             (Focus::Sidebar, _) => {
                 if repeat {
@@ -538,13 +547,6 @@ impl App {
                                 } else {
                                     "always on top off".to_string()
                                 });
-                            }
-                        }
-                        "q" => {
-                            if ui.active_tab().is_shell() {
-                                ui.message = Some("the shell tab cannot be closed".to_string());
-                            } else {
-                                ui.close_active_file(system);
                             }
                         }
                         value if value.len() == 1 => {
@@ -1010,6 +1012,10 @@ impl ApplicationHandler for App {
                 if !focused {
                     self.drag = None;
                     self.vertical = None;
+                } else if let (Some(fonts), Some(ui)) = (self.fonts.as_mut(), self.ui.as_mut()) {
+                    // Files come and go while some other window has the screen, so
+                    // coming back to this one is when the tree gets looked at again.
+                    ui.sidebar.git_changed(&mut fonts.system);
                 }
                 return;
             }
@@ -1316,6 +1322,14 @@ fn handle_insert_key(
                     }
                     changed = true;
                 }
+                "l" | "L" => {
+                    if let Some(editor) = ui.active_editor_mut() {
+                        editor.select_line(system);
+                    } else if let Some(shell) = ui.active_shell_mut() {
+                        shell.select_line(system);
+                    }
+                    changed = true;
+                }
                 _ => {}
             },
             _ => {}
@@ -1325,6 +1339,7 @@ fn handle_insert_key(
 
     match key {
         Key::Named(NamedKey::Enter) => {
+            let submitted = ui.active_editor().is_none() && ui.active_shell().is_some();
             let effect = if let Some(editor) = ui.active_editor_mut() {
                 if let Err(error) = editor.newline(system) {
                     ui.message = Some(format!("!{error}"));
@@ -1337,6 +1352,11 @@ fn handle_insert_key(
             };
             if let Some(effect) = effect {
                 ui.handle_shell_effect(system, effect);
+            }
+            if submitted {
+                // A built-in can write the file right here, with no process to
+                // wait for, so the tree is asked again as soon as the line is done.
+                ui.command_ran(system);
             }
             changed = true;
         }
@@ -1661,9 +1681,141 @@ mod tests {
         assert!(holds_to_repeat(&Key::Named(NamedKey::ArrowRight)));
         // A held key must not paste the clipboard thirty times, save in a loop,
         // cut the selection away or close a tab nobody meant to close.
-        for key in ["v", "V", "c", "C", "x", "X", "s", "S", "a", "A", "w", "q"] {
+        for key in ["v", "V", "c", "C", "x", "X", "s", "S", "a", "A", "w", "q", "l", "L"] {
             assert!(!holds_to_repeat(&character(key)), "{key} must not repeat");
         }
+    }
+
+    /// Ctrl+L is the whole logical line: the newline at its end stays outside
+    /// the selection, so typing over it cannot change the line count.
+    #[test]
+    fn ctrl_l_selects_the_logical_line() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            winit::dpi::PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, b"").unwrap();
+        ui.open_file(&mut fonts.system, path).unwrap();
+
+        let mut window: Option<Arc<Window>> = None;
+        let mut clipboard: Option<arboard::Clipboard> = None;
+        let mut next_blink = Instant::now();
+        let mut ime: Option<(Instant, String)> = None;
+        let system = &mut fonts.system;
+        // "abc", a newline, then "de" — the caret ends inside the second line.
+        let mut presses = Vec::new();
+        for value in ["a", "b", "c"] {
+            presses.push((Key::Character(value.into()), Some(value)));
+        }
+        presses.push((Key::Named(NamedKey::Enter), None));
+        for value in ["d", "e"] {
+            presses.push((Key::Character(value.into()), Some(value)));
+        }
+        for (key, text) in presses {
+            handle_insert_key(
+                &mut window,
+                &mut ui,
+                system,
+                &mut clipboard,
+                &key,
+                text,
+                false,
+                false,
+                &mut next_blink,
+                &mut ime,
+            );
+        }
+
+        // The chord, with and without the shift the hand may still be holding.
+        for value in ["l", "L"] {
+            handle_insert_key(
+                &mut window,
+                &mut ui,
+                system,
+                &mut clipboard,
+                &Key::Character(value.into()),
+                Some(value),
+                true,
+                false,
+                &mut next_blink,
+                &mut ime,
+            );
+            let selection = ui.active_editor().unwrap().selection;
+            assert_eq!(
+                selection.anchor,
+                kite_core::Position::new(1, 0),
+                "the selection starts at the line's first character"
+            );
+            assert_eq!(
+                selection.cursor,
+                kite_core::Position::new(1, 2),
+                "and ends at its last one, newline left out"
+            );
+        }
+    }
+
+    /// `ni` makes a file without starting anything, so there is no child to wait
+    /// for: the tree has to learn about the file from the line itself.
+    #[test]
+    fn a_builtin_that_makes_a_file_updates_the_tree() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            winit::dpi::PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        ui.sidebar.visible = true;
+        ui.sidebar.root = crate::sidebar::Root::Dir(dir.path().to_path_buf());
+        ui.sidebar.git_changed(&mut fonts.system);
+        let made = dir.path().join("t.c");
+        assert!(!ui.sidebar.rows.iter().any(|row| row.path == made));
+
+        let mut window: Option<Arc<Window>> = None;
+        let mut clipboard: Option<arboard::Clipboard> = None;
+        let mut next_blink = Instant::now();
+        let mut ime: Option<(Instant, String)> = None;
+        let system = &mut fonts.system;
+        let line = format!("ni {}", kite_core::display_path(&made));
+        for value in line.chars() {
+            let key = Key::Character(value.to_string().into());
+            handle_insert_key(
+                &mut window,
+                &mut ui,
+                system,
+                &mut clipboard,
+                &key,
+                Some(value.to_string().as_str()),
+                false,
+                false,
+                &mut next_blink,
+                &mut ime,
+            );
+        }
+        handle_insert_key(
+            &mut window,
+            &mut ui,
+            system,
+            &mut clipboard,
+            &Key::Named(NamedKey::Enter),
+            Some("\n"),
+            false,
+            false,
+            &mut next_blink,
+            &mut ime,
+        );
+
+        assert!(made.is_file(), "the built-in did not make the file");
+        assert!(
+            ui.sidebar.rows.iter().any(|row| row.path == made),
+            "the tree still shows the old contents"
+        );
     }
 
     #[test]

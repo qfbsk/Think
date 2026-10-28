@@ -277,7 +277,9 @@ impl Ui {
         let mut ui = Self {
             tabs: vec![shell_tab],
             active: 0,
-            mode: Mode::Insert,
+            // A window that opens ready for `i` rather than mid-typing, and that
+            // shows the shell instead of a file tree nobody asked for.
+            mode: Mode::Normal,
             focus: Focus::Right,
             sidebar,
             size,
@@ -636,9 +638,8 @@ impl Ui {
     }
 
     pub fn close_active_file(&mut self, font_system: &mut FontSystem) -> bool {
-        if self.focus != Focus::Right || self.mode != Mode::Normal {
-            return false;
-        }
+        // Who may ask is the caller's business; the tree holds the focus just as
+        // well as the page does. What never closes is the shell tab.
         if self.active_tab().is_shell() {
             return false;
         }
@@ -780,14 +781,32 @@ impl Ui {
         self.message = Some(format!("text size {:.0}px", size / self.scale));
     }
 
+    /// A command line has just been dealt with. Built-ins write files right
+    /// there — `ni t.c` makes one and never starts a process — so this is where
+    /// the tree learns it may have changed.
+    pub fn command_ran(&mut self, font_system: &mut FontSystem) {
+        self.sidebar.git_changed(font_system);
+    }
+
     pub fn poll_shell(&mut self, font_system: &mut FontSystem) -> bool {
         let mut changed = false;
+        let mut command_ended = false;
         for tab in &mut self.tabs {
             if let TabContent::Shell(shell) = &mut tab.content {
+                let was_running = shell.is_running();
                 if shell.poll(font_system) {
                     changed = true;
                 }
+                if was_running && !shell.is_running() {
+                    command_ended = true;
+                }
             }
+        }
+        // Whatever the command did to the tree is on disk by now, so the listing
+        // is rebuilt the moment it is done rather than waiting for the panel to
+        // be closed and opened again.
+        if command_ended {
+            self.sidebar.git_changed(font_system);
         }
         changed
     }
@@ -2304,6 +2323,10 @@ mod tests {
             ui.right.h + ui.strip_rect.h,
             "the right pane's one background spans body and band"
         );
+        // The tree starts put away; this is about how both panes paint once it
+        // is open, so open it before looking at their colours.
+        ui.sidebar.visible = true;
+        ui.recompute_layout(&mut fonts.system);
         let quad = |quads: &[QuadVertex], rect: Rect| -> [f32; 4] {
             quads
                 .iter()
@@ -2379,6 +2402,102 @@ mod tests {
         assert_eq!(short.strip_rect.h, 0.0, "a short window gets no line");
         short.resize(&mut fonts.system, PhysicalSize::new(1600, 640));
         assert_eq!(short.strip_rect.h, 64.0, "the band is back with the room");
+    }
+
+    /// A window opens quiet: nothing is being typed yet, and the file tree is
+    /// not in the way until `-` asks for it.
+    #[test]
+    fn opens_in_normal_with_the_tree_put_away() {
+        let mut fonts = Fonts::load();
+        let ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        assert_eq!(ui.mode, Mode::Normal);
+        assert_eq!(ui.focus, Focus::Right);
+        assert!(!ui.sidebar.visible);
+    }
+
+    /// The tree holds the focus as well as the page does, so the same ask works
+    /// from either side of the window.
+    #[test]
+    fn a_file_tab_closes_with_the_tree_in_focus() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("close.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        ui.open_file(&mut fonts.system, path).unwrap();
+        assert_eq!(ui.tabs.len(), 2, "the file sits beside the shell");
+
+        ui.toggle_sidebar(&mut fonts.system);
+        assert_eq!(ui.focus, Focus::Sidebar);
+        assert!(
+            ui.close_active_file(&mut fonts.system),
+            "the tree's focus must not stop the close"
+        );
+        assert_eq!(ui.tabs.len(), 1, "only the shell tab is left");
+    }
+
+    /// A command that makes a file changes the tree, so the listing follows the
+    /// moment the command is done — not the next time the panel is closed and
+    /// opened again.
+    #[test]
+    fn a_finished_command_puts_the_new_file_in_the_tree() {
+        use std::time::Duration;
+
+        let mut fonts = Fonts::load();
+        theme::init();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        ui.sidebar.visible = true;
+        ui.sidebar.root = crate::sidebar::Root::Dir(dir.path().to_path_buf());
+        ui.sidebar.git_changed(&mut fonts.system);
+        let made = dir.path().join("made.txt");
+        assert!(
+            !ui.sidebar.rows.iter().any(|row| row.path == made),
+            "the file is not there before the command runs"
+        );
+
+        let shell = ui.active_shell_mut().expect("the shell tab");
+        shell.insert_text(
+            &mut fonts.system,
+            &format!("cd {}", kite_core::display_path(dir.path())),
+        );
+        shell.submit(&mut fonts.system);
+        let shell = ui.active_shell_mut().expect("the shell tab");
+        shell.insert_text(&mut fonts.system, "cmd /c copy nul made.txt");
+        assert!(shell.submit(&mut fonts.system).is_none());
+
+        let waited = Instant::now();
+        while ui.active_shell().is_some_and(|shell| shell.is_running())
+            && waited.elapsed() < Duration::from_secs(10)
+        {
+            ui.poll_shell(&mut fonts.system);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(made.is_file(), "the command never made the file");
+        assert!(
+            ui.sidebar.rows.iter().any(|row| row.path == made),
+            "the tree still lists the old contents: {:?}",
+            ui.sidebar
+                .rows
+                .iter()
+                .map(|row| row.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

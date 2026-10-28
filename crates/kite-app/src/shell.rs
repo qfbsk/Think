@@ -397,6 +397,18 @@ impl Shell {
         self.refresh_prompt(font_system);
     }
 
+    /// The whole input line, wrapped rows included. Nothing to hold when the
+    /// line is empty, so an empty selection is never claimed.
+    pub fn select_line(&mut self, font_system: &mut FontSystem) {
+        let end = self.input.chars().count();
+        if end == 0 {
+            return;
+        }
+        self.input_selection = Some((0, end));
+        self.input_cursor = end;
+        self.refresh_prompt(font_system);
+    }
+
     /// Everything on the grid, scrollback included.
     pub fn select_all(&mut self, font_system: &mut FontSystem) {
         self.input_selection = None;
@@ -2305,6 +2317,34 @@ mod tests {
     /// A selection may cover rows that cannot be edited: the session text the
     /// commands printed. Copying still takes all of it, but an edit reaches the
     /// input line rather than doing nothing at all.
+    /// Ctrl+L on the shell page is the input line, and none of the session
+    /// text above it. An empty line has nothing to grab, so no selection.
+    #[test]
+    fn select_line_grabs_the_input_line_only() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 1200.0, 900.0);
+        shell.push_line("some output".to_string(), LineKind::Output);
+        shell.rebuild_buffer(&mut fonts.system);
+        shell.insert_text(&mut fonts.system, "echo 清枫");
+
+        shell.select_line(&mut fonts.system);
+        assert_eq!(
+            shell.input_selection,
+            Some((0, shell.input.chars().count())),
+            "the selection is the whole line, characters counted"
+        );
+        let copied = shell.selected_text().expect("the line is selected");
+        assert!(
+            copied.contains("echo 清枫") && !copied.contains("some output"),
+            "the input line and nothing of the session above it: {copied:?}"
+        );
+
+        shell.cut_selection(&mut fonts.system);
+        assert_eq!(shell.input, "");
+        shell.select_line(&mut fonts.system);
+        assert_eq!(shell.input_selection, None, "an empty line selects nothing");
+    }
+
     #[test]
     fn an_edit_over_session_text_changes_the_input_line() {
         let mut fonts = Fonts::load();
