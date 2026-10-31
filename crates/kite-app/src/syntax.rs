@@ -374,6 +374,13 @@ pub fn language_for_path(path: &Path) -> Option<Language> {
         .map(|index| Language(index as u32))
 }
 
+/// The name a language answers to, the same one its query files are filed
+/// under. Completion keeps its tables by this rather than by an index that
+/// shifts whenever a grammar is added.
+pub fn language_name(language: Language) -> &'static str {
+    DEFINITIONS[language.0 as usize].name
+}
+
 pub fn enabled(bytes: usize) -> bool {
     bytes <= MAX_HIGHLIGHT_BYTES
 }

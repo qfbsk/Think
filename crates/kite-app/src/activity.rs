@@ -262,11 +262,11 @@ impl Probe {
         changed
     }
 
-    /// Append one save and fold it straight into the day it belongs to.
-    pub fn record(&mut self, day: Day, path: &str) {
-        if let Some(file) = self.path.as_ref().and_then(|path| open_append(path)) {
-            append(file, day, path);
-        }
+    /// Fold a save into the day it belongs to.
+    ///
+    /// This does not touch the file: the log is written by [`record_save`],
+    /// which does not need a reader to be looking at anything.
+    pub fn note(&mut self, day: Day, path: &str) {
         self.history.record(day, path);
     }
 
@@ -302,9 +302,18 @@ fn open_append(path: &Path) -> Option<File> {
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
-fn append(mut file: File, day: Day, path: &str) {
-    let line = format!("{}\t{}\n", day.label(), path);
-    let _ = file.write_all(line.as_bytes());
+/// Append one save to the log.
+///
+/// The log is the history and everything else is a view of it, so this stands
+/// on its own: a save counts whether or not a board is open to show it, and
+/// whether or not one was ever opened before.
+pub fn record_save(log: Option<&Path>, day: Day, file: &str) {
+    let Some(handle) = log.and_then(open_append) else {
+        return;
+    };
+    let line = format!("{}\t{}\n", day.label(), file);
+    let mut handle = handle;
+    let _ = handle.write_all(line.as_bytes());
 }
 
 #[cfg(test)]
@@ -383,10 +392,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("activity.log");
         let day = Day::from_date(2026, 10, 22);
-        {
-            let mut probe = Probe::new(Some(path.clone()));
-            probe.record(day, "E:\\Think\\x.rs");
-        }
+        record_save(Some(&path), day, "E:\\Think\\x.rs");
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, "2026-10-22\tE:\\Think\\x.rs\n");
 
@@ -399,5 +405,35 @@ mod tests {
         }
         assert_eq!(probe.total(day), 1);
         assert_eq!(probe.files(day)[0].0, "E:\\Think\\x.rs");
+    }
+
+    /// The board is a view of the log, so the log has to be complete on its own.
+    #[test]
+    fn a_save_needs_no_reader_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activity.log");
+        let day = Day::from_date(2026, 10, 22);
+        record_save(Some(&path), day, "E:\\Think\\a.rs");
+        record_save(Some(&path), day, "E:\\Think\\b.rs");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            2,
+            "both saves are in the file though nothing was watching"
+        );
+
+        // A board opened afterwards sees what the earlier ones missed.
+        let mut probe = Probe::new(Some(path));
+        for _ in 0..50 {
+            if probe.poll() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(probe.total(day), 2);
+    }
+
+    #[test]
+    fn a_save_where_there_is_no_log_is_not_a_crash() {
+        record_save(None, Day::from_date(2026, 10, 22), "E:\\Think\\a.rs");
     }
 }

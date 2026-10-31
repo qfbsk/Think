@@ -23,6 +23,7 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 toml.workspace = true
 winreg.workspace = true
+serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tree-house = "0.4.0"
 tree-house-bindings = { version = "0.3.2", features = ["ropey", "tree-sitter-language"] }

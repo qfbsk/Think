@@ -9,6 +9,7 @@ use tree_house::tree_sitter::{InputEdit, Point};
 use tree_house::{Language, Syntax};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::lsp::RawDiagnostic;
 use crate::syntax::{self, Engine, Run};
 use crate::text::{bold_attrs, buffer_line, byte_to_char, char_to_byte, force_relayout};
 use crate::theme;
@@ -42,6 +43,43 @@ pub struct Editor {
     line_height: f32,
     view_width: f32,
     view_height: f32,
+    /// The placeholders a taken snippet still has to walk through, if any. The
+    /// positions are the document's own, so typing inside one moves the rest.
+    snippet: Option<Snippet>,
+    /// What the server last said about this page. Kept until it says something
+    /// else, which is how long the red lines can be wrong for after an edit.
+    issues: Vec<Issue>,
+}
+
+/// A snippet the reader is tabbing through. `next` is the stop the next Tab
+/// goes to; the stops behind it are kept so the walk knows where it ends.
+struct Snippet {
+    stops: Vec<(Position, Position)>,
+    next: usize,
+}
+
+/// One thing the language server found wrong with the page, in the document's
+/// own positions. It is what the server said, kept as it said it: nothing here
+/// decides which troubles are worth mentioning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Issue {
+    pub start: Position,
+    pub end: Position,
+    pub error: bool,
+    pub message: String,
+    pub note: String,
+}
+
+impl Issue {
+    /// The two ends in order. A server that sends them the other way round is
+    /// not rare enough to lose the underline over.
+    fn range(&self) -> (Position, Position) {
+        if self.start <= self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -107,6 +145,8 @@ impl Editor {
             line_height,
             view_width,
             view_height,
+            snippet: None,
+            issues: Vec::new(),
         };
         editor.shape_view(font_system);
         editor
@@ -451,7 +491,223 @@ impl Editor {
         font_system: &mut FontSystem,
         text: &str,
     ) -> Result<(), Unencodable> {
+        let (start, end) = self.selection.ordered();
         self.selection = self.document.apply_edit(self.selection, text)?;
+        self.shift_snippet(start, end, text);
+        self.after_change(font_system);
+        Ok(())
+    }
+
+    /// The place a taken snippet has left to walk. Empty after the last stop.
+    pub fn snippet_pending(&self) -> bool {
+        self.snippet.is_some()
+    }
+
+    /// Start walking the placeholders of a snippet taken from a list. The first
+    /// one is selected, so typing replaces the text the server put there.
+    pub fn begin_snippet(&mut self, font_system: &mut FontSystem, stops: Vec<(Position, Position)>) {
+        if stops.is_empty() {
+            self.snippet = None;
+            return;
+        }
+        self.snippet = Some(Snippet { stops: stops.clone(), next: 1 });
+        self.set_selection(font_system, Selection::new(stops[0].0, stops[0].1));
+    }
+
+    /// Tab inside a snippet: select the next placeholder, and end the walk once
+    /// the last one has been used. Reports false when no snippet is in force,
+    /// so Tab goes on being Tab.
+    pub fn snippet_tab(&mut self, font_system: &mut FontSystem) -> bool {
+        let Some(snippet) = &self.snippet else {
+            return false;
+        };
+        let Some(&(start, end)) = snippet.stops.get(snippet.next) else {
+            self.snippet = None;
+            return true;
+        };
+        let next = snippet.next + 1;
+        let done = next >= snippet.stops.len();
+        if done {
+            self.snippet = None;
+        } else if let Some(snippet) = &mut self.snippet {
+            snippet.next = next;
+        }
+        self.set_selection(font_system, Selection::new(start, end));
+        true
+    }
+
+    pub fn clear_snippet(&mut self) {
+        self.snippet = None;
+    }
+
+    /// Move the stops over an edit: what stands after it moves with it, and
+    /// what stood inside it is gone with it.
+    fn shift_snippet(&mut self, start: Position, end: Position, text: &str) {
+        let Some(snippet) = &mut self.snippet else {
+            return;
+        };
+        for (stop_start, stop_end) in &mut snippet.stops {
+            *stop_start = shifted(*stop_start, start, end, text);
+            *stop_end = shifted(*stop_end, start, end, text);
+        }
+    }
+
+    /// Take the server's report for this page, in its own coordinates, and keep
+    /// it as document positions. Reports whether anything the screen shows has
+    /// changed, which is the difference between redrawing on every notification
+    /// and redrawing when the page actually got better or worse.
+    pub fn set_issues(&mut self, raw: &[RawDiagnostic]) -> bool {
+        let lines = self.document.line_count();
+        let found: Vec<Issue> = raw
+            .iter()
+            .map(|issue| Issue {
+                start: Position::new(
+                    issue.start.0.min(lines.saturating_sub(1)),
+                    self.column(issue.start.0, issue.start.1),
+                ),
+                end: Position::new(
+                    issue.end.0.min(lines.saturating_sub(1)),
+                    self.column(issue.end.0, issue.end.1),
+                ),
+                error: issue.error,
+                message: issue.message.clone(),
+                note: issue.note.clone(),
+            })
+            .collect();
+        if found == self.issues {
+            return false;
+        }
+        self.issues = found;
+        true
+    }
+
+    /// A server's UTF-16 column into the line's own characters. A line the page
+    /// does not have is the end of the last one, which is where a report about
+    /// "one more line than there is" points.
+    fn column(&self, line: usize, units: u64) -> usize {
+        if line >= self.document.line_count() {
+            return self
+                .document
+                .line_text(self.document.line_count().saturating_sub(1))
+                .chars()
+                .count();
+        }
+        crate::lsp::character_column(&self.document.line_text(line), units as usize)
+    }
+
+    pub fn issue_counts(&self) -> (usize, usize) {
+        let errors = self.issues.iter().filter(|issue| issue.error).count();
+        (errors, self.issues.len() - errors)
+    }
+
+    /// The rows the reports cover, in the same pixel spans the selection uses,
+    /// so a line under a bad token sits where the token is rather than where a
+    /// character count says it should be. Each one carries which report it is,
+    /// because the mouse lands on a span and the card needs the words.
+    pub fn issue_spans(&self) -> Vec<(usize, f32, f32, f32, f32, bool)> {
+        let mut found = Vec::new();
+        for (index, issue) in self.issues.iter().enumerate() {
+            let (first, last) = issue.range();
+            if first == last {
+                // A report with no width is a report about the end of the line,
+                // and there is nothing under to draw on. clangd sends these for
+                // a missing `;` at the start of the next row.
+                continue;
+            }
+            let start = self.position_cosmic(first);
+            let end = self.position_cosmic(last);
+            for run in self.buffer.layout_runs() {
+                if run.line_i < first.line || run.line_i > last.line {
+                    continue;
+                }
+                for (x, width) in run.highlight(start, end) {
+                    if width > 0.0 {
+                        found.push((index, x, run.line_top, width, run.line_height, issue.error));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    pub fn issue(&self, index: usize) -> Option<&Issue> {
+        self.issues.get(index)
+    }
+
+    /// Make the edits a server attached to an answer — the include that makes
+    /// the name compile, usually. They are made bottom-up so the earlier ones
+    /// keep their line numbers, and the caret is mapped through each of them:
+    /// the completion's own span sits below every one of them in practice, and
+    /// the caller shifts that span by how far the caret moved.
+    pub fn apply_edits(
+        &mut self,
+        font_system: &mut FontSystem,
+        edits: &[(Position, Position, String)],
+    ) -> Result<(), Unencodable> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let caret = self.selection.cursor;
+        let mut ordered: Vec<&(Position, Position, String)> = edits.iter().collect();
+        ordered.sort_by(|left, right| right.0.cmp(&left.0));
+        for edit in &ordered {
+            let (start, end, text) = *edit;
+            self.document.apply_edit(Selection::new(*start, *end), text)?;
+        }
+        let mut moved = caret;
+        // Bottom-up, like the edits themselves: an edit below the caret has
+        // already been walked over, and the ones above still hold the line
+        // numbers the server wrote them in.
+        for edit in &ordered {
+            let (start, end, text) = *edit;
+            moved = shifted(moved, *start, *end, text);
+        }
+        self.selection = Selection::caret(moved);
+        self.desired_x = None;
+        self.snippet = None;
+        self.after_change(font_system);
+        Ok(())
+    }
+
+    /// What the row still holds past the caret. A ghost is written on the row,
+    /// so anything already there is text it would have to sit on top of.
+    pub fn text_after_caret(&self) -> String {
+        let caret = self.selection.cursor;
+        if caret.line >= self.document.line_count() {
+            return String::new();
+        }
+        self.document
+            .line_text(caret.line)
+            .chars()
+            .skip(caret.ch)
+            .take(80)
+            .collect()
+    }
+
+    /// The language table to complete from, as the server files name it. A file
+    /// with no recognised language gets no server, and so no completion.
+    pub fn language_name(&self) -> Option<&'static str> {
+        self.language.map(syntax::language_name)
+    }
+
+    /// Put the chosen word where the half-typed one stood. One edit, never a
+    /// delete and an insert, so a single undo takes the whole completion back
+    /// instead of peeling it off a letter at a time. The span can reach past the
+    /// caret, because a server that completes the `strn` of `strncpy` means the
+    /// whole of the word it was asked about.
+    pub fn replace_range(
+        &mut self,
+        font_system: &mut FontSystem,
+        start: Position,
+        end: Position,
+        text: &str,
+    ) -> Result<(), Unencodable> {
+        let cursor = self.selection.cursor;
+        let start = start.min(cursor);
+        let end = end.max(start).max(cursor);
+        self.selection = self.document.apply_edit(Selection::new(start, end), text)?;
+        self.shift_snippet(start, end, text);
+        self.desired_x = None;
         self.after_change(font_system);
         Ok(())
     }
@@ -525,6 +781,7 @@ impl Editor {
             format!("{ch}{close}")
         };
         self.selection = self.document.apply_edit(self.selection, &inserted)?;
+        self.shift_snippet(caret, caret, &inserted);
         let inner = if ch == '{' {
             Position::new(caret.line + 1, lead.chars().count() + 1)
         } else {
@@ -540,6 +797,7 @@ impl Editor {
     /// deeper after an unclosed opener, and splits a pair the caret sits inside
     /// into three lines. Bytes outside the inserted text are never touched.
     pub fn newline(&mut self, font_system: &mut FontSystem) -> Result<(), Unencodable> {
+        self.snippet = None;
         if !self.selection.is_empty() {
             self.selection = self.document.apply_edit(self.selection, "\n")?;
             self.after_change(font_system);
@@ -589,6 +847,7 @@ impl Editor {
     }
 
     pub fn backspace(&mut self, font_system: &mut FontSystem) -> Result<(), Unencodable> {
+        self.snippet = None;
         if !self.selection.is_empty() {
             self.selection = self.document.apply_edit(self.selection, "")?;
         } else if let Some(previous) = self.previous_position(self.selection.cursor) {
@@ -609,6 +868,7 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self, font_system: &mut FontSystem) -> Result<(), Unencodable> {
+        self.snippet = None;
         if !self.selection.is_empty() {
             self.selection = self.document.apply_edit(self.selection, "")?;
         } else if let Some(next) = self.next_position(self.selection.cursor) {
@@ -620,6 +880,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self, font_system: &mut FontSystem) -> bool {
+        self.snippet = None;
         if let Some(selection) = self.document.undo() {
             self.selection = selection;
             self.after_change(font_system);
@@ -1083,6 +1344,28 @@ fn byte_of_char(text: &str, column: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Where a position lands after `[start, end)` was replaced by `text`. The
+/// pieces before the edit stand, the pieces after it ride the new text, and
+/// anything the edit swallowed collapses onto its start.
+pub(crate) fn shifted(p: Position, start: Position, end: Position, text: &str) -> Position {
+    if p <= start {
+        return p;
+    }
+    if p < end {
+        return start;
+    }
+    let lines = text.matches('\n').count();
+    let tail = text.rsplit('\n').next().map(str::chars).map(Iterator::count).unwrap_or(0);
+    let line = p.line - end.line + start.line + lines;
+    let ch = if p.line == end.line {
+        let lead = if lines == 0 { start.ch } else { 0 };
+        lead + tail + (p.ch - end.ch)
+    } else {
+        p.ch
+    };
+    Position::new(line, ch)
+}
+
 /// Decoded copy of the document, kept only for the highlighter. A document over the
 /// tree-sitter budget returns `None` and stays uncoloured rather than trading memory
 /// for colour; nothing here is ever written back.
@@ -1102,6 +1385,40 @@ mod tests {
     use super::*;
     use crate::fonts::Fonts;
     use kite_core::Position;
+
+    /// A report arrives in the server's counting — lines from zero, columns in
+    /// its own units — and the underline is drawn in the page's positions. A
+    /// line past the end of the file is the last line of the file, because that
+    /// is where a report about "one more row than there is" points. The unit to
+    /// column conversion itself is `columns_are_counted_the_way_each_side_counts_them`.
+    #[test]
+    fn a_report_is_placed_in_the_pages_own_positions() {
+        let (mut editor, _fonts) = editor("// int a;
+int b
+");
+        let at = |line, units| crate::lsp::RawDiagnostic {
+            start: (line, units),
+            end: (line, units + 4),
+            error: true,
+            message: "Expected ';'".to_string(),
+            note: "clang expected_semi".to_string(),
+        };
+        assert!(editor.set_issues(&[at(0, 3), at(9, 0)]));
+        assert_eq!(editor.issue_counts(), (2, 0), "both are errors");
+        assert_eq!(editor.issues[0].start, Position::new(0, 3));
+        assert_eq!(editor.issues[0].end, Position::new(0, 7));
+        assert_eq!(
+            editor.issues[1].start,
+            Position::new(2, 0),
+            "a line past the end of the page is its last line, where that report points"
+        );
+        assert!(
+            !editor.set_issues(&[at(0, 3), at(9, 0)]),
+            "the same report said twice changes nothing on the screen"
+        );
+        assert!(editor.set_issues(&[]), "and an empty report takes it all off");
+        assert_eq!(editor.issue_counts(), (0, 0));
+    }
 
     fn editor(text: &str) -> (Editor, Fonts) {
         let mut fonts = Fonts::load();
@@ -1123,6 +1440,23 @@ mod tests {
     fn rust_editor(text: &str) -> (Editor, Fonts) {
         let mut fonts = Fonts::load();
         let document = Document::from_bytes("kite-editor-test.rs", text.as_bytes().to_vec())
+            .expect("a document");
+        let editor = Editor::new(
+            document,
+            &mut fonts.system,
+            fonts.mono,
+            400.0,
+            200.0,
+            16.0,
+            Arc::new(Engine::new()),
+        );
+        (editor, fonts)
+    }
+
+    /// A C buffer, which is the only kind that has headers and a preprocessor.
+    fn c_editor(text: &str) -> (Editor, Fonts) {
+        let mut fonts = Fonts::load();
+        let document = Document::from_bytes("kite-editor-test.c", text.as_bytes().to_vec())
             .expect("a document");
         let editor = Editor::new(
             document,
@@ -1529,6 +1863,37 @@ mod tests {
         assert_eq!(rows(&editor), vec!["alpha", "", ""]);
         assert!(editor.undo(&mut fonts.system));
         assert_eq!(rows(&editor), vec!["alpha", "bravo", ""]);
+    }
+
+    /// The server table is keyed on these names, so a file whose language is
+    /// reported under another spelling quietly loses completion altogether.
+    #[test]
+    fn a_page_names_its_language_the_way_the_servers_are_named() {
+        let (c, _fonts) = c_editor("int main(void) { return 0; }\n");
+        assert_eq!(c.language_name(), Some("c"));
+        let (rs, _fonts) = rust_editor("fn main() {}\n");
+        assert_eq!(rs.language_name(), Some("rust"));
+    }
+
+    #[test]
+    fn a_completion_is_one_undo_step_not_a_letter_at_a_time() {
+        let (mut editor, mut fonts) = editor("let led\n");
+        place(&mut editor, &mut fonts, 0, 7);
+        editor
+            .replace_range(
+                &mut fonts.system,
+                Position::new(0, 4),
+                Position::new(0, 7),
+                "ledger",
+            )
+            .unwrap();
+        assert_eq!(rows(&editor), vec!["let ledger", ""]);
+        assert!(editor.undo(&mut fonts.system));
+        assert_eq!(
+            rows(&editor),
+            vec!["let led", ""],
+            "the whole word came back at once"
+        );
     }
 }
 

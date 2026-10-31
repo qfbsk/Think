@@ -165,8 +165,10 @@ impl Miku {
         self.probe.pending()
     }
 
-    pub fn record_save(&mut self, font_system: &mut FontSystem, path: &str) {
-        self.probe.record(Day::today(), path);
+    /// Take in a save the log already holds. The writing is done elsewhere, so
+    /// a board that was not open at the time still catches up when it is.
+    pub fn note_save(&mut self, font_system: &mut FontSystem, path: &str) {
+        self.probe.note(Day::today(), path);
         self.dirty = true;
         self.shape(font_system);
     }

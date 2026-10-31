@@ -4,11 +4,14 @@ mod activity;
 mod app;
 mod archive;
 mod blur;
+mod complete;
 mod banner;
+mod cli;
 mod day;
 mod editor;
 mod fonts;
 mod git;
+mod lsp;
 mod miku;
 mod palette; // engineering only, remove whole
 mod renderer;
@@ -20,6 +23,7 @@ mod terminal;
 mod text;
 mod theme;
 mod ui;
+mod usage;
 mod visualizer;
 
 use winit::event_loop::{ControlFlow, EventLoop};

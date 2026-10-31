@@ -10,6 +10,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::banner;
+use crate::cli;
+use crate::complete::{Item, Kind};
 use crate::terminal::{MouseReport, Run, Terminal};
 use crate::text::{bold_attrs, byte_to_char, char_to_byte, make_label, measure};
 use crate::theme;
@@ -28,6 +30,16 @@ const OS_ICON: char = '\u{f17a}';
 const GIT_BRANCH_ICON: char = '\u{f418}';
 #[cfg(windows)]
 pub(crate) const NO_WINDOW: u32 = 0x0800_0000;
+
+/// Every name this shell answers to itself: the commands a person would type,
+/// then the aliases that mean the same thing. Completion offers exactly this,
+/// so a test holds the list and the parser's `match` together — an offer the
+/// parser would refuse is worse than no offer.
+const BUILTINS: &[&str] = &[
+    "help", "cd", "pwd", "ls", "cp", "mv", "rm", "mkdir", "touch", "echo", "kkk", "theme",
+    "clear", "miku", "restart", "cls", "dir", "copy", "move", "ren", "del", "erase", "rd",
+    "rmdir", "md", "ni",
+];
 
 /// The prompt of one input line, split into the parts that get their own
 /// colors. Byte ranges are offsets into the line's own text.
@@ -162,6 +174,10 @@ pub struct Shell {
     prompt: Prompt,
     branch: Option<String>,
     identity: String,
+    /// The programs PATH can name, read the first time a completion asks for it
+    /// and kept: walking every directory on the way is far too slow to do on
+    /// each Tab, and a PATH that changes mid-session is not worth chasing.
+    path_commands: Option<Vec<String>>,
 }
 
 /// Kills the whole process tree. The helper is a console program, so without
@@ -224,6 +240,7 @@ impl Shell {
             prompt,
             branch,
             identity,
+            path_commands: None,
             focused: true,
         };
         let lines = banner::lines();
@@ -304,6 +321,100 @@ impl Shell {
         self.input.insert_str(byte, text);
         self.input_cursor += text.chars().count();
         self.input_selection = None;
+        self.refresh_prompt(font_system);
+    }
+
+    /// The token the caret is finishing, and where it starts, both counted in
+    /// characters of `input` the way the caret is. An empty token still counts:
+    /// a Tab on a bare prompt is a question about what can go here at all.
+    pub fn word_before_caret(&self) -> Option<(usize, String)> {
+        let chars: Vec<char> = self.input.chars().collect();
+        let end = self.input_cursor.min(chars.len());
+        let mut start = end;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        Some((start, chars[start..end].iter().collect()))
+    }
+
+    /// What the token under the caret could still become. The first word of a
+    /// line names a program; anywhere else it names a place on disk.
+    pub fn completions(&mut self) -> Vec<Item> {
+        let Some((start, token)) = self.word_before_caret() else {
+            return Vec::new();
+        };
+        // Whatever stands before the token decides what the token is: only
+        // whitespace means this is the word the shell would run.
+        let head = &self.input[..char_to_byte(&self.input, start)];
+        let first_word = head.chars().all(char::is_whitespace);
+        let program = head.split_whitespace().next().map(str::to_string);
+        let previous = head.split_whitespace().next_back().map(str::to_string);
+        if first_word && !token.contains(['/', '\\']) {
+            return self.command_items(&token);
+        }
+        // A program whose arguments kite knows answers before the disk does:
+        // after `gcc -` the candidates are gcc's own options, and the word after
+        // `gcc -o` is the file gcc means to write, not every name in the folder.
+        match cli::ask(program.as_deref(), previous.as_deref(), &token) {
+            Some(cli::Answer::Options(table)) => cli::rows(table, &token),
+            Some(cli::Answer::Glued { option, arg }) => {
+                let tail = &token[option.len()..];
+                path_items(&self.cwd, tail)
+                    .into_iter()
+                    .filter(|item| !matches!(arg, cli::Arg::Folder) || item.name.ends_with('/'))
+                    .map(|item| Item::new(format!("{option}{}", item.text), Kind::Path))
+                    .collect()
+            }
+            Some(cli::Answer::Folders) => path_items(&self.cwd, &token)
+                .into_iter()
+                .filter(|item| item.name.ends_with('/'))
+                .collect(),
+            Some(cli::Answer::Nothing) => Vec::new(),
+            _ => path_items(&self.cwd, &token),
+        }
+    }
+
+    /// The built-ins, and on top of them whatever PATH can run. With nothing
+    /// typed yet only the built-ins are worth showing: a system directory holds
+    /// thousands of programs and none of them is what a bare prompt asked for.
+    fn command_items(&mut self, token: &str) -> Vec<Item> {
+        let mut items: Vec<Item> = BUILTINS
+            .iter()
+            .map(|name| Item::new(*name, Kind::Command))
+            .collect();
+        if token.is_empty() {
+            return items;
+        }
+        for name in self.path_commands() {
+            if BUILTINS.iter().any(|built| built.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            items.push(Item::new(name, Kind::Command));
+        }
+        items
+    }
+
+    fn path_commands(&mut self) -> Vec<String> {
+        self.path_commands
+            .get_or_insert_with(scan_path)
+            .clone()
+    }
+
+    /// Put a chosen token where the half-typed one stood, and finish the word:
+    /// what is typed next is the next word, not more letters of this one. A
+    /// folder is the exception — its trailing slash says keep going in here, and
+    /// a space after it opens an argument nobody meant to write.
+    pub fn replace_word(&mut self, font_system: &mut FontSystem, start: usize, text: &str) {
+        let mut text = text.to_string();
+        if self.input_cursor >= self.input.chars().count() && !text.ends_with('/') {
+            text.push(' ');
+        }
+        let start = start.min(self.input_cursor);
+        self.input_selection = None;
+        let from = char_to_byte(&self.input, start);
+        let to = char_to_byte(&self.input, self.input_cursor);
+        self.input.replace_range(from..to, &text);
+        self.input_cursor = start + text.chars().count();
         self.refresh_prompt(font_system);
     }
 
@@ -1528,6 +1639,78 @@ fn list_directory(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(entries.into_iter().map(|(_, _, name)| name).collect())
 }
 
+/// What a directory can offer for the token being typed. Everything up to the
+/// last separator is carried through the answer rather than stripped from it:
+/// the caret sits after all of that, and the replacement has to cover the same
+/// ground the half-typed token did.
+fn path_items(cwd: &Path, token: &str) -> Vec<Item> {
+    let (head, needle) = match token.rfind(['/', '\\']) {
+        Some(index) => (&token[..=index], &token[index + 1..]),
+        None => ("", token),
+    };
+    let base = if head.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        resolve_path(cwd, head)
+    };
+    let Ok(names) = list_directory(&base) else {
+        return Vec::new();
+    };
+    let folded = needle.to_lowercase();
+    names
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .filter(|name| folded.is_empty() || name.to_lowercase().starts_with(&folded))
+        .map(|name| Item::new(format!("{head}{name}"), Kind::Path))
+        .collect()
+}
+
+/// The programs PATH can name, each without the extension nobody types. The
+/// first hit of a name wins, which is the order `CreateProcess` would have used
+/// anyway.
+fn scan_path() -> Vec<String> {
+    const RUNNABLE: [&str; 4] = ["exe", "cmd", "bat", "com"];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut found: Vec<(String, String)> = Vec::new();
+    let Some(variable) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    for dir in std::env::split_paths(&variable) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = Path::new(&name);
+            let runs = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    RUNNABLE.iter().any(|suffix| extension.eq_ignore_ascii_case(suffix))
+                });
+            if !runs {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let key = stem.to_lowercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            found.push((stem.to_string(), key));
+        }
+    }
+    found.sort_by(|a, b| a.1.cmp(&b.1));
+    found.into_iter().map(|(name, _)| name).collect()
+}
+
 /// `CreateProcess` looks a relative program name up in the directory of the
 /// *calling* process, which is where kite was launched from, not this tab's
 /// `cwd`. So a token that spells a path is made absolute here first; a bare
@@ -2620,5 +2803,197 @@ mod tests {
             Some(at_rest),
             "back at the bottom the caret is where it was"
         );
+    }
+
+    #[test]
+    fn every_name_completion_offers_is_one_the_shell_answers() {
+        let mut fonts = Fonts::load();
+        for name in BUILTINS {
+            let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+            let mut effect = None;
+            assert!(
+                shell.run_builtin(&[name.to_string()], &mut effect),
+                "`{name}` is offered but the parser would refuse it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_word_of_a_line_completes_to_commands() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.input = "kk".to_string();
+        shell.input_cursor = 2;
+        let offered: Vec<String> = shell
+            .completions()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(
+            shell.word_before_caret().map(|(start, _)| start),
+            Some(0),
+            "the token reaches back to the start of the line"
+        );
+        assert!(offered.contains(&"kkk".to_string()), "{offered:?}");
+    }
+
+    #[test]
+    fn a_bare_prompt_offers_the_builtins_and_nobody_else() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        let offered = shell.completions();
+        assert!(!offered.is_empty(), "a Tab on an empty line still answers");
+        assert!(
+            offered
+                .iter()
+                .all(|item| BUILTINS.iter().any(|name| *name == item.text)),
+            "PATH has thousands of programs and none of them is what an empty prompt asked for"
+        );
+    }
+
+    #[test]
+    fn a_path_token_keeps_its_directory_and_completes_only_the_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        fs::write(dir.path().join("elsewhere.md"), b"").unwrap();
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.cwd = dir.path().to_path_buf();
+        shell.input = "cat no".to_string();
+        shell.input_cursor = 6;
+        let offered: Vec<String> = shell
+            .completions()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert!(
+            offered.contains(&"notes/".to_string()),
+            "a directory says so: {offered:?}"
+        );
+        assert!(offered.contains(&"notes.txt".to_string()), "{offered:?}");
+        assert!(
+            !offered.iter().any(|name| name.contains("elsewhere")),
+            "{offered:?} is not what the caret was typing"
+        );
+    }
+
+    fn offered_in(dir: &Path, line: &str) -> Vec<(String, Option<String>)> {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.cwd = dir.to_path_buf();
+        shell.input = line.to_string();
+        shell.input_cursor = line.chars().count();
+        shell
+            .completions()
+            .into_iter()
+            .map(|item| (item.text, item.note))
+            .collect()
+    }
+
+    fn scratch() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        dir
+    }
+
+    /// A program whose arguments kite knows answers with its own options, in the
+    /// program's own words. The sentences are copied out of `gcc --help` on this
+    /// machine, so a row means what the compiler says it means.
+    #[test]
+    fn a_known_program_offers_its_own_options() {
+        let dir = scratch();
+        let offered = offered_in(dir.path(), "gcc main.c -W");
+        let wall = offered
+            .iter()
+            .find(|(text, _)| text == "-Wall")
+            .expect("gcc has a -Wall");
+        assert_eq!(
+            wall.1.as_deref(),
+            Some("Enable most warning messages"),
+            "the note is the compiler's sentence, not a guess"
+        );
+        assert!(
+            !offered.iter().any(|(text, _)| text == "notes.txt"),
+            "a dash is not a file name"
+        );
+    }
+
+    /// The word after `-o` is whatever file the compiler is going to write, and
+    /// the word after `-I` is a folder to look inside — the list shows directories
+    /// and nothing else, because a file on an include path is not an answer.
+    #[test]
+    fn an_option_that_takes_a_path_offers_the_right_kind() {
+        let dir = scratch();
+        let output = offered_in(dir.path(), "gcc main.c -o n");
+        assert!(
+            output.iter().any(|(text, _)| text == "notes.txt"),
+            "{output:?} — -o takes any file"
+        );
+        let search = offered_in(dir.path(), "gcc main.c -I n");
+        assert!(
+            search.iter().any(|(text, _)| text == "notes/"),
+            "{search:?} — -I takes a folder"
+        );
+        assert!(
+            !search.iter().any(|(text, _)| text == "notes.txt"),
+            "{search:?} — and not a file"
+        );
+    }
+
+    /// `-I` and its path are one token, so completing inside it has to write the
+    /// option back with the path — `-Inotes/`, not `notes/` on its own.
+    #[test]
+    fn a_glued_option_carries_its_path_on_itself() {
+        let dir = scratch();
+        let offered = offered_in(dir.path(), "gcc -In");
+        assert!(
+            offered.iter().any(|(text, _)| text == "-Inotes/"),
+            "{offered:?}"
+        );
+    }
+
+    /// A program this file knows nothing about is answered by the disk, which is
+    /// what it did before any of this existed. Inventing options for a program
+    /// from a guess is worse than silence.
+    #[test]
+    fn an_unknown_program_is_answered_by_the_disk() {
+        let dir = scratch();
+        let offered = offered_in(dir.path(), "frobnicate -n");
+        assert!(
+            !offered.iter().any(|(text, _)| text == "-Wall"),
+            "{offered:?} — nothing was invented"
+        );
+    }
+
+    #[test]
+    fn a_deeper_token_carries_the_directory_it_came_with() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("crates")).unwrap();
+        fs::create_dir(dir.path().join("crates").join("kite-app")).unwrap();
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.cwd = dir.path().to_path_buf();
+        shell.input = "open crates/kite".to_string();
+        shell.input_cursor = 15;
+        let offered: Vec<String> = shell
+            .completions()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+        assert_eq!(offered, vec!["crates/kite-app/".to_string()]);
+    }
+
+    #[test]
+    fn replacing_a_token_leaves_the_caret_at_its_end() {
+        let mut fonts = Fonts::load();
+        let mut shell = Shell::new(&mut fonts.system, fonts.mono, 16.0, 400.0, 200.0);
+        shell.input = "cat note".to_string();
+        shell.input_cursor = 8;
+        let (start, _) = shell.word_before_caret().unwrap();
+        shell.replace_word(&mut fonts.system, start, "notes.txt");
+        assert_eq!(shell.input, "cat notes.txt ");
+        assert_eq!(shell.input_cursor, 14, "past the space that finished it");
     }
 }

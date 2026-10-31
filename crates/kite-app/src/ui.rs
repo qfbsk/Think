@@ -10,7 +10,11 @@ use kite_core::{Document, Position, Selection, file_key};
 use winit::dpi::PhysicalSize;
 use winit::keyboard::KeyCode;
 
+use crate::activity;
+use crate::complete::{Completer, ExtraEdit, Item, Style, Target};
+use crate::day::Day;
 use crate::editor::Editor;
+use crate::lsp::{self, Asking, Page, Servers};
 use crate::miku::Miku;
 use crate::palette::Palette; // engineering only, remove whole
 use crate::renderer::QuadVertex;
@@ -18,8 +22,9 @@ use crate::shell::{Shell, ShellEffect};
 use crate::sidebar::{Sidebar, SidebarAction};
 use crate::sparks::Sparks;
 use crate::syntax::Engine;
-use crate::text::{attrs, make_label, measure};
+use crate::text::{attrs, make_label, make_paragraph, measure, measure_block};
 use crate::theme;
+use crate::usage::Usage;
 use crate::visualizer::{STRIP_HEIGHT, STRIP_MIN_HEIGHT, Visualizer};
 
 /// The sidebar's text size, before the window scale. It is set here once so the
@@ -155,6 +160,63 @@ fn caret_step(cur: f32, target: f32, dt: f32) -> f32 {
     cur + (target - cur) * alpha
 }
 
+/// A question the caret asked a server, kept until either it is answered or the
+/// caret moves away from where it was asked. The caret and the document revision
+/// are recorded so a late answer can be recognised as late: one that arrives
+/// after the reader has moved on describes a place nobody is looking at, and
+/// putting it on the screen would offer a finish to a word no longer there.
+/// The card that says what the trouble under the mouse is, already shaped: a
+/// text area has to outlive the frame that measured it.
+struct Hover {
+    text: Buffer,
+    x: f32,
+    y: f32,
+}
+
+struct Awaiting {
+    id: u64,
+    /// The line the question was asked on. An answer is only ever placed where
+    /// it can still be read: a caret on another line is asking something else.
+    line: usize,
+}
+
+/// The answer on screen, as far as the caret is concerned: the span of one line
+/// it speaks for, and the word that was typed in that span when it landed. While
+/// the caret stays inside it and the text there only grows, this answer is still
+/// the answer — narrowing it locally costs nothing and keeps up with the keys,
+/// which is the whole reason a list is worth having.
+struct Answered {
+    line: usize,
+    start: usize,
+    word: String,
+    /// The server said its list was cut short. Then the next letter is worth a
+    /// second question, because the names it did not send cannot be filtered out
+    /// of what it did.
+    truncated: bool,
+}
+
+/// Where a keystroke asks, as far as an answer can be placed without having one.
+enum Where {
+    /// The shell keeps its own view of the command line, so it answers in the
+    /// same breath as the key that asked.
+    Shell {
+        target: Target,
+        word: String,
+        style: Style,
+    },
+    /// A file has to ask somebody else, and only the place is known yet. The
+    /// path is here because the server that answers is chosen by it.
+    File {
+        path: std::path::PathBuf,
+        language: &'static str,
+        line: usize,
+        column: usize,
+        revision: u64,
+        caret_line: String,
+        style: Style,
+    },
+}
+
 pub struct Ui {
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -197,6 +259,28 @@ pub struct Ui {
     sparks: Sparks,
     /// engineering palette: remove this field and its uses to rip the feature out
     pub palette: Palette,
+    /// Where saves are tallied for the board. Held, not re-read per save, so a
+    /// test can point the history at a temporary file.
+    activity_log: Option<PathBuf>,
+    /// The list of ways to finish what is being typed, if there is one up.
+    completer: Completer,
+    /// The names this machine's code actually holds, kept by the language
+    /// servers this machine runs.
+    servers: Servers,
+    /// The names the reader has taken from a list before, by language.
+    usage: Usage,
+    /// A question posted to a server that has not answered yet.
+    awaiting: Option<Awaiting>,
+    /// The answer the list on screen is standing for, so the next letter can be
+    /// filtered out of it instead of asking the server again.
+    answered: Option<Answered>,
+    /// Which server report the open pages are showing. A server tells when it
+    /// likes, so this is the only way to notice it has said anything.
+    seen_generation: u64,
+    /// The card saying what the trouble under the mouse is, already shaped: a
+    /// text area has to outlive the frame that measured it, so it is built while
+    /// the quads are and drawn from there.
+    hover: Option<Hover>,
     window_close: Rect,
     tab_strip: Rect,
     tab_scroll: f32,
@@ -313,6 +397,14 @@ impl Ui {
             visualizer: Visualizer::new(),
             sparks: Sparks::new(),
             palette: Palette::new(font_system, family, scale),
+            activity_log: activity::log_path(),
+            completer: Completer::new(family, scale),
+            servers: Servers::new(),
+            usage: Usage::store(),
+            awaiting: None,
+            answered: None,
+            seen_generation: 0,
+            hover: None,
             window_close: Rect::default(),
             tab_strip: Rect::default(),
             tab_scroll: 0.0,
@@ -566,6 +658,9 @@ impl Ui {
     }
 
     pub fn escape(&mut self, font_system: &mut FontSystem) {
+        // Escape first means "I am not choosing from that list". Only with the
+        // list gone does it mean "I have finished typing".
+        self.completer.close();
         if self.mode == Mode::Insert {
             self.mode = Mode::Normal;
             let focus = if self.sidebar.visible {
@@ -586,6 +681,11 @@ impl Ui {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
+        // The list offered a word in the page being left, and that page is no
+        // longer where the caret is.
+        self.completer.close();
+        self.awaiting = None;
+        self.answered = None;
         let previous = self.active;
         self.active = index;
         self.message = None;
@@ -613,7 +713,25 @@ impl Ui {
             return false;
         }
         let was_active = index == self.active;
+        // A server is hundreds of megabytes of somebody's index, so it goes when
+        // the last page that needed it closes rather than when one does.
+        if let TabContent::Editor(editor) = &self.tabs[index].content {
+            let path = editor.document.path().to_path_buf();
+            let Ok(key) = file_key(&path) else { return false };
+            let language = editor.language_name();
+            let still_open = self.tabs.iter().enumerate().any(|(other, tab)| {
+                other != index
+                    && matches!(&tab.content, TabContent::Editor(open)
+                        if file_key(open.document.path()).ok().as_ref() == Some(&key))
+            });
+            if let Some(language) = language {
+                self.servers.forget(&path, language, still_open);
+            }
+        }
         self.tabs.remove(index);
+        self.completer.close();
+        self.awaiting = None;
+        self.answered = None;
         self.message = None;
         if index < self.active {
             self.active -= 1;
@@ -683,6 +801,8 @@ impl Ui {
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.awaiting = None;
+        self.answered = None;
         self.set_focus(font_system, Focus::Right);
         self.mode = Mode::Insert;
         self.message = Some(format!("opened {title}"));
@@ -711,12 +831,15 @@ impl Ui {
     }
 
     /// The board counts saves, so a save is worth recording even when the board
-    /// is not the page in front.
+    /// is not the page in front — and even when no board has ever been opened.
+    /// The log is the history; a live board is only told about the line it just
+    /// gained, because its reader stopped at the end of the file long ago.
     fn note_save(&mut self, font_system: &mut FontSystem, path: &Path) {
         let text = kite_core::display_path(path);
+        activity::record_save(self.activity_log.as_deref(), Day::today(), &text);
         for tab in &mut self.tabs {
             if let TabContent::Miku(miku) = &mut tab.content {
-                miku.record_save(font_system, &text);
+                miku.note_save(font_system, &text);
             }
         }
     }
@@ -752,6 +875,537 @@ impl Ui {
     pub fn poll_miku(&mut self, font_system: &mut FontSystem) -> bool {
         self.active_miku_mut()
             .is_some_and(|miku| miku.poll(font_system))
+    }
+
+    /// Whether the completion list is up and holding keys.
+    pub fn completing(&self) -> bool {
+        self.completer.is_open()
+    }
+
+    pub fn close_completion(&mut self) {
+        self.completer.close();
+    }
+
+    /// Whether a taken snippet still has placeholders to walk. Only a file
+    /// page can hold one, so only a file page can answer yes.
+    pub fn snippet_pending(&self) -> bool {
+        self.active_editor().is_some_and(Editor::snippet_pending)
+    }
+
+    /// Tab through a taken snippet. Reports false when there is none, so Tab
+    /// goes on being Tab.
+    pub fn snippet_tab(&mut self, font_system: &mut FontSystem) -> bool {
+        self.active_editor_mut()
+            .is_some_and(|editor| editor.snippet_tab(font_system))
+    }
+
+    pub fn end_snippet(&mut self) {
+        if let Some(editor) = self.active_editor_mut() {
+            editor.clear_snippet();
+        }
+    }
+
+    /// Walk the highlight one row, `delta` being ±1.
+    pub fn complete_move(&mut self, delta: i32) {
+        self.completer.move_by(delta);
+    }
+
+    /// A click inside the list chooses that row and finishes. Anywhere else it
+    /// reports false, so the click goes on being a click.
+    pub fn completion_press(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> bool {
+        if !self.completer.over(x, y) {
+            return false;
+        }
+        self.completer.pick_at(x, y);
+        self.accept_completion(font_system);
+        true
+    }
+
+    /// The caret's place on the page: where a ghost would be drawn, how far the
+    /// row behind it has been typed, and which revision that text is. Cheap
+    /// enough to ask after every keystroke, which is the point — an answer that
+    /// keeps the place it first appeared in walks backwards over every letter
+    /// typed since.
+    fn completion_where(&mut self) -> Option<Where> {
+        // The page's own left edge, which for a file is behind the line numbers.
+        // Reading the caret from one rect and drawing the answer from another is
+        // how the faint text ended up written on top of the real text.
+        let body = self.body_text_rect();
+        let scale = self.scale;
+        let family = self.family;
+        match &mut self.tabs[self.active].content {
+            TabContent::Shell(shell) => {
+                // A child that owns the screen owns the keys with it; nothing
+                // kite could offer would be what that program is waiting for.
+                if shell.is_running() {
+                    return None;
+                }
+                let (start, word) = shell.word_before_caret()?;
+                let (x, y, height) = shell.cursor_rect()?;
+                Some(Where::Shell {
+                    target: Target::Shell { start },
+                    word,
+                    style: Style {
+                        origin: (body.x + x, body.y + y),
+                        line_height: height,
+                        family,
+                        scale,
+                    },
+                })
+            }
+            TabContent::Editor(editor) => {
+                // A file with no server is a file with no completion. Saying so
+                // by saying nothing is the whole of the policy.
+                let language = editor.language_name()?;
+                let caret = editor.selection.cursor;
+                let (x, y, height) = editor.cursor_rect()?;
+                let caret_line = editor.document.line_text(caret.line);
+                Some(Where::File {
+                    path: editor.document.path().to_path_buf(),
+                    language,
+                    line: caret.line,
+                    column: caret.ch,
+                    revision: editor.document.revision(),
+                    caret_line,
+                    style: Style {
+                        origin: (body.x + x, body.y + y),
+                        line_height: height,
+                        family,
+                        scale,
+                    },
+                })
+            }
+            TabContent::Miku(_) => None,
+        }
+    }
+
+    /// The shell's own view of the word being typed. Only it can supply this: the
+    /// running child has a working folder and a history that kite cannot see.
+    fn shell_pool(&mut self) -> Vec<Item> {
+        if let TabContent::Shell(shell) = &mut self.tabs[self.active].content {
+            return shell.completions();
+        }
+        Vec::new()
+    }
+
+    /// Post the question. Never waits, never draws: an answer is put on the
+    /// screen by [`Ui::poll_lsp`] some milliseconds later, and by then the caret
+    /// may have moved on, which is fine — the answer is a pool of names for this
+    /// span of the line, not a one-shot ghost for one column.
+    fn ask(
+        &mut self,
+        language: &'static str,
+        line: usize,
+        column: usize,
+        revision: u64,
+        caret_line: &str,
+    ) {
+        let (path, text) = match &self.tabs[self.active].content {
+            TabContent::Editor(editor) => (
+                editor.document.path().to_path_buf(),
+                String::from_utf8_lossy(&editor.document.to_bytes()).into_owned(),
+            ),
+            _ => return,
+        };
+        let behind = column.checked_sub(1).and_then(|at| caret_line.chars().nth(at));
+        let Some(id) = self.servers.ask(
+            &Page {
+                path: &path,
+                language,
+                text: &text,
+                revision,
+            },
+            &Asking {
+                caret_line,
+                line,
+                column,
+                trigger: behind,
+            },
+        ) else {
+            return;
+        };
+        self.awaiting = Some(Awaiting { id, line });
+    }
+
+    /// The answer that has come in since the last key, put on the screen. Same
+    /// contract as the sidebar and the band: true means something changed.
+    ///
+    /// An answer is not thrown away because the caret moved on while it was in
+    /// flight: it is a list of the names that fit the span it was asked for, and
+    /// letters typed since then only narrow that list. It is filtered against
+    /// what is written there now, which is what makes a fast typist see a list
+    /// at all. A caret on another line is a different question, and that one is
+    /// dropped.
+    pub fn poll_lsp(&mut self) -> bool {
+        let Some(pending) = &self.awaiting else {
+            return false;
+        };
+        let (id, line) = (pending.id, pending.line);
+        let Some(Where::File {
+            language,
+            caret_line,
+            line: here,
+            column,
+            style,
+            ..
+        }) = self.completion_where()
+        else {
+            self.awaiting = None;
+            return false;
+        };
+        if here != line {
+            self.awaiting = None;
+            return false;
+        }
+        let Some(answer) = self.servers.take(id, &caret_line, column) else {
+            return false;
+        };
+        self.awaiting = None;
+        let start = answer.start.min(column);
+        let end = answer.end.max(column).min(caret_line.chars().count());
+        let word: String = caret_line
+            .chars()
+            .skip(start)
+            .take(column.saturating_sub(start))
+            .collect();
+        self.answered = Some(Answered {
+            line,
+            start,
+            word: word.clone(),
+            truncated: answer.incomplete,
+        });
+        let target = Target::Editor {
+            start: Position::new(line, start),
+            end: Position::new(line, end),
+        };
+        let mut items = answer.items;
+        // `#include "` with nothing typed after it is a question about this
+        // project's own headers; clangd answers it with every header on the
+        // search path — the Windows SDK, alphabetically — so the ones that are
+        // not files in this folder are dropped. Type a letter, or use the angle
+        // bracket, and the whole search path is back: there the reader is asking
+        // for a system header by name.
+        self.usage.rank(language, &mut items);
+        self.completer
+            .show(&style, items, &word, target);
+        true
+    }
+
+    /// Whether the page on screen is one a server was started for. The reports
+    /// arrive with no question of ours outstanding, so this is what tells the
+    /// loop to keep waking up to look for them.
+    pub fn server_backed(&self) -> bool {
+        self.active_editor()
+            .is_some_and(|editor| editor.language_name().is_some())
+    }
+
+    /// Whether a server owes the caret an answer.
+    pub fn lsp_pending(&self) -> bool {
+        self.awaiting.is_some()
+    }
+
+    /// Keep the page on screen in front of its server.
+    ///
+    /// The words go over the wire whenever they are not already there, whether or
+    /// not anything is asked of the server. A report about what is wrong with a
+    /// file is worthless if it is about the text that was there two keystrokes
+    /// ago — the line lands in the wrong place and the reader learns to ignore
+    /// it — and completion is not the only thing a server is good for.
+    pub fn sync_servers(&mut self) {
+        let Some((path, language, revision)) = self.server_page() else {
+            return;
+        };
+        if self.servers.holds(&path, language, revision) {
+            return;
+        }
+        let text = match &self.tabs[self.active].content {
+            TabContent::Editor(editor) => {
+                String::from_utf8_lossy(&editor.document.to_bytes()).into_owned()
+            }
+            _ => return,
+        };
+        self.servers.sync(&Page {
+            path: &path,
+            language,
+            text: &text,
+            revision,
+        });
+    }
+
+    /// The page a server would be told about, without its text: the one on
+    /// screen, when its language has a server at all.
+    fn server_page(&self) -> Option<(PathBuf, &'static str, u64)> {
+        let TabContent::Editor(editor) = &self.tabs[self.active].content else {
+            return None;
+        };
+        let language = editor.language_name()?;
+        Some((
+            editor.document.path().to_path_buf(),
+            language,
+            editor.document.revision(),
+        ))
+    }
+
+    /// What the servers have said about the open pages since the last look.
+    ///
+    /// A report arrives when the server gets round to it, which is not when the
+    /// reader moves the mouse, so this is asked on every frame: the generation
+    /// counter is the only cheap way to know whether anything was told. Every
+    /// page is offered its own report, not just the one on screen, because a
+    /// tab switched to is a tab that should already be showing what is wrong
+    /// with it.
+    pub fn poll_diagnostics(&mut self) -> bool {
+        let generation = self.servers.generation();
+        if generation == self.seen_generation {
+            return false;
+        }
+        self.seen_generation = generation;
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let TabContent::Editor(editor) = &mut tab.content else {
+                continue;
+            };
+            let found = self.servers.diagnostics(editor.document.path());
+            changed |= editor.set_issues(&found);
+        }
+        changed
+    }
+
+    /// The report the mouse is sitting on, as the words to show, where to open
+    /// the card, and how bad it is. A hover rather than a click or a key: the
+    /// reader is already looking at the red line and wants to know what it says
+    /// without moving the caret off his place.
+    fn hovered_issue(&self) -> Option<(String, f32, f32, bool)> {
+        let TabContent::Editor(editor) = &self.tabs[self.active].content else {
+            return None;
+        };
+        // The wave is painted inside the gutter, and so is the mouse that asks
+        // about it: the rect that placed the ink is the rect that must take the
+        // hit, or a card opens for a mouse over the line numbers.
+        let content = self.body_text_rect();
+        let (index, x, top, width, height, _) = editor.issue_spans().into_iter().find(|span| {
+            self.mouse_x >= content.x + span.1
+                && self.mouse_x < content.x + span.1 + span.3
+                && self.mouse_y >= content.y + span.2
+                && self.mouse_y < content.y + span.2 + span.4
+        })?;
+        let issue = editor.issue(index)?;
+        let words = match issue.note.is_empty() {
+            true => issue.message.clone(),
+            false => format!("{}  ({})", issue.message, issue.note),
+        };
+        // One report per card. A message long enough to outgrow the pane would be
+        // a second page, and the trouble is always in its first sentence.
+        let words: String = words.chars().take(400).collect();
+        Some((
+            words,
+            content.x + x + width.min(12.0),
+            content.y + top + height,
+            issue.error,
+        ))
+    }
+
+    /// The answer that follows typing. A page gets a list under the word, opened
+    /// by the keystroke that started it; the shell gets the best candidate
+    /// written faintly on the rest of the row, because a menu there would cover
+    /// the line being typed into. Either way it puts itself away as soon as the
+    /// caret leaves the word it was offered for, and an answer already on screen
+    /// narrows rather than being rebuilt from under the reader.
+    pub fn update_completion(&mut self) {
+        let Some(spot) = self.completion_where() else {
+            self.completer.close();
+            self.awaiting = None;
+            return;
+        };
+        match spot {
+            Where::Shell {
+                target,
+                word,
+                style,
+            } => {
+                // Nothing typed is nothing finished. A bare prompt is a question
+                // nobody has asked yet, and a word offered there is a guess at a
+                // command the reader never meant to write.
+                if word.is_empty() {
+                    self.completer.close();
+                    return;
+                }
+                if self.completer.is_open() && self.completer.target() == target {
+                    if self.completer.refine(&style, &word) {
+                        return;
+                    }
+                }
+                self.completer.close();
+                let mut pool = self.shell_pool();
+                self.usage.rank("shell", &mut pool);
+                // The same list the file page gets. It was kept off the shell on
+                // the grounds that a menu covers the line being typed into, and
+                // the answer is that the list already knows to open above when
+                // there is no room below — the file page has never covered the
+                // text it is completing either.
+                self.completer.show(&style, pool, &word, target);
+            }
+            Where::File {
+                path,
+                language,
+                line,
+                column,
+                revision,
+                caret_line,
+                style,
+            } => {
+                let typed = lsp::name_before(&caret_line, column);
+                let behind = column.checked_sub(1).and_then(|at| caret_line.chars().nth(at));
+                // A question is worth posting where the caret is inside a name,
+                // or stands just behind a character the server named as one it
+                // answers to. Both are the server's own vocabulary: nothing here
+                // decides what punctuation means.
+                if typed.is_empty() && !self.servers.declares(&path, language, behind) {
+                    self.completer.close();
+                    self.answered = None;
+                    self.awaiting = None;
+                    return;
+                }
+                // The list on screen speaks for a span of this line. While the
+                // caret is still past the start of that span and what is written
+                // there is the word it was asked about with letters added, the
+                // answer it holds is still the answer: narrow it here, in the
+                // same breath as the key, instead of waiting on a server that was
+                // already asked.
+                let known = self.answered.as_ref().filter(|known| {
+                    known.line == line && column >= known.start
+                });
+                if let Some(known) = known {
+                    let word: String = caret_line
+                        .chars()
+                        .skip(known.start)
+                        .take(column - known.start)
+                        .collect();
+                    if word.starts_with(&known.word) {
+                        let truncated = known.truncated;
+                        if self.completer.refine(&style, &word) {
+                            // A server that cut its list short knows names this
+                            // pool has never seen, so keep asking while the word
+                            // grows — but never stack a second question on one
+                            // already in flight.
+                            if truncated && self.awaiting.is_none() {
+                                self.ask(language, line, column, revision, &caret_line);
+                            }
+                            return;
+                        }
+                        self.answered = None;
+                    }
+                }
+                self.completer.close();
+                self.ask(language, line, column, revision, &caret_line);
+            }
+        }
+    }
+
+    /// Wave the faint answer off. It stays out of the way while the word it was
+    /// offered for is still the word under the caret.
+    pub fn dismiss_completion(&mut self) {
+        self.completer.dismiss();
+    }
+
+    /// Put the chosen candidate where the half-word was. The list has already
+    /// closed by the time it hands the text over; only the range it was
+    /// replacing is left, and only its owner knows how to splice into it.
+    pub fn accept_completion(&mut self, font_system: &mut FontSystem) -> bool {
+        let Some(item) = self.completer.accept() else {
+            return false;
+        };
+        // The span the answer spoke for has just been rewritten, so nothing it
+        // said about that word stands any more.
+        self.answered = None;
+        let text = item.text.clone();
+        // A name taken once is a name this project talks about: the next list
+        // puts it first. The language is the one the list was asked from.
+        let language = match self.completer.target() {
+            Target::Shell { .. } => Some("shell"),
+            Target::Editor { .. } => self.active_editor().and_then(Editor::language_name),
+        };
+        if let Some(language) = language {
+            self.usage.take(language, &item.name);
+        }
+        match self.completer.target() {
+            Target::Shell { start } => {
+                if let Some(shell) = self.active_shell_mut() {
+                    shell.replace_word(font_system, start, &text);
+                }
+            }
+            Target::Editor { start, end } => {
+                let Some(editor) = self.active_editor_mut() else {
+                    return true;
+                };
+                let caret = editor.selection.cursor;
+                // The answer belongs to the caret that asked for it, and
+                // that caret may have moved while the answer was on screen.
+                // Another row is another word, and a span that no longer
+                // ends where the caret stands would be spliced around it.
+                if caret.line != start.line {
+                    return true;
+                }
+                editor.clear_snippet();
+                let mut start = start;
+                let mut end = end;
+                // The include a server attached to the answer is what makes
+                // the name mean anything. It goes in first, and the word's own
+                // span rides along with the lines it adds.
+                if !item.edits.is_empty() {
+                    let mut edits: Vec<(Position, Position, String)> = item
+                        .edits
+                        .iter()
+                        .map(|edit| placed_edit(&editor.document, edit))
+                        .collect();
+                    edits.sort_by(|left, right| right.0.cmp(&left.0));
+                    if let Err(error) = editor.apply_edits(font_system, &edits) {
+                        self.message = Some(format!("!{error}"));
+                        return true;
+                    }
+                    for (from, to, text) in &edits {
+                        start = crate::editor::shifted(start, *from, *to, text);
+                        end = crate::editor::shifted(end, *from, *to, text);
+                    }
+                }
+                let caret = editor.selection.cursor;
+                let length = editor.document.line_text(start.line).chars().count();
+                let stop = if editor.text_after_caret().is_empty() {
+                    caret.ch
+                } else {
+                    end.ch.max(caret.ch)
+                };
+                let start = Position::new(start.line, start.ch.min(caret.ch).min(length));
+                let end = Position::new(start.line, stop.min(length));
+                // A function comes with its brackets and the places inside
+                // them; a name comes alone. Either way one edit is made, so a
+                // single undo takes the whole completion back — and the space
+                // that finishes a word belongs to that same edit.
+                let stops = match &item.call {
+                    Some(call) => call.stops.clone(),
+                    None => Vec::new(),
+                };
+                let mut typed = match &item.call {
+                    Some(call) => call.text.clone(),
+                    None => text.clone(),
+                };
+                // Only a plain name at the end of a row. A call puts the caret
+                // inside its brackets, and `printf (` is not how a call reads;
+                // a row with text after the caret is one the name is being
+                // written into, not one being finished.
+                if stops.is_empty() && editor.text_after_caret().is_empty() {
+                    typed.push(' ');
+                }
+                if let Err(error) = editor.replace_range(font_system, start, end, &typed) {
+                    self.message = Some(format!("!{error}"));
+                    return true;
+                }
+                if !stops.is_empty() {
+                    editor.begin_snippet(font_system, stops_at(start, &typed, &stops));
+                }
+            }
+        }
+        true
     }
 
     /// What a file page is drawn at. The shell keeps the body size because its
@@ -824,6 +1478,12 @@ impl Ui {
                 shell.kill_job();
             }
         }
+    }
+
+    /// The window is going away. A language server left alive after it is a
+    /// process of several hundred megabytes that nobody can see or close.
+    pub fn kill_servers(&mut self) {
+        self.servers.quit();
     }
 
     /// Either background worker still owes the sidebar an answer.
@@ -1136,10 +1796,31 @@ impl Ui {
         areas
     }
 
-    /// engineering palette: its labels render in their own pass, above quads
+    /// engineering palette: its labels render in their own pass, above quads.
+    /// The completion list rides the same pass, since it is the other thing that
+    /// has to sit on top of whatever page is underneath.
     pub fn palette_areas(&self) -> Vec<TextArea<'_>> {
         let size = (self.size.width as f32, self.size.height as f32);
-        self.palette.areas(size)
+        let mut areas = self.palette.areas(size);
+        if let Some(card) = &self.hover {
+            let bounds = TextBounds {
+                left: self.right.x as i32,
+                top: self.right.y as i32,
+                right: self.right.right() as i32,
+                bottom: self.right.bottom() as i32,
+            };
+            areas.push(TextArea {
+                buffer: &card.text,
+                left: card.x,
+                top: card.y,
+                scale: 1.0,
+                bounds,
+                default_color: theme::pane(self.focus == Focus::Right).text,
+                custom_glyphs: &[],
+            });
+        }
+        areas.extend(self.completer.areas());
+        areas
     }
 
     /// Hit the band with one physical keypress. A collapsed band takes the hit
@@ -1390,6 +2071,23 @@ impl Ui {
                         right.selection,
                     );
                 }
+                // What the server said about this page, under the text it said
+                // it about. Red for the trouble that stops the program, yellow
+                // for the doubt: two colours because a page that cannot compile
+                // and a page that might be wrong are not the same notice.
+                for (_, x, top, width, height, error) in editor.issue_spans() {
+                    push_squiggle(
+                        &mut quads,
+                        Rect {
+                            x: content.x + x,
+                            y: content.y + top,
+                            w: width,
+                            h: height,
+                        },
+                        if error { right.red } else { right.yellow },
+                        self.scale,
+                    );
+                }
             }
             TabContent::Shell(shell) => {
                 for (x, y, width, height) in shell.selection_spans() {
@@ -1490,10 +2188,57 @@ impl Ui {
             }
         }
 
+        self.hover = None;
+        if let Some((words, x, y, error)) = self.hovered_issue() {
+            let right = theme::pane(self.focus == Focus::Right);
+            let ink = if error { right.red } else { right.yellow };
+            let size = self.editor_font_size();
+            let pad = 7.0 * self.scale;
+            // A server writes a sentence and the card is not a row of the grid:
+            // it takes the room the pane has left, never so wide that the eye
+            // loses the line on its way back, and breaks the sentence across as
+            // many rows as it needs.
+            let room = (self.right.w - pad * 2.0).min(size * 40.0);
+            let text = make_paragraph(
+                font_system,
+                &attrs(self.family, right.text),
+                size,
+                &words,
+                room,
+            );
+            let (text_w, text_h) = measure_block(&text);
+            let card = Rect {
+                x: x.max(self.right.x + pad)
+                    .min((self.right.right() - text_w - pad * 3.0).max(self.right.x + pad)),
+                y: (y + 4.0 * self.scale).min(self.right.bottom() - text_h - pad * 2.0),
+                w: text_w + pad * 2.0,
+                h: text_h + pad * 2.0,
+            };
+            push_round_rect(&mut quads, card, right.panel, 4.0 * self.scale);
+            // One edge in the colour of the trouble, so a card that has opened
+            // is still obvious when the mouse has moved off the line it was for.
+            push_rect(
+                &mut quads,
+                Rect {
+                    x: card.x,
+                    y: card.y,
+                    w: 2.5 * self.scale,
+                    h: card.h,
+                },
+                ink,
+            );
+            self.hover = Some(Hover {
+                text,
+                x: card.x + pad,
+                y: card.y + pad,
+            });
+        }
+
         quads.extend(self.sparks.quads());
         // engineering palette: drawn last so it covers everything
         let size = (self.size.width as f32, self.size.height as f32);
         quads.extend(self.palette.quads(font_system, size));
+        quads.extend(self.completer.quads(font_system, size));
         quads
     }
 
@@ -1691,8 +2436,18 @@ impl Ui {
         let mut text = match &self.active_tab().content {
             TabContent::Editor(editor) => {
                 let cursor = editor.cursor_position();
+                // The count is the whole reason to look at the bar: a page with
+                // two troubles on it says so before the reader goes hunting, and
+                // a clean page says nothing at all.
+                let (errors, warnings) = editor.issue_counts();
+                let trouble = match (errors, warnings) {
+                    (0, 0) => String::new(),
+                    (0, warnings) => format!("   {warnings} warn"),
+                    (errors, 0) => format!("   {errors} err"),
+                    (errors, warnings) => format!("   {errors} err   {warnings} warn"),
+                };
                 format!(
-                    "{}   {}   Ln {}, Col {}",
+                    "{}   {}   Ln {}, Col {}{trouble}",
                     kite_core::display_path(editor.document.path()),
                     editor.encoding_name(),
                     cursor.line + 1,
@@ -2000,6 +2755,42 @@ impl Ui {
     }
 }
 
+/// An edit a server attached to an answer, in the document's own coordinates.
+/// A line past the last one is the end of the last one: a server writing
+/// beyond the file is writing exactly there.
+fn placed_edit(document: &Document, edit: &ExtraEdit) -> (Position, Position, String) {
+    let last = document.line_count().saturating_sub(1);
+    let at = |(line, units): (usize, u64)| {
+        let line = line.min(last);
+        Position::new(
+            line,
+            lsp::character_column(&document.line_text(line), units as usize),
+        )
+    };
+    (at(edit.start), at(edit.end), edit.text.clone())
+}
+
+/// The placeholders of a snippet, counted from the place its text was typed.
+/// A server counts characters; the document counts lines and columns.
+fn stops_at(origin: Position, text: &str, stops: &[(usize, usize)]) -> Vec<(Position, Position)> {
+    let mut places = vec![origin];
+    let mut line = origin.line;
+    let mut ch = origin.ch;
+    for value in text.chars() {
+        if value == '\n' {
+            line += 1;
+            ch = 0;
+        } else {
+            ch += 1;
+        }
+        places.push(Position::new(line, ch));
+    }
+    stops
+        .iter()
+        .filter_map(|&(start, end)| Some((*places.get(start)?, *places.get(end)?)))
+        .collect()
+}
+
 fn make_tab(
     font_system: &mut FontSystem,
     family: &'static str,
@@ -2101,6 +2892,33 @@ fn linear_color(color: Color) -> [f32; 4] {
 
 pub(crate) fn push_rect(quads: &mut Vec<QuadVertex>, rect: Rect, color: Color) {
     push_round_rect(quads, rect, color, 0.0);
+}
+
+/// The mark under a trouble the server reported: a wave two dots tall along the
+/// bottom of the row. A straight rule under text reads as a separator, and the
+/// whole job of this one is to read as "here is something wrong" without
+/// covering the letters it is about.
+fn push_squiggle(quads: &mut Vec<QuadVertex>, row: Rect, color: Color, scale: f32) {
+    let step = (3.0 * scale).max(2.0);
+    let thick = (1.4 * scale).max(1.0);
+    let base = row.y + row.h - thick * 2.5;
+    let mut at = 0.0;
+    let mut high = true;
+    while at < row.w {
+        let piece = step.min(row.w - at);
+        push_rect(
+            quads,
+            Rect {
+                x: row.x + at,
+                y: if high { base } else { base + thick },
+                w: piece,
+                h: thick,
+            },
+            color,
+        );
+        at += piece;
+        high = !high;
+    }
 }
 
 /// A rectangle whose colour runs from one edge to the other. The shader
@@ -2265,6 +3083,8 @@ fn push_whitespace_markers(
 mod tests {
     use super::*;
     use crate::fonts::Fonts;
+    use serde_json::json;
+    use std::fs;
     use winit::dpi::PhysicalSize;
 
     #[test]
@@ -2305,6 +3125,54 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The wave and its card are painted inside the line-number gutter, so a hit
+    /// test written against the pane rather than the text answers a mouse over
+    /// the gutter and ignores one over the trouble it is asking about.
+    #[test]
+    fn a_mouse_on_the_wave_opens_the_report_under_it() {
+        let mut fonts = Fonts::load();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.25,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.c");
+        std::fs::write(&path, b"int main(void) {\n  int a\n  return 0;\n}\n").unwrap();
+        ui.open_file(&mut fonts.system, path).unwrap();
+        ui.active_editor_mut().unwrap().set_issues(&[lsp::RawDiagnostic {
+            start: (1, 2),
+            end: (1, 7),
+            error: true,
+            message: "Expected ';' at end of declaration".to_string(),
+            note: "clang expected_semi_declaration".to_string(),
+        }]);
+        ui.prepare(&mut fonts.system);
+
+        let content = ui.body_text_rect();
+        let (_, x, top, width, height, error) = ui
+            .active_editor()
+            .unwrap()
+            .issue_spans()
+            .into_iter()
+            .next()
+            .expect("the row the report is about is drawn");
+        assert!(error, "and drawn as the trouble it is");
+
+        ui.set_mouse(content.x + x + width * 0.5, content.y + top + height * 0.5);
+        let (words, _, _, error) = ui.hovered_issue().expect("the wave answers");
+        assert!(error);
+        assert!(words.contains("Expected ';'"), "{words}");
+        assert!(words.contains("clang"), "and says who said it");
+
+        ui.set_mouse(content.x - 4.0, content.y + top + height * 0.5);
+        assert!(
+            ui.hovered_issue().is_none(),
+            "a mouse in the gutter has nothing to say"
+        );
     }
 
     #[test]
@@ -2499,6 +3367,633 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    /// Typing on the command line asks the same question the file page asks, and
+    /// gets the same shape back: a list, taken with `Tab`, not one faint guess.
+    #[test]
+    fn the_command_line_answers_with_the_same_list() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("gcc.txt"), b"").unwrap();
+        fs::write(dir.path().join("gccd.txt"), b"").unwrap();
+        let mut ui = Ui::new(
+            &mut fonts.system,
+            fonts.mono,
+            PhysicalSize::new(1600, 1000),
+            1.0,
+        );
+        let shell = ui.active_shell_mut().expect("the shell tab");
+        shell.insert_text(
+            &mut fonts.system,
+            &format!("cd {}", kite_core::display_path(dir.path())),
+        );
+        shell.submit(&mut fonts.system);
+
+        let shell = ui.active_shell_mut().expect("the shell tab");
+        shell.insert_text(&mut fonts.system, "cat g");
+        ui.update_completion();
+        assert!(ui.completing(), "typing asked and nothing answered");
+        // A frame asks for the shapes before the text, and the panel is placed
+        // while it does; this follows the same order rather than the other way.
+        ui.completer.quads(&mut fonts.system, (1600.0, 1000.0));
+        assert!(
+            ui.completer.areas().len() > 1,
+            "a list writes its rows, not one run of faint text"
+        );
+
+        let before = ui.active_shell().unwrap().input.clone();
+        assert!(
+            ui.accept_completion(&mut fonts.system),
+            "Tab had nothing to take"
+        );
+        let shell = ui.active_shell().unwrap();
+        assert_eq!(shell.input, format!("{before}cc.txt "));
+        assert!(!ui.completing(), "a taken answer is gone");
+    }
+
+    /// A window the size the tests are drawn at, with the shell tab already in it.
+    fn stage(fonts: &mut Fonts) -> Ui {
+        let mono = fonts.mono;
+        Ui::new(&mut fonts.system, mono, PhysicalSize::new(1600, 1000), 1.0)
+    }
+
+    /// A file page does not guess. The keystroke posts a question and a later
+    /// frame puts the answer under the word, so this walks the whole chain — the
+    /// caret, the range the server named, the word the list is scoped to — with
+    /// a reply handed in by the test instead of by a server.
+    #[test]
+    fn an_answer_from_a_server_opens_the_list_on_the_word() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(&path, b"int main(void) {\n  comp\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 6);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server, it does not answer for itself");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": "compute_thing", "kind": 6,
+                              "detail": "int compute_thing(void)"}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+
+        assert!(ui.poll_lsp(), "the answer did not reach the screen");
+        assert!(ui.completing(), "the answer went up as the whole list");
+        assert!(
+            ui.accept_completion(&mut fonts.system),
+            "Tab had nothing to take"
+        );
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(1),
+            "  compute_thing ",
+            "the four letters already typed are replaced, not doubled"
+        );
+    }
+
+    /// A name this project already took once is a name it talks about, so the
+    /// next list opens on it even though the server listed another name first.
+    #[test]
+    fn a_name_taken_before_is_offered_first() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(&path, b"int main(void) {\n  p\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 3);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        ui.usage.take("c", "printf");
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": "puts", "kind": 3}, {"label": "printf", "kind": 3}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(
+            ui.accept_completion(&mut fonts.system),
+            "Tab had nothing to take"
+        );
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(1),
+            "  printf ",
+            "the name this file took before, not the server's first row"
+        );
+        assert_eq!(
+            ui.usage.weight("c", "printf").0,
+            2,
+            "taking it makes it more likely next time"
+        );
+    }
+
+    /// The include is the point: a name that only compiles once its header is
+    /// there is a name the server knows the file needs, and the edit rides
+    /// along with the answer so the reader never types the `#include` himself.
+    #[test]
+    fn taking_a_name_brings_the_include_it_needs() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("len.c");
+        fs::write(&path, b"int main(void) {\n  str\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 5);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{
+                "label": "strlen", "kind": 3, "insertText": "strlen",
+                "additionalTextEdits": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 0}
+                    },
+                    "newText": "#include <string.h>\n"
+                }]
+            }]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(
+            ui.accept_completion(&mut fonts.system),
+            "Tab had nothing to take"
+        );
+        let editor = ui.active_editor().unwrap();
+        assert_eq!(editor.document.line_text(0), "#include <string.h>");
+        assert_eq!(
+            editor.document.line_text(2),
+            "  strlen ",
+            "the word is completed on the line the include pushed down"
+        );
+        assert_eq!(
+            editor.selection.cursor,
+            Position::new(2, 9),
+            "the caret rides with the line it completes, past its space"
+        );
+    }
+
+    /// A function is taken whole: its brackets and the places inside them, and
+    /// Tab walks those places instead of walking the line.
+    #[test]
+    fn a_taken_function_is_tabbed_through_its_places() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.c");
+        fs::write(&path, b"int main(void) {\n  ru\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 4);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{
+                "label": "run", "kind": 3, "insertTextFormat": 2,
+                "insertText": "run(${1:one}, ${2:two})"
+            }]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(ui.accept_completion(&mut fonts.system));
+        {
+            let editor = ui.active_editor().unwrap();
+            assert_eq!(editor.document.line_text(1), "  run(one, two)");
+            assert_eq!(
+                editor.selection.ordered(),
+                (Position::new(1, 6), Position::new(1, 9)),
+                "the first placeholder is selected, ready to be typed over"
+            );
+        }
+        // Typing over the first place leaves the walk intact: the next place
+        // moves left with the text it replaced.
+        if let Some(editor) = ui.active_editor_mut() {
+            editor
+                .insert_typed(&mut fonts.system, 'X')
+                .expect("a letter");
+            assert_eq!(editor.document.line_text(1), "  run(X, two)");
+        }
+        assert!(ui.snippet_pending(), "the walk ended on the first letter");
+        assert!(ui.snippet_tab(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().selection.ordered(),
+            (Position::new(1, 9), Position::new(1, 12)),
+            "Tab reaches the second placeholder, counted from the new text"
+        );
+        assert!(ui.snippet_tab(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().selection.cursor,
+            Position::new(1, 13),
+            "the last Tab lands after the call"
+        );
+        assert!(!ui.snippet_pending(), "the walk is over");
+    }
+
+    /// The include answer is a whole directive: it carries the quote that
+    /// closes it, and the range reaches over the quote already on the row. The
+    /// taken header must end up with one pair of quotes, not two.
+    #[test]
+    fn a_header_taken_between_the_quotes_closes_them_once() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        // A quoted include is only offered what the folder really has, so this
+        // one has the header it is about to name.
+        fs::write(dir.path().join("stdio.h"), b"").unwrap();
+        let path = dir.path().join("header.c");
+        fs::write(&path, b"#include \"\"\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(0, 10);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": " stdio.h\"", "kind": 17,
+                "textEdit": {"newText": "stdio.h\"", "range": {
+                    "start": {"line": 0, "character": 10},
+                    "end": {"line": 0, "character": 11}}}}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp(), "typing the quote asked and nothing showed");
+        assert!(
+            matches!(ui.completer.target(), Target::Editor { start, end }
+                if start == Position::new(0, 10) && end == Position::new(0, 11)),
+            "the answer replaces the empty header, quotes included"
+        );
+        assert!(ui.accept_completion(&mut fonts.system));
+        let editor = ui.active_editor().unwrap();
+        assert_eq!(
+            editor.document.line_text(0),
+            "#include \"stdio.h\"",
+            "the quote the server sent closes the one already on the row"
+        );
+        assert_eq!(editor.selection.cursor, Position::new(0, 18));
+    }
+
+    /// The header list asked from a file page: the caret is parked where the
+    /// reader has just typed the given row, and the answer is handed in by the
+    /// test rather than by a server.
+    fn ask_headers(ui: &mut Ui, fonts: &mut Fonts, caret: Position, items: serde_json::Value) {
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(id, items);
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp(), "the answer did not reach the screen");
+    }
+
+    fn header(new_text: &str, from: usize, to: usize) -> serde_json::Value {
+        json!({"items": [{"label": format!(" {new_text}"), "kind": 17,
+            "textEdit": {"newText": new_text, "range": {
+                "start": {"line": 0, "character": from},
+                "end": {"line": 0, "character": to}}}}]})
+    }
+
+    /// A bare quote lists what the server answered, in the order it answered.
+    /// The client does not second-guess the search path by looking for the files
+    /// beside the page: that is the server's job, and a client that filters it
+    /// is one more guess the reader has to know about.
+    #[test]
+    fn a_bare_quote_lists_what_the_server_answered() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("widget.h"), b"int widget(void);\n").unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(&path, b"#include \"\"\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        ask_headers(
+            &mut ui,
+            &mut fonts,
+            Position::new(0, 10),
+            json!({"items": [
+                {"label": " stdio.h\"", "kind": 17, "textEdit": {
+                    "newText": "stdio.h\"", "range": {
+                        "start": {"line": 0, "character": 10},
+                        "end": {"line": 0, "character": 11}}}},
+                {"label": " widget.h\"", "kind": 17, "textEdit": {
+                    "newText": "widget.h\"", "range": {
+                        "start": {"line": 0, "character": 10},
+                        "end": {"line": 0, "character": 11}}}}
+            ]}),
+        );
+        assert!(ui.completing(), "the quote asked, the list answers");
+        assert!(ui.accept_completion(&mut fonts.system), "Tab had nothing to take");
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(0),
+            "#include \"stdio.h\"",
+            "the server's own first row, with nothing filtered out of it"
+        );
+    }
+
+    /// The angle bracket is the system header path, and it keeps everything the
+    /// search path holds — `stdio.h` is not a file beside the reader's `.c`.
+    #[test]
+    fn an_angle_bracket_keeps_the_whole_search_path() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(&path, b"#include <>\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        ask_headers(
+            &mut ui,
+            &mut fonts,
+            Position::new(0, 10),
+            header("stdio.h>", 10, 11),
+        );
+        assert!(ui.accept_completion(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(0),
+            "#include <stdio.h>",
+            "one pair of brackets, no quotes anywhere"
+        );
+    }
+
+    /// The word already on the row is the row the reader means: clangd answers
+    /// `int` with `inline`, `int` and `intptr_t` in that alphabetical order, and
+    /// a list that drops the whole match to avoid repeating the page ends up
+    /// offering `inline` for `int`.
+    #[test]
+    fn the_word_being_typed_is_the_first_row() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.c");
+        fs::write(&path, b"int main(void) {\n  int\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 5);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": "inline", "kind": 14},
+                             {"label": "int", "kind": 13},
+                             {"label": "intptr_t", "kind": 9}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(ui.accept_completion(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(1),
+            "  int ",
+            "the word typed, not the name that merely begins with the same letters"
+        );
+    }
+
+    /// The answer is a pool, not a one-shot ghost. Each letter typed after it
+    /// lands narrows that pool where it stands — no second question, no waiting
+    /// — which is the difference between a list that keeps up with typing and
+    /// one that arrives after the word is finished.
+    #[test]
+    fn a_list_narrows_with_the_next_letter_without_asking_again() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("narrow.c");
+        fs::write(&path, b"int main(void) {\n  i\n}\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(1, 3);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": "inline", "kind": 14},
+                             {"label": "int", "kind": 13},
+                             {"label": "intptr_t", "kind": 9}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(ui.completing());
+
+        for letter in ['n', 't'] {
+            ui.active_editor_mut()
+                .expect("the file tab")
+                .insert_typed(&mut fonts.system, letter)
+                .expect("a letter");
+            ui.update_completion();
+            assert!(ui.completing(), "the list went away on {letter}");
+            assert!(
+                !ui.lsp_pending(),
+                "{letter} asked the server again instead of narrowing the answer it had"
+            );
+        }
+        assert!(ui.accept_completion(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(1),
+            "  int ",
+            "the list followed the typing all the way to the word"
+        );
+    }
+
+    /// A caret that has left the row takes the answer with it. A span taken
+    /// from a row the reader is no longer standing in is not a word, and
+    /// splicing a name across two rows is worse than doing nothing.
+    #[test]
+    fn an_answer_is_not_spliced_into_a_row_the_caret_has_left() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("moved.c");
+        fs::write(&path, b"comp\nsecond\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(0, 4);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { style, .. }) = ui.completion_where() else {
+            panic!("a C page asks its server");
+        };
+        let pool = vec![Item::new("compute_thing", crate::complete::Kind::Word)];
+        ui.completer.show(
+            &style,
+            pool,
+            "comp",
+            Target::Editor {
+                start: Position::new(0, 0),
+                end: Position::new(0, 4),
+            },
+        );
+        assert!(ui.completing(), "the list was up when the caret moved");
+
+        let away = Position::new(1, 2);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(away, away));
+        assert!(ui.accept_completion(&mut fonts.system), "the key was still eaten");
+        let editor = ui.active_editor().unwrap();
+        assert_eq!(editor.document.line_text(0), "comp");
+        assert_eq!(editor.document.line_text(1), "second");
+    }
+
+    /// The server's range can reach past the caret, because the reader is often
+    /// standing inside the word he wants changed. Replacing only up to the caret
+    /// would leave the old ending glued to the new one.
+    #[test]
+    fn an_answer_replaces_the_whole_of_a_word_the_caret_is_inside() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.c");
+        fs::write(&path, b"strncpy(from, to, n);\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(0, 4);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": "strncat", "insertText": "strncat",
+                "textEdit": {"newText": "strncat", "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 7}}}}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp());
+        assert!(
+            ui.accept_completion(&mut fonts.system),
+            "the list was up but had nothing highlighted"
+        );
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(0),
+            "strncat(from, to, n);",
+            "the whole word was replaced, not the part behind the caret"
+        );
+    }
+
+    /// The answer is a pool for the span it was asked about, not a ghost for one
+    /// column, so typing does not invalidate it — it narrows it. Throwing an
+    /// answer away because the caret moved a letter is what made a list arrive
+    /// after the word was already finished.
+    #[test]
+    fn an_answer_that_arrives_while_the_word_grows_still_lands() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.c");
+        fs::write(&path, b"comp\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(0, 4);
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        ui.servers.fake_answer(id, json!({"items": [{"label": "compute_thing"}]}));
+        ui.awaiting = Some(Awaiting { id, line });
+
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .insert_text(&mut fonts.system, "u")
+            .unwrap();
+        assert!(ui.poll_lsp(), "the word only grew, so the answer still fits it");
+        assert!(ui.accept_completion(&mut fonts.system));
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(0),
+            "compute_thing ",
+            "and it is filtered against what is on the row now, not what was there"
+        );
+    }
+
+    /// The screenshot this answers: the caret inside `#include <std>`, where the
+    /// row already ends in a `>`. The list may open there — the word is real —
+    /// but the server sends the closing bracket along with the name, and the row
+    /// must not come out with two of them.
+    #[test]
+    fn a_name_that_closes_the_bracket_does_not_close_it_twice() {
+        let mut fonts = Fonts::load();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("over.c");
+        fs::write(&path, b"#include <std>\n").unwrap();
+        let mut ui = stage(&mut fonts);
+        ui.open_file(&mut fonts.system, path).unwrap();
+        let caret = Position::new(0, "#include <std".chars().count());
+        ui.active_editor_mut()
+            .expect("the file tab")
+            .set_selection(&mut fonts.system, Selection::new(caret, caret));
+        let Some(Where::File { line, .. }) = ui.completion_where()
+        else {
+            panic!("a C page asks its server");
+        };
+        let id = ui.servers.fake_question();
+        // clangd's range reaches past the caret and takes the `>` with it, and
+        // the name it puts back carries a bracket of its own.
+        ui.servers.fake_answer(
+            id,
+            json!({"items": [{"label": " stdio.h>", "kind": 17,
+                "textEdit": {"newText": "stdio.h>", "range": {
+                    "start": {"line": 0, "character": 10},
+                    "end": {"line": 0, "character": 14}}}}]}),
+        );
+        ui.awaiting = Some(Awaiting { id, line });
+        assert!(ui.poll_lsp(), "a word is being typed, so the list belongs up");
+        assert!(ui.accept_completion(&mut fonts.system), "the list had no row");
+        assert_eq!(
+            ui.active_editor().unwrap().document.line_text(0),
+            "#include <stdio.h>",
+            "the typed header and the bracket it closes were both replaced"
+        );
+    }
+
 
     #[test]
     fn the_status_bar_counts_characters_only_on_a_file_page() {

@@ -154,6 +154,7 @@ impl App {
     fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(ui) = self.ui.as_mut() {
             ui.kill_shells();
+            ui.kill_servers();
         }
         event_loop.exit();
     }
@@ -270,6 +271,33 @@ impl App {
             if ui.poll_miku(&mut fonts.system) {
                 window.request_redraw();
             }
+            let poll_at = now + WORKER_POLL_INTERVAL;
+            deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
+        }
+
+        // A language server answers in its own time, and never on the thread
+        // that reads keys.
+        if ui.lsp_pending() {
+            if ui.poll_lsp() {
+                window.request_redraw();
+            }
+            let poll_at = now + WORKER_POLL_INTERVAL;
+            deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
+        }
+
+        // What a server says about a page is only worth drawing if it is about
+        // the page as it stands, so the words go over on this beat whether or not
+        // a completion question needs them, before the loop looks for the report.
+        ui.sync_servers();
+
+        // A server says what is wrong with a page whenever it gets round to it,
+        // with no question of ours for the answer to hang on, so the loop looks
+        // for it on the same beat it looks for the rest of the workers.
+        if ui.poll_diagnostics() {
+            ui.refresh_status(&mut fonts.system);
+            window.request_redraw();
+        }
+        if ui.server_backed() {
             let poll_at = now + WORKER_POLL_INTERVAL;
             deadline = Some(deadline.map_or(poll_at, |value| value.min(poll_at)));
         }
@@ -448,6 +476,18 @@ impl App {
         let screen = matches!(ui.active_shell(), Some(shell) if shell.is_running());
         if let Some(direction) = VerticalDir::from_key(&key) {
             let ours = !screen && (!direction.is_horizontal() || (board && !ctrl));
+            if ours && !direction.is_horizontal() && ui.completing() {
+                // The same two keys that walk a history or a page of scroll walk
+                // a list of candidates while one is up — on the command line too,
+                // where that costs the arrows to history for as long as the list
+                // stands, and buys the second choice.
+                ui.complete_move(direction.step() as i32);
+                *next_blink = Instant::now() + BLINK_INTERVAL;
+                if let Some(window) = window.as_ref() {
+                    window.request_redraw();
+                }
+                return;
+            }
             if ours {
                 if direction.is_horizontal() && shift {
                     // Shift turns a year; holding it down does not scroll years.
@@ -628,6 +668,17 @@ impl App {
         let system = &mut fonts.system;
         let (x, y) = ui.mouse();
 
+        // A click on the list chooses from it. Anywhere else that same click is
+        // a click on the page underneath, and a list about the word the caret
+        // has just left has no business staying up.
+        if ui.completing() {
+            if ui.completion_press(system, x, y) {
+                window.request_redraw();
+                return;
+            }
+            ui.close_completion();
+        }
+
         // engineering palette: the panel takes its own clicks
         if ui.palette.open {
             let size = (ui.size.width as f32, ui.size.height as f32);
@@ -640,6 +691,7 @@ impl App {
 
         if ui.hit_window_close(x, y) {
             ui.kill_shells();
+            ui.kill_servers();
             event_loop.exit();
             return;
         }
@@ -847,6 +899,9 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        if let Some(icon) = window_icon() {
+            window.set_window_icon(Some(icon));
+        }
 
         if let Some(monitor) = window.current_monitor() {
             let screen = monitor.size();
@@ -1081,6 +1136,15 @@ impl App {
     }
 }
 
+fn window_icon() -> Option<winit::window::Icon> {
+    // The .ico resource covers Explorer and the taskbar; this PNG keeps the
+    // window itself (title bar, Alt-Tab, taskbar button) on the same mark.
+    let decoded = image::load_from_memory(include_bytes!("../assets/icon.png")).ok()?;
+    let rgba = decoded.into_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
+
 fn vertical_target(ui: &Ui) -> Option<VerticalTarget> {
     match (ui.focus, ui.mode) {
         (Focus::Sidebar, _) => Some(VerticalTarget::Sidebar),
@@ -1205,6 +1269,45 @@ fn handle_insert_key(
                 }
                 return true;
             }
+        }
+    }
+
+    // An answer on screen answers to the two keys that deal with it before
+    // anything else does: Tab is the one that takes it, and the first Escape is
+    // the one that refuses it — the second Escape is what leaves insert mode.
+    // Enter is deliberately not one of them; a line that means to be run, or a
+    // newline that means to be typed, outranks a suggestion.
+    if ui.completing() && !ctrl {
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                ui.dismiss_completion();
+                return true;
+            }
+            Key::Named(NamedKey::Tab) => {
+                if !repeat {
+                    ui.accept_completion(system);
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    // A taken snippet keeps Tab and the first Escape: Tab walks to the next
+    // placeholder, and Escape ends the walk before it ends the mode.
+    if !ctrl && ui.snippet_pending() {
+        match key {
+            Key::Named(NamedKey::Tab) => {
+                if !repeat {
+                    ui.snippet_tab(system);
+                }
+                return true;
+            }
+            Key::Named(NamedKey::Escape) => {
+                ui.end_snippet();
+                return true;
+            }
+            _ => {}
         }
     }
 
@@ -1424,6 +1527,11 @@ fn handle_insert_key(
             }
         }
     }
+
+    // Whatever the key did to the text, the answer on screen has to be asked
+    // again: a longer word narrows it, a caret that left the word drops it, and
+    // a word that just became finishable is where a ghost first appears.
+    ui.update_completion();
 
     if changed {
         let _ = window;

@@ -42,6 +42,36 @@ pub fn measure(buffer: &Buffer) -> (f32, f32) {
     }
 }
 
+/// A label that wraps: a card has to hold a sentence, and a sentence clipped
+/// mid-word says nothing. The height is left unbounded because the shaping stops
+/// at the scroll edge, and a card has no scroll.
+pub fn make_paragraph(
+    font_system: &mut FontSystem,
+    attr: &Attrs<'static>,
+    font_size: f32,
+    text: &str,
+    width: f32,
+) -> Buffer {
+    let line_height = (font_size * 1.35).ceil();
+    let mut buffer = Buffer::new_empty(Metrics::new(font_size, line_height));
+    buffer.set_wrap(Wrap::WordOrGlyph);
+    buffer.set_size(Some(width), None);
+    buffer.set_text(text, attr, Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+/// The room a whole wrapped buffer took: its widest row, and the height of every
+/// row it broke into.
+pub fn measure_block(buffer: &Buffer) -> (f32, f32) {
+    let mut block: (f32, f32) = (0.0, 0.0);
+    for run in buffer.layout_runs() {
+        block.0 = block.0.max(run.line_w);
+        block.1 += run.line_height;
+    }
+    block
+}
+
 pub fn buffer_line(text: &str, attrs: &Attrs<'static>) -> BufferLine {
     BufferLine::new(
         text.to_string(),
