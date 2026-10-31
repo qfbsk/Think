@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">kite</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e1620"/>
+      <stop offset="1" stop-color="#04070c"/>
+    </linearGradient>
+    <linearGradient id="neon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b8ffe3"/>
+      <stop offset="1" stop-color="#3df09c"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#52f2ab" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#52f2ab" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="scan" width="8" height="6" patternUnits="userSpaceOnUse">
+      <rect width="8" height="1" y="5" fill="#ffffff" opacity="0.03"/>
+    </pattern>
+    <clipPath id="round">
+      <rect x="16" y="16" width="480" height="480" rx="112"/>
+    </clipPath>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <!-- dark tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <g clip-path="url(#round)">
+    <circle cx="256" cy="256" r="170" fill="url(#halo)"/>
+    <rect x="16" y="16" width="480" height="480" fill="url(#scan)"/>
+  </g>
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="none"
+        stroke="#52f2ab" stroke-opacity="0.20" stroke-width="1.5"/>
+
+  <!-- HUD corner brackets -->
+  <g fill="none" stroke="#52f2ab" stroke-opacity="0.38" stroke-width="4" stroke-linecap="round">
+    <path d="M64 110 V74 Q64 64 74 64 H110"/>
+    <path d="M402 64 H438 Q448 64 448 74 V110"/>
+    <path d="M448 402 V438 Q448 448 438 448 H402"/>
+    <path d="M110 448 H74 Q64 448 64 438 V402"/>
+  </g>
+
+  <!-- the prompt: >_ -->
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <g filter="url(#glow)" opacity="0.9" stroke="#2fe897" fill="#2fe897">
+      <path d="M156 162 L264 256 L156 350" fill="none" stroke-width="26"/>
+      <rect x="272" y="322" width="124" height="30" rx="15"/>
+    </g>
+    <g stroke="url(#neon)" fill="url(#neon)">
+      <path d="M156 162 L264 256 L156 350" fill="none" stroke-width="26"/>
+      <rect x="272" y="322" width="124" height="30" rx="15"/>
+    </g>
+  </g>
+</svg>
